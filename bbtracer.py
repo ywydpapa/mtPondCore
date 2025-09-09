@@ -1,8 +1,9 @@
 import requests
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
+from math import sqrt
 
 # ==============================
 # Config
@@ -20,12 +21,33 @@ HOLD_CANDLES = 3
 REQUEST_SLEEP = 0.06
 EXCLUDE_INCOMPLETE_CANDLE = True
 
-# 최근 추세 분석 창
-RECENT_TREND_WINDOW = 10
-
-# 스케줄 설정: 2분 간격 실행
+# 스케줄 설정
 INTERVAL_MINUTES = 2
-MAX_RUNS = None   # None = 무한, 정수 지정 시 해당 횟수 후 종료
+MAX_RUNS = None  # None=무한
+
+# 고급 반전 탐지 파라미터
+ADV_CFG = {
+    "window": 10,
+    "tolerance": 0.07,
+    "band_pos_mid_upper": 0.55,
+    "band_pos_mid_lower": 0.45,
+    "band_pos_gap_min": 0.18,
+    "slope_min_abs": 0.0,              # 필요 시 (예: 0.0001) 조정
+    "r2_min": 0.40,
+    "cluster_min_ratio": 0.30,
+    "band_contraction_lookback": 50,
+    "band_contraction_quantile": 0.30,
+    "confirm_recent_bars": 3,
+    "atr_period": 14,
+    "atr_expansion_factor": 1.15,
+    "volume_ma_period": 20,
+    "volume_factor": 1.4,
+    "cool_off_bars": 5,
+}
+
+# (market, timeframe)별 마지막 반전 상태 저장 전역 dict
+# key: (market, timeframe_int) -> {"last_index": int, "direction": "UP"/"DOWN"}
+REVERSAL_STATE_STORE: Dict[Tuple[str,int], Dict[str, Any]] = {}
 
 # ==============================
 # Helpers / Logging
@@ -171,12 +193,65 @@ def compute_recent_stats(df: pd.DataFrame, n: int = RECENT_N) -> Dict[str, Any]:
     }
 
 # ==============================
-# Recent Window Trend / Touch / Reversal
+# Advanced Reversal Helpers
 # ==============================
-def compute_recent_window_trend(df: pd.DataFrame,
-                                tolerance: float = TOLERANCE_RATIO,
-                                window: int = RECENT_TREND_WINDOW) -> Dict[str, Any]:
-    if len(df) < window or 'band_pos' not in df.columns:
+def _linear_regression_stats(y: np.ndarray):
+    n = len(y)
+    x = np.arange(n)
+    if n < 3:
+        return None, None, None, None
+    x_mean = x.mean()
+    y_mean = y.mean()
+    ss_tot = ((y - y_mean) ** 2).sum()
+    cov_xy = ((x - x_mean) * (y - y_mean)).sum()
+    ss_x = ((x - x_mean) ** 2).sum()
+    if ss_x == 0:
+        return None, None, None, None
+    slope = cov_xy / ss_x
+    intercept = y_mean - slope * x_mean
+    y_pred = slope * x + intercept
+    ss_res = ((y - y_pred) ** 2).sum()
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 0
+    if n > 2:
+        se = sqrt((ss_res / (n - 2)) / ss_x) if ss_x != 0 else None
+    else:
+        se = None
+    t_stat = slope / se if (se and se != 0) else None
+    return slope, r2, se, t_stat
+
+def _atr(df: pd.DataFrame, period: int):
+    if not set(['high','low','close']).issubset(df.columns):
+        return None
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    prev_close = close.shift(1)
+    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
+    return tr.rolling(period).mean()
+
+# ==============================
+# Advanced Reversal Detection
+# ==============================
+def compute_recent_window_trend_advanced(
+    df: pd.DataFrame,
+    prev_reversal_state: dict = None,
+    cfg: dict = ADV_CFG
+) -> dict:
+    """
+    고급 반전/추세 탐지:
+    - trigger / pre / confirm / quality / volume / ATR / cool-off
+    반환 구조:
+    {
+      recent_trend, recent_trend_kr,
+      recent_upper_touch, recent_lower_touch,
+      recent_reversal, recent_reversal_kr,
+      recent_reversal_grade, recent_reversal_grade_kr,
+      recent_detail: {...}
+    }
+    """
+    window = cfg["window"]
+    tolerance = cfg["tolerance"]
+    if len(df) < window + 5 or 'band_pos' not in df.columns:
         return {
             "recent_trend": "NEUTRAL",
             "recent_trend_kr": "중립",
@@ -184,25 +259,35 @@ def compute_recent_window_trend(df: pd.DataFrame,
             "recent_lower_touch": False,
             "recent_reversal": "NONE",
             "recent_reversal_kr": "없음",
+            "recent_reversal_grade": "NONE",
+            "recent_reversal_grade_kr": "없음",
             "recent_detail": {"usable": False}
         }
 
-    sub = df.tail(window)
+    # 밴드폭 확보
+    if {'bb_upper', 'bb_lower'}.issubset(df.columns) and 'band_width' not in df.columns:
+        df = df.copy()
+        df['band_width'] = df['bb_upper'] - df['bb_lower']
+    elif 'band_width' not in df.columns:
+        df = df.copy()
+        df['band_width'] = np.nan
+
+    sub = df.tail(window).copy()
     band_pos = sub['band_pos']
     returns = sub['return_pct']
 
     upper_touch = (band_pos >= (1 - tolerance)).any()
     lower_touch = (band_pos <= tolerance).any()
-    mean_band_pos = band_pos.mean()
-    mean_return = returns.mean()
+    mean_bp = band_pos.mean()
+    mean_ret = returns.mean()
 
-    if upper_touch and (mean_return or 0) > 0:
+    if upper_touch and (mean_ret or 0) > 0:
         trend = "UP"
-    elif lower_touch and (mean_return or 0) < 0:
+    elif lower_touch and (mean_ret or 0) < 0:
         trend = "DOWN"
-    elif mean_band_pos > 0.6 and (mean_return or 0) > 0:
+    elif mean_bp > 0.6 and (mean_ret or 0) > 0:
         trend = "UP"
-    elif mean_band_pos < 0.4 and (mean_return or 0) < 0:
+    elif mean_bp < 0.4 and (mean_ret or 0) < 0:
         trend = "DOWN"
     else:
         trend = "NEUTRAL"
@@ -211,30 +296,107 @@ def compute_recent_window_trend(df: pd.DataFrame,
     first = sub.iloc[:half]
     second = sub.iloc[-half:]
 
-    def half_slope(vals: pd.Series) -> Optional[float]:
-        y = vals.dropna()
-        if len(y) < 3:
-            return None
-        x = np.arange(len(y))
-        try:
-            return float(np.polyfit(x, y.values, 1)[0])
-        except Exception:
-            return None
+    bb_mid = df['bb_mid']
+    first_mid = first['bb_mid'].dropna()
+    second_mid = second['bb_mid'].dropna()
+    slope_first = r2_first = slope_second = r2_second = None
+    t_first = t_second = None
+    if len(first_mid) >= 3:
+        slope_first, r2_first, _, t_first = _linear_regression_stats(first_mid.values)
+    if len(second_mid) >= 3:
+        slope_second, r2_second, _, t_second = _linear_regression_stats(second_mid.values)
 
-    slope_first = half_slope(first['bb_mid'])
-    slope_second = half_slope(second['bb_mid'])
     mean_first_bp = first['band_pos'].mean()
     mean_second_bp = second['band_pos'].mean()
+    band_pos_gap = abs(mean_first_bp - mean_second_bp)
+
+    cluster_up_ratio = (first['band_pos'] >= (1 - tolerance)).mean()
+    cluster_down_ratio = (first['band_pos'] <= tolerance).mean()
+
+    # 수축 판단: 전체 df 기준 (lookback) 과거 폭 분위 → sub first 폭 비교
+    contraction_region = df.tail(cfg["band_contraction_lookback"])['band_width']
+    contraction_thresh = contraction_region.quantile(cfg["band_contraction_quantile"]) if contraction_region.notna().any() else np.nan
+    first_band_width_mean = first['band_width'].mean()
+    band_contraction = (pd.notna(contraction_thresh)
+                        and pd.notna(first_band_width_mean)
+                        and first_band_width_mean <= contraction_thresh)
+
+    # ATR
+    atr_series = _atr(df, cfg["atr_period"])
+    atr_last = atr_series.iloc[-1] if atr_series is not None else None
+    atr_mean = (atr_series.tail(cfg["atr_period"] * 2).mean()
+                if atr_series is not None else None)
+    atr_expansion = False
+    if (atr_last is not None) and (atr_mean is not None) and atr_mean != 0:
+        atr_expansion = atr_last > atr_mean * cfg["atr_expansion_factor"]
+
+    # 거래량
+    if 'volume' in df.columns:
+        vol_ma = df['volume'].rolling(cfg["volume_ma_period"]).mean()
+        vol_last = df['volume'].iloc[-1]
+        vol_ma_last = vol_ma.iloc[-1]
+        volume_expansion = (pd.notna(vol_ma_last)
+                             and vol_ma_last > 0
+                             and vol_last > vol_ma_last * cfg["volume_factor"])
+    else:
+        volume_expansion = False
+
+    confirm_n = cfg["confirm_recent_bars"]
+    tail_confirm = sub.tail(confirm_n)
+    mid_up = cfg["band_pos_mid_upper"]
+    mid_dn = cfg["band_pos_mid_lower"]
+
+    # slope 절대값 필터 옵션 (slope_min_abs > 0 인 경우)
+    slope_min_abs = cfg.get("slope_min_abs", 0.0) or 0.0
+    slope_first_ok = (slope_first is not None and abs(slope_first) >= slope_min_abs)
+    slope_second_ok = (slope_second is not None and abs(slope_second) >= slope_min_abs)
+
+    trigger_up = (slope_first_ok and slope_second_ok and
+                  slope_first < 0 and slope_second > 0 and
+                  mean_first_bp < mid_dn and mean_second_bp > mid_up and
+                  band_pos_gap >= cfg["band_pos_gap_min"])
+
+    trigger_down = (slope_first_ok and slope_second_ok and
+                    slope_first > 0 and slope_second < 0 and
+                    mean_first_bp > mid_up and mean_second_bp < mid_dn and
+                    band_pos_gap >= cfg["band_pos_gap_min"])
+
+    pre_up = (cluster_down_ratio >= cfg["cluster_min_ratio"]) and band_contraction
+    pre_down = (cluster_up_ratio >= cfg["cluster_min_ratio"]) and band_contraction
+
+    confirm_up = trigger_up and (tail_confirm['band_pos'] > mid_up).all()
+    confirm_down = trigger_down and (tail_confirm['band_pos'] < mid_dn).all()
+
+    quality_ok = ((r2_first or 0) >= cfg["r2_min"] and (r2_second or 0) >= cfg["r2_min"])
+
+    cool_off_active = False
+    if prev_reversal_state and "last_index" in prev_reversal_state:
+        last_idx = prev_reversal_state["last_index"]
+        current_idx = df.index[-1]
+        if (current_idx - last_idx) < cfg["cool_off_bars"]:
+            cool_off_active = True
 
     reversal = "NONE"
-    if slope_first is not None and slope_second is not None:
-        if slope_first > 0 and slope_second < 0 and mean_first_bp > 0.5 and mean_second_bp < 0.5:
-            reversal = "DOWN"
-        elif slope_first < 0 and slope_second > 0 and mean_first_bp < 0.5 and mean_second_bp > 0.5:
-            reversal = "UP"
+    Grade = "NONE"
+    if not cool_off_active:
+        if trigger_up:
+            if pre_up and confirm_up and quality_ok and (volume_expansion or atr_expansion):
+                reversal = "UP"; Grade = "STRONG"
+            elif pre_up and confirm_up and quality_ok:
+                reversal = "UP"; Grade = "CONFIRMED"
+            else:
+                reversal = "UP"; Grade = "POTENTIAL"
+        elif trigger_down:
+            if pre_down and confirm_down and quality_ok and (volume_expansion or atr_expansion):
+                reversal = "DOWN"; Grade = "STRONG"
+            elif pre_down and confirm_down and quality_ok:
+                reversal = "DOWN"; Grade = "CONFIRMED"
+            else:
+                reversal = "DOWN"; Grade = "POTENTIAL"
 
     kr_map_trend = {"UP": "상승", "DOWN": "하락", "NEUTRAL": "중립"}
-    kr_map_rev = {"UP": "상방반전", "DOWN": "하방반전", "NONE": "없음"}
+    kr_map_rev = {"UP": "상승반전", "DOWN": "하락반전", "NONE": "없음"}
+    kr_grade = {"STRONG": "강", "CONFIRMED": "확정", "POTENTIAL": "잠재", "NONE": "없음"}
 
     return {
         "recent_trend": trend,
@@ -243,17 +405,43 @@ def compute_recent_window_trend(df: pd.DataFrame,
         "recent_lower_touch": bool(lower_touch),
         "recent_reversal": reversal,
         "recent_reversal_kr": kr_map_rev.get(reversal, "없음"),
+        "recent_reversal_grade": Grade,
+        "recent_reversal_grade_kr": kr_grade.get(Grade, "없음"),
         "recent_detail": {
+            "usable": True,
             "window": window,
-            "mean_band_pos": float(mean_band_pos) if pd.notna(mean_band_pos) else None,
-            "mean_return_pct": float(mean_return) if pd.notna(mean_return) else None,
+            "mean_band_pos": float(mean_bp) if pd.notna(mean_bp) else None,
+            "mean_return_pct": float(mean_ret) if pd.notna(mean_ret) else None,
             "slope_first": slope_first,
             "slope_second": slope_second,
+            "r2_first": r2_first,
+            "r2_second": r2_second,
+            "t_first": t_first,
+            "t_second": t_second,
             "mean_first_band_pos": float(mean_first_bp) if pd.notna(mean_first_bp) else None,
-            "mean_second_band_pos": float(mean_second_bp) if pd.notna(mean_second_bp) else None
+            "mean_second_band_pos": float(mean_second_bp) if pd.notna(mean_second_bp) else None,
+            "band_pos_gap": band_pos_gap,
+            "cluster_up_ratio": cluster_up_ratio,
+            "cluster_down_ratio": cluster_down_ratio,
+            "band_contraction": band_contraction,
+            "first_band_width_mean": float(first_band_width_mean) if pd.notna(first_band_width_mean) else None,
+            "contraction_thresh": float(contraction_thresh) if pd.notna(contraction_thresh) else None,
+            "atr_last": float(atr_last) if atr_last is not None else None,
+            "atr_mean": float(atr_mean) if atr_mean is not None else None,
+            "atr_expansion": atr_expansion,
+            "volume_expansion": volume_expansion,
+            "trigger_up": trigger_up,
+            "trigger_down": trigger_down,
+            "pre_up": pre_up,
+            "pre_down": pre_down,
+            "confirm_up": confirm_up,
+            "confirm_down": confirm_down,
+            "quality_ok": quality_ok,
+            "cool_off_active": cool_off_active,
+            "slope_first_ok": slope_first_ok,
+            "slope_second_ok": slope_second_ok
         }
     }
-
 # ==============================
 # Signal Logic
 # ==============================
@@ -283,7 +471,14 @@ def simplify_signal(sig: str) -> str:
 # ==============================
 # Per-Timeframe Processing
 # ==============================
-def process_timeframe(market: str, unit: int, debug: bool=False) -> Dict[str, Any]:
+
+# 추가 상수 (기존 Config 아래에 배치)
+BAND_WIDTH_THRESHOLD_PCT = 0.01  # 1%
+BAND_WIDTH_BASE_TF = 5           # 폭 비교 및 평균 계산 기준 타임프레임
+
+def process_timeframe(market: str, unit: int,
+                      reversal_state_store: Optional[Dict[Tuple[str,int], Dict[str,Any]]] = None,
+                      debug: bool=False) -> Dict[str, Any]:
     raw = fetch_upbit_minutes(market, unit, LOOKBACK_CANDLES, allow_debug=debug)
     if raw.empty:
         return {"error": "no_data"}
@@ -302,7 +497,19 @@ def process_timeframe(market: str, unit: int, debug: bool=False) -> Dict[str, An
 
     last = df.iloc[-1]
     stats = compute_recent_stats(df)
-    recent_info = compute_recent_window_trend(df, window=RECENT_TREND_WINDOW)
+
+    prev_state = reversal_state_store.get((market, unit)) if reversal_state_store is not None else None
+    recent_info = compute_recent_window_trend_advanced(df, prev_reversal_state=prev_state, cfg=ADV_CFG)
+
+    # 새 반전 상태 저장
+    if reversal_state_store is not None:
+        if (recent_info.get("recent_reversal") in ("UP","DOWN") and
+            recent_info.get("recent_reversal_grade") != "NONE" and
+            recent_info.get("recent_detail", {}).get("cool_off_active") is False):
+            reversal_state_store[(market, unit)] = {
+                "last_index": int(df.index[-1]),
+                "direction": recent_info.get("recent_reversal")
+            }
 
     band_pos = last.get('band_pos', np.nan)
     slope_val = slope if slope is not None else np.nan
@@ -315,22 +522,52 @@ def process_timeframe(market: str, unit: int, debug: bool=False) -> Dict[str, An
         expected_profit_long_pct = None
         expected_profit_short_pct = None
 
+    # 마지막 봉 Bollinger 폭 퍼센트
+    if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
+        last_bb_upper = df['bb_upper'].iloc[-1]
+        last_bb_lower = df['bb_lower'].iloc[-1]
+        if pd.notna(last_bb_upper) and pd.notna(last_bb_lower) and last['close'] != 0:
+            band_width_pct = (last_bb_upper - last_bb_lower) / last['close']
+        else:
+            band_width_pct = None
+    else:
+        band_width_pct = None
+
+    # 최근 20개 캔들의 상승봉/하강봉 평균 (body_pct = (close-open)/open)
+    bull_avg_body = None
+    bear_avg_body = None
+    if len(df) >= 2:
+        recent_n = df.tail(RECENT_N).copy()
+        if 'open' in recent_n.columns and 'close' in recent_n.columns:
+            recent_n['body_pct_tmp'] = (recent_n['close'] - recent_n['open']) / recent_n['open']
+            bull_series = recent_n.loc[recent_n['body_pct_tmp'] > 0, 'body_pct_tmp']
+            bear_series = recent_n.loc[recent_n['body_pct_tmp'] < 0, 'body_pct_tmp']
+            if not bull_series.empty:
+                bull_avg_body = float(bull_series.mean())
+            if not bear_series.empty:
+                bear_avg_body = float(bear_series.mean())
+
     result = {
         "last_price": float(last['close']),
         "band_pos": float(band_pos) if pd.notna(band_pos) else None,
         "slope": float(slope_val) if pd.notna(slope_val) else None,
         "bb_signal": signal,
         "upper_touch": bool(band_pos >= (1 - TOLERANCE_RATIO)) if pd.notna(band_pos) else False,
-        "lower_touch": bool(band_pos <= TOLERANCE_RATIO) if pd.notna(band_pos) else False,
+          "lower_touch": bool(band_pos <= TOLERANCE_RATIO) if pd.notna(band_pos) else False,
         "expected_profit_long_pct": expected_profit_long_pct,
         "expected_profit_short_pct": expected_profit_short_pct,
-        "recent_trend": recent_info["recent_trend"],
-        "recent_trend_kr": recent_info["recent_trend_kr"],
-        "recent_upper_touch": recent_info["recent_upper_touch"],
-        "recent_lower_touch": recent_info["recent_lower_touch"],
-        "recent_reversal": recent_info["recent_reversal"],
-        "recent_reversal_kr": recent_info["recent_reversal_kr"],
-        "recent_detail": recent_info["recent_detail"]
+        "recent_trend": recent_info.get("recent_trend"),
+        "recent_trend_kr": recent_info.get("recent_trend_kr"),
+        "recent_upper_touch": recent_info.get("recent_upper_touch"),
+        "recent_lower_touch": recent_info.get("recent_lower_touch"),
+        "recent_reversal": recent_info.get("recent_reversal"),
+        "recent_reversal_kr": recent_info.get("recent_reversal_kr"),
+        "recent_reversal_grade": recent_info.get("recent_reversal_grade"),
+        "recent_reversal_grade_kr": recent_info.get("recent_reversal_grade_kr"),
+        "recent_detail": recent_info.get("recent_detail", {}),
+        "band_width_pct": float(band_width_pct) if band_width_pct is not None else None,
+        "recent20_bull_avg_body_pct": bull_avg_body,
+        "recent20_bear_avg_body_pct": bear_avg_body
     }
     result.update(stats)
 
@@ -372,6 +609,7 @@ def aggregate_signals(tf_dict: Dict[str, Dict[str, Any]]) -> str:
 # ==============================
 def run_scan(markets: Optional[List[str]] = None,
              timeframes: List[int] = TIMEFRAMES,
+             reversal_state_store: Optional[Dict[Tuple[str,int], Dict[str,Any]]] = None,
              debug: bool=False) -> List[Dict[str, Any]]:
     if markets is None:
         markets = get_top_markets()
@@ -380,7 +618,7 @@ def run_scan(markets: Optional[List[str]] = None,
         tf_result = {}
         for tf in timeframes:
             time.sleep(REQUEST_SLEEP)
-            data = process_timeframe(m, tf, debug=debug)
+            data = process_timeframe(m, tf, reversal_state_store=reversal_state_store, debug=debug)
             tf_result[f"{tf}m"] = data
         agg = aggregate_signals(tf_result)
         results.append({
@@ -410,7 +648,11 @@ def flatten_results(results: List[Dict[str, Any]]) -> pd.DataFrame:
 def format_recent_trend_line(item: Dict[str, Any],
                              timeframes: List[int] = TIMEFRAMES,
                              include_extras_tf=(5, 15),
-                             no_space_between: bool=False) -> str:
+                             no_space_between: bool=False,
+                             base_width_tf: int = BAND_WIDTH_BASE_TF) -> str:
+    """
+    예: KRW-BTC 5분(상승,반전↑:강) 15분(중립) 30분(하락) 폭<1%
+    """
     market = item.get("market", "UNKNOWN")
     parts = [market]
     sep = "" if no_space_between else " "
@@ -419,39 +661,36 @@ def format_recent_trend_line(item: Dict[str, Any],
         info = item['timeframes'].get(key, {})
         trend_kr = info.get("recent_trend_kr", "중립")
 
-        extras = []
+        label_core = f"{tf}분({trend_kr}"
         if tf in include_extras_tf:
-            if info.get("recent_upper_touch"):
-                extras.append("상터치")
-            if info.get("recent_lower_touch"):
-                extras.append("하터치")
             rev = info.get("recent_reversal")
-            if rev == "UP":
-                extras.append("반전↑")
-            elif rev == "DOWN":
-                extras.append("반전↓")
+            grade_kr = info.get("recent_reversal_grade_kr")
+            if rev in ("UP","DOWN") and grade_kr not in ("없음", None):
+                arrow = "↑" if rev == "UP" else "↓"
+                label_core += f",반전{arrow}:{grade_kr}"
+        label_core += ")"
+        parts.append(label_core)
 
-        if extras:
-            label = f"{tf}분({trend_kr}," + ",".join(extras) + ")"
-        else:
-            label = f"{tf}분({trend_kr})"
-        parts.append(label)
+    # 밴드폭 판단 (기준 타임프레임)
+    base_key = f"{base_width_tf}m"
+    base_info = item['timeframes'].get(base_key, {})
+    bw_pct = base_info.get("band_width_pct")
+    if bw_pct is None:
+        width_tag = "폭:N/A"
+    else:
+        width_tag = "폭<1%" if bw_pct < BAND_WIDTH_THRESHOLD_PCT else "폭≥1%"
+
+    parts.append(width_tag)
     return sep.join(parts)
 
 # ==============================
 # Scheduling Helpers
 # ==============================
 def align_to_even_minute(ts: pd.Timestamp, interval: int = INTERVAL_MINUTES) -> pd.Timestamp:
-    """
-    ts 이후(또는 현재)가 되는 가장 가까운 짝수( interval 배수 ) 분 0초 시각 반환.
-    interval=2 이면 분%2==0 & 초==0.
-    """
     base = ts.replace(second=0, microsecond=0)
-    # 이미 정각 & 짝수분이면 그대로
     if ts.second == 0 and (ts.minute % interval == 0):
         return base
     minute = ts.minute
-    # 다음 interval 배수 분
     next_min = minute + (interval - (minute % interval))
     if next_min >= 60:
         base = base + pd.Timedelta(hours=1)
@@ -461,7 +700,7 @@ def align_to_even_minute(ts: pd.Timestamp, interval: int = INTERVAL_MINUTES) -> 
     return base
 
 # ==============================
-# Main Loop (Every 2 Minutes)
+# Main Loop
 # ==============================
 if __name__ == "__main__":
     try:
@@ -471,12 +710,11 @@ if __name__ == "__main__":
 
         while True:
             now = now_kst()
-            # 대기
             if now < next_run:
                 sleep_sec = (next_run - now).total_seconds()
                 if sleep_sec > 0:
                     time.sleep(sleep_sec)
-            # 실행 시간 (이론적 스케줄 기준)
+
             run_time = next_run
             start_actual = now_kst()
 
@@ -484,10 +722,11 @@ if __name__ == "__main__":
             if not markets:
                 print(f"[{start_actual}] No markets retrieved.")
             else:
-                scan = run_scan(markets[:30], debug=False)
-                # 알파벳(사전) 순 정렬
+                scan = run_scan(markets[:30],
+                                reversal_state_store=REVERSAL_STATE_STORE,
+                                debug=False)
                 scan_sorted = sorted(scan, key=lambda x: x['market'])
-                header = f"=== 최근 10개 봉 추세/터치/반전 (5분,15분 확장) Scheduled:{run_time} Started:{start_actual} ==="
+                header = f"=== 고급 반전 (window={ADV_CFG['window']}) 5/15분 확장 Scheduled:{run_time} Started:{start_actual} ==="
                 print(header)
                 for item in scan_sorted:
                     print(format_recent_trend_line(item))
@@ -497,12 +736,9 @@ if __name__ == "__main__":
                 print(f"[INFO] Reached MAX_RUNS={MAX_RUNS}. Exiting.")
                 break
 
-            # 다음 실행 시각 고정 간격 증가
             next_run = next_run + pd.Timedelta(minutes=INTERVAL_MINUTES)
-            # 만약 현재 시간이 이미 다음_run 을 지나쳤다면(지연), 현재 시간을 기준으로 다시 정렬
             now_after = now_kst()
             if now_after > next_run:
-                # 여러 주기가 밀린 경우를 방지
                 missed = int((now_after - next_run).total_seconds() // (INTERVAL_MINUTES * 60)) + 1
                 next_run = next_run + pd.Timedelta(minutes=INTERVAL_MINUTES * missed)
                 print(f"[WARN] Delayed execution detected. Skipping {missed} interval(s). Next run reset to {next_run}")
