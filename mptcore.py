@@ -3,7 +3,6 @@ import threading
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Callable, Iterable, Tuple
 import requests
-import math
 
 # ==============================
 # 설정
@@ -12,13 +11,18 @@ API_URL = "http://ywydpapa.iptime.org:8000/api/bbtrend30"
 REFRESH_INTERVAL_SEC = 30
 TIMEOUT_SEC = 8
 DEFAULT_TOP_N = 8
-TARGET_TIMEFRAMES = ["5m", "15m", "30m"]   # 원하는 타임프레임 필터 (None 또는 빈 리스트면 전체)
+TARGET_TIMEFRAMES = ["5m", "15m", "30m"]
 
-# 임계값(필터/스코어용) - 필요 시 조정
+# 스코어 / 필터 파라미터
 RSI_OVERHEAT = 72
 RSI_GOOD_LOW, RSI_GOOD_HIGH = 50, 70
-BB_POS_BREAKOUT = 100
-BB_POS_STRONG_LOW = -20
+
+# MACD_Hist 교차 감지 활성화
+ENABLE_MACD_HIST_CROSS_DETECTION = True
+# 아주 작은 미세한 진동(노이즈) 배제 위한 최소 절대값 (필요 시 조정)
+MACD_HIST_MIN_ABS_FOR_EVENT = 0.0001
+# 하락 전환도 보고 싶지 않다면 False 로
+DETECT_DOWN_CROSS = True
 
 # ==============================
 # 데이터 모델
@@ -40,13 +44,6 @@ class CoinIndicator:
     time: str
 
     def basic_momentum_score(self) -> float:
-        """
-        기본 모멘텀 점수 예시:
-        - BB_Pos (0~100 구간 + 이상 돌파) 가중
-        - MACD_Hist 양수 가점
-        - RSI 중간 상단대(50~70) 가점, 과열 패널티
-        - BandWidth(변동성)가 너무 과도하면 감점(예: 폭발 후 피로)
-        """
         rsi_score = 0
         if RSI_GOOD_LOW <= self.RSI <= RSI_GOOD_HIGH:
             rsi_score = 8
@@ -54,22 +51,17 @@ class CoinIndicator:
             rsi_score = -5
         bw_penalty = 0
         if self.BandWidth > 8:
-            bw_penalty = - (self.BandWidth - 8) * 0.5  # 과도한 확장 벌점
+            bw_penalty = - (self.BandWidth - 8) * 0.5
         return self.BB_Pos * 0.4 + self.MACD_Hist * 25 + rsi_score + bw_penalty
 
     def trend10_score(self) -> float:
-        """
-        Trend10 문자열 기반 간단 점수:
-        U=+2, u=+1, -=0, d=-1, D=-2
-        """
         if not self.Trend10:
             return 0.0
         score_map = {'U': 2, 'u': 1, '-': 0, 'd': -1, 'D': -2}
         total = 0
-          # 최근 패턴 뒤쪽(최신)이 더 가중치 높게 (선형 가중치)
         length = len(self.Trend10)
         for i, ch in enumerate(self.Trend10):
-            w = (i + 1) / length
+            w = (i + 1) / length  # 뒤쪽(최근) 가중
             total += w * score_map.get(ch, 0)
         return total
 
@@ -77,17 +69,64 @@ class CoinIndicator:
         return self.basic_momentum_score() + self.trend10_score() * 3
 
 # ==============================
-# 타임프레임 저장소
+# 타임프레임 저장소 + MACD_Hist 교차 감지
 # ==============================
 class TimeframeStore:
     def __init__(self, timeframe: str):
         self.timeframe = timeframe
         self._coins: Dict[str, CoinIndicator] = {}
+        self._prev_macd_hist: Dict[str, float] = {}
         self.last_updated: Optional[float] = None
 
-    def update(self, coins: List[CoinIndicator]):
-        self._coins = {c.market: c for c in coins}
+    def update(self, coins: List[CoinIndicator]) -> List[dict]:
+        """
+        코인 리스트 갱신하면서 MACD_Hist 교차 이벤트 탐지.
+        반환: 이벤트 리스트
+        """
+        events = []
+        new_map = {}
+        for c in coins:
+            prev = self._prev_macd_hist.get(c.market)
+            curr = c.MACD_Hist
+            # 교차 감지 로직
+            if ENABLE_MACD_HIST_CROSS_DETECTION and prev is not None:
+                # 상승 전환: prev <= 0, curr > 0
+                if prev <= 0 and curr > 0 and abs(curr) >= MACD_HIST_MIN_ABS_FOR_EVENT:
+                    events.append({
+                        "type": "MACD_HIST_CROSS",
+                        "direction": "UP",
+                        "timeframe": self.timeframe,
+                        "market": c.market,
+                        "prev": prev,
+                        "curr": curr,
+                        "time": c.time,
+                        "RSI": c.RSI,
+                        "BB_Pos": c.BB_Pos,
+                        "MACD": c.MACD,
+                        "MACD_Signal": c.MACD_Signal
+                    })
+                # 하락 전환(옵션)
+                if DETECT_DOWN_CROSS and prev >= 0 and curr < 0 and abs(curr) >= MACD_HIST_MIN_ABS_FOR_EVENT:
+                    events.append({
+                        "type": "MACD_HIST_CROSS",
+                        "direction": "DOWN",
+                        "timeframe": self.timeframe,
+                        "market": c.market,
+                        "prev": prev,
+                        "curr": curr,
+                        "time": c.time,
+                        "RSI": c.RSI,
+                        "BB_Pos": c.BB_Pos,
+                        "MACD": c.MACD,
+                        "MACD_Signal": c.MACD_Signal
+                    })
+            # prev 없으면 최초 진입 → 아직 교차 판단 X
+            new_map[c.market] = c
+            self._prev_macd_hist[c.market] = curr
+
+        self._coins = new_map
         self.last_updated = time.time()
+        return events
 
     def all(self) -> List[CoinIndicator]:
         return list(self._coins.values())
@@ -99,7 +138,7 @@ class TimeframeStore:
         return sorted(self._coins.values(), key=key_func, reverse=True)[:n]
 
 # ==============================
-# 멀티 타임프레임 통합 저장소
+# 멀티 타임프레임 저장소
 # ==============================
 class MultiTimeframeStore:
     def __init__(self):
@@ -108,9 +147,12 @@ class MultiTimeframeStore:
         self.last_fetch_status: Optional[str] = None
         self.last_fetch_error: Optional[str] = None
         self.last_server_updated: Optional[str] = None
+        # 이벤트 중복 방지 (market,timeframe,direction,time) 키
+        self._emitted_event_keys = set()
 
-    def update_from_response(self, resp_json: dict):
+    def update_from_response(self, resp_json: dict) -> List[dict]:
         with self._lock:
+            all_events = []
             self.last_fetch_status = resp_json.get("status")
             self.last_server_updated = resp_json.get("updated")
             tfs = resp_json.get("timeframes", {})
@@ -139,12 +181,19 @@ class MultiTimeframeStore:
                         )
                         coins.append(c)
                     except Exception as parse_e:
-                        # 단일 레코드 에러는 무시
                         print(f"[WARN] parse 실패 tf={tf_name} err={parse_e} raw={row}")
                 if tf_name not in self._stores:
                     self._stores[tf_name] = TimeframeStore(tf_name)
-                self._stores[tf_name].update(coins)
+                events = self._stores[tf_name].update(coins)
+                # 중복 제거
+                for ev in events:
+                    key = (ev["market"], ev["timeframe"], ev["direction"], ev["time"])
+                    if key in self._emitted_event_keys:
+                        continue
+                    self._emitted_event_keys.add(key)
+                    all_events.append(ev)
             self.last_fetch_error = None
+            return all_events
 
     def set_error(self, msg: str):
         with self._lock:
@@ -173,12 +222,6 @@ class MultiTimeframeStore:
         per_tf_top: int = 12,
         final_limit: int = 10
     ) -> List[Tuple[str, Dict[str, CoinIndicator]]]:
-        """
-        각 타임프레임별 상위(per_tf_top) 코인을 뽑고
-        교집합(모든 타임프레임에 등장) 종목을 반환.
-
-        반환 형식: [(market, {tf: CoinIndicator, ...}), ...] 점수는 합산(/평균) 정렬.
-        """
         with self._lock:
             tf_list = list(timeframes)
             rank_sets: Dict[str, Dict[str, CoinIndicator]] = {}
@@ -188,12 +231,9 @@ class MultiTimeframeStore:
                     return []
                 top_coins = store.top_by(key_func, per_tf_top)
                 rank_sets[tf] = {c.market: c for c in top_coins}
-
-            # 교집합
             common_markets = set.intersection(*(set(d.keys()) for d in rank_sets.values()))
             scored = []
             for m in common_markets:
-                # 합산 스코어
                 score_sum = 0.0
                 details: Dict[str, CoinIndicator] = {}
                 for tf in tf_list:
@@ -202,11 +242,8 @@ class MultiTimeframeStore:
                     score_sum += key_func(c)
                 avg_score = score_sum / len(tf_list)
                 scored.append((m, avg_score, details))
-
             scored.sort(key=lambda x: x[1], reverse=True)
-            # 결과 형태 가공
-            result = [(m, det) for (m, _s, det) in scored[:final_limit]]
-            return result
+            return [(m, det) for (m, _s, det) in scored[:final_limit]]
 
     def snapshot_summary(self) -> dict:
         with self._lock:
@@ -223,31 +260,27 @@ store = MultiTimeframeStore()
 # ==============================
 # Fetch 로직
 # ==============================
-def fetch_once(verbose: bool = True):
+def fetch_once(verbose: bool = True) -> List[dict]:
     try:
         r = requests.get(API_URL, timeout=TIMEOUT_SEC)
         r.raise_for_status()
         data = r.json()
         if data.get("status") != "ok":
             raise ValueError(f"status != ok : {data.get('status')}")
-        store.update_from_response(data)
+        events = store.update_from_response(data)
         if verbose:
-            print(f"[INFO] fetch 성공 updated={data.get('updated')} tfs={store.timeframes()}")
+            print(f"[INFO] fetch 성공 updated={data.get('updated')} tfs={store.timeframes()} events={len(events)}")
+        return events
     except Exception as e:
         store.set_error(str(e))
         if verbose:
             print(f"[ERROR] fetch 실패: {e}")
+        return []
 
 # ==============================
-# 추천/필터 유틸
+# 추천/필터/출력 유틸
 # ==============================
 def filter_candidates(coins: List[CoinIndicator]) -> List[CoinIndicator]:
-    """
-    1차 필터 예시:
-    - BB_Pos >= 60
-    - MACD_Hist > 0 (상승 모멘텀)
-    - RSI 45~75
-    """
     out = []
     for c in coins:
         if c.BB_Pos >= 60 and c.MACD_Hist > 0 and 45 <= c.RSI <= 75:
@@ -262,9 +295,6 @@ def print_top_per_timeframe(n: int = DEFAULT_TOP_N):
             print(f"{c.market:12} sc={c.combined_score():8.2f} BB={c.BB_Pos:7.2f} MACD_Hist={c.MACD_Hist:7.3f} RSI={c.RSI:5.1f} Trend10={c.Trend10}")
 
 def print_intersection_example():
-    """
-    5m,15m,30m 모두에서 상위권(각 타임프레임 combined_score 상위 12개)에 드는 교집합 종목 출력
-    """
     tfs = ["5m","15m","30m"]
     inter = store.multi_tf_intersection(tfs, lambda c: c.combined_score(), per_tf_top=12, final_limit=10)
     print("\n=== Multi-TF Intersection (combined_score) ===")
@@ -276,6 +306,21 @@ def print_intersection_example():
         avg_score = sum(scores.values()) / len(scores)
         print(f"{market:12} avg={avg_score:7.2f} " +
               " ".join(f"{tf}:{scores[tf]:.1f}" for tf in sorted(scores.keys())))
+
+def print_macd_hist_cross_events(events: List[dict]):
+    if not events:
+        return
+    # 상승 전환 먼저
+    ups = [e for e in events if e.get("direction") == "UP"]
+    downs = [e for e in events if e.get("direction") == "DOWN"]
+    if ups:
+        print("\n[MACD_Hist 상승 전환 감지]")
+        for e in ups:
+            print(f"{e['timeframe']:>3} {e['market']:12} prev={e['prev']:7.4f} -> curr={e['curr']:7.4f}  RSI={e['RSI']:5.1f} BB_Pos={e['BB_Pos']:7.2f}")
+    if downs:
+        print("\n[MACD_Hist 하락 전환 감지]")
+        for e in downs:
+            print(f"{e['timeframe']:>3} {e['market']:12} prev={e['prev']:7.4f} -> curr={e['curr']:7.4f}  RSI={e['RSI']:5.1f} BB_Pos={e['BB_Pos']:7.2f}")
 
 # ==============================
 # 스케줄러
@@ -296,9 +341,10 @@ class FetchScheduler:
 
     def _loop(self):
         while not self._stop.is_set():
-            fetch_once(verbose=False)
+            events = fetch_once(verbose=False)
             print_top_per_timeframe()
             print_intersection_example()
+            print_macd_hist_cross_events(events)
             self._stop.wait(self.interval)
 
     def stop(self):
@@ -311,15 +357,14 @@ class FetchScheduler:
 # 실행 예시
 # ==============================
 def main():
-    fetch_once(verbose=True)
+    events = fetch_once(verbose=True)
     print_top_per_timeframe()
     print_intersection_example()
+    print_macd_hist_cross_events(events)
 
     scheduler = FetchScheduler(interval=REFRESH_INTERVAL_SEC)
     scheduler.start()
     try:
-        # 3분 후 종료 (원하면 while True 로)
-          # 테스트 목적 제한
         end_t = time.time() + 180
         while time.time() < end_t:
             time.sleep(5)
