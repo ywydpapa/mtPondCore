@@ -473,8 +473,9 @@ def simplify_signal(sig: str) -> str:
 # ==============================
 
 # 추가 상수 (기존 Config 아래에 배치)
-BAND_WIDTH_THRESHOLD_PCT = 0.01  # 1%
-BAND_WIDTH_BASE_TF = 5           # 폭 비교 및 평균 계산 기준 타임프레임
+BAND_WIDTH_THRESHOLD_PCT = 0.01  # (이전 분류 로직이 필요하면 유지)
+BAND_WIDTH_BASE_TF = 5
+BW_AVG_PERIOD = 20               # 최근 평균 폭 계산에 사용할 최대 캔들 수
 
 def process_timeframe(market: str, unit: int,
                       reversal_state_store: Optional[Dict[Tuple[str,int], Dict[str,Any]]] = None,
@@ -491,6 +492,14 @@ def process_timeframe(market: str, unit: int,
 
     df = add_returns(raw)
     df = add_bollinger(df)
+
+    # ===== Bollinger 폭 % (전체 시리즈 & 마지막 / 평균) 계산 추가 =====
+    # (bb_upper, bb_lower 존재 & close 유효한 경우만)
+    if {'bb_upper', 'bb_lower', 'close'}.issubset(df.columns):
+        df['band_width_pct'] = (df['bb_upper'] - df['bb_lower']) / df['close']
+    else:
+        df['band_width_pct'] = np.nan
+
     slope = compute_slope(df['bb_mid'])
     if df.empty:
         return {"error": "after_processing_empty"}
@@ -501,7 +510,7 @@ def process_timeframe(market: str, unit: int,
     prev_state = reversal_state_store.get((market, unit)) if reversal_state_store is not None else None
     recent_info = compute_recent_window_trend_advanced(df, prev_reversal_state=prev_state, cfg=ADV_CFG)
 
-    # 새 반전 상태 저장
+    # 반전 상태 저장
     if reversal_state_store is not None:
         if (recent_info.get("recent_reversal") in ("UP","DOWN") and
             recent_info.get("recent_reversal_grade") != "NONE" and
@@ -522,18 +531,17 @@ def process_timeframe(market: str, unit: int,
         expected_profit_long_pct = None
         expected_profit_short_pct = None
 
-    # 마지막 봉 Bollinger 폭 퍼센트
-    if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
-        last_bb_upper = df['bb_upper'].iloc[-1]
-        last_bb_lower = df['bb_lower'].iloc[-1]
-        if pd.notna(last_bb_upper) and pd.notna(last_bb_lower) and last['close'] != 0:
-            band_width_pct = (last_bb_upper - last_bb_lower) / last['close']
-        else:
-            band_width_pct = None
-    else:
-        band_width_pct = None
+    # (이전) 마지막 폭 퍼센트
+    last_band_width_pct = float(last['band_width_pct']) if pd.notna(last.get('band_width_pct')) else None
 
-    # 최근 20개 캔들의 상승봉/하강봉 평균 (body_pct = (close-open)/open)
+    # 최근 BW_AVG_PERIOD (최대 20) 평균 폭
+    bw_recent = df['band_width_pct'].dropna().tail(BW_AVG_PERIOD)
+    if not bw_recent.empty:
+        band_width_pct_avg20 = float(bw_recent.mean())
+    else:
+        band_width_pct_avg20 = None
+
+    # 최근 20개 캔들 상승/하락 평균 body
     bull_avg_body = None
     bear_avg_body = None
     if len(df) >= 2:
@@ -553,7 +561,7 @@ def process_timeframe(market: str, unit: int,
         "slope": float(slope_val) if pd.notna(slope_val) else None,
         "bb_signal": signal,
         "upper_touch": bool(band_pos >= (1 - TOLERANCE_RATIO)) if pd.notna(band_pos) else False,
-          "lower_touch": bool(band_pos <= TOLERANCE_RATIO) if pd.notna(band_pos) else False,
+        "lower_touch": bool(band_pos <= TOLERANCE_RATIO) if pd.notna(band_pos) else False,
         "expected_profit_long_pct": expected_profit_long_pct,
         "expected_profit_short_pct": expected_profit_short_pct,
         "recent_trend": recent_info.get("recent_trend"),
@@ -565,7 +573,9 @@ def process_timeframe(market: str, unit: int,
         "recent_reversal_grade": recent_info.get("recent_reversal_grade"),
         "recent_reversal_grade_kr": recent_info.get("recent_reversal_grade_kr"),
         "recent_detail": recent_info.get("recent_detail", {}),
-        "band_width_pct": float(band_width_pct) if band_width_pct is not None else None,
+        # 폭 관련 (단일 & 평균)
+        "band_width_pct": last_band_width_pct,
+        "band_width_pct_avg20": band_width_pct_avg20,
         "recent20_bull_avg_body_pct": bull_avg_body,
         "recent20_bear_avg_body_pct": bear_avg_body
     }
@@ -580,6 +590,7 @@ def process_timeframe(market: str, unit: int,
         else:
             result["slope_normalized"] = None
     return result
+
 
 # ==============================
 # Aggregation Logic
@@ -651,11 +662,12 @@ def format_recent_trend_line(item: Dict[str, Any],
                              no_space_between: bool=False,
                              base_width_tf: int = BAND_WIDTH_BASE_TF) -> str:
     """
-    예: KRW-BTC 5분(상승,반전↑:강) 15분(중립) 30분(하락) 폭<1%
+    예: KRW-BTC 5분(상승,반전↑:강) 15분(중립) 30분(하락) 폭:0.83%(20평균:0.95%)
     """
     market = item.get("market", "UNKNOWN")
     parts = [market]
     sep = "" if no_space_between else " "
+
     for tf in timeframes:
         key = f"{tf}m"
         info = item['timeframes'].get(key, {})
@@ -671,16 +683,30 @@ def format_recent_trend_line(item: Dict[str, Any],
         label_core += ")"
         parts.append(label_core)
 
-    # 밴드폭 판단 (기준 타임프레임)
+    # 폭 표시 (기준 타임프레임)
     base_key = f"{base_width_tf}m"
     base_info = item['timeframes'].get(base_key, {})
-    bw_pct = base_info.get("band_width_pct")
-    if bw_pct is None:
-        width_tag = "폭:N/A"
-    else:
-        width_tag = "폭<1%" if bw_pct < BAND_WIDTH_THRESHOLD_PCT else "폭≥1%"
+    bw_cur = base_info.get("band_width_pct")
+    bw_avg = base_info.get("band_width_pct_avg20")
 
+    if bw_cur is not None:
+        cur_str = f"{bw_cur * 100:.2f}%"
+    else:
+        cur_str = "N/A"
+    if bw_avg is not None:
+        avg_str = f"{bw_avg * 100:.2f}%"
+    else:
+        avg_str = "N/A"
+
+    # 필요하다면 분류 태그도 덧붙이고 싶을 경우:
+    # classification = ""
+    # if bw_cur is not None:
+    #     classification = " (<1%)" if bw_cur < BAND_WIDTH_THRESHOLD_PCT else " (≥1%)"
+    # width_tag = f"폭:{cur_str}{classification}(20평균:{avg_str})"
+
+    width_tag = f"폭:{cur_str}(20평균:{avg_str})"
     parts.append(width_tag)
+
     return sep.join(parts)
 
 # ==============================
