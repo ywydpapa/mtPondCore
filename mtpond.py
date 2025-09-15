@@ -79,34 +79,38 @@ MOMENTUM_TIER3_TRAIL_EXTRA = Decimal(os.getenv("MOMENTUM_TIER3_TRAIL_EXTRA", "0.
 MOMENTUM_MAX_EXTRA_CAP = Decimal(os.getenv("MOMENTUM_MAX_EXTRA_CAP", "1.2"))
 
 # =========================================
-# 교집합(Intersection) 매수 전략 환경 변수
+# 교집합 매수 전략
 # =========================================
 INTERSECTION_BUY_ENABLED = os.getenv("INTERSECTION_BUY_ENABLED", "1") == "1"
 INTERSECTION_MIN_SCORE = Decimal(os.getenv("INTERSECTION_MIN_SCORE", "10"))
 INTERSECTION_BUY_KRW = Decimal(os.getenv("INTERSECTION_BUY_KRW", "200000"))
 INTERSECTION_MAX_BUY_PER_CYCLE = int(os.getenv("INTERSECTION_MAX_BUY_PER_CYCLE", "1"))
-INTERSECTION_BUY_COOLDOWN_SEC = int(os.getenv("INTERSECTION_BUY_COOLDOWN_SEC", "1200"))  # 20분
+INTERSECTION_BUY_COOLDOWN_SEC = int(os.getenv("INTERSECTION_BUY_COOLDOWN_SEC", "1200"))
 
 # =========================================
-# 교집합 데이터 안전 처리 & 캐시 관련 새 환경 변수
+# 교집합 데이터 캐시
 # =========================================
 INTERSECTION_USE_CACHE_ON_EMPTY = os.getenv("INTERSECTION_USE_CACHE_ON_EMPTY", "1") == "1"
 INTERSECTION_CACHE_TTL_SEC = int(os.getenv("INTERSECTION_CACHE_TTL_SEC", "180"))
 INTERSECTION_MAX_EMPTY_WARN = int(os.getenv("INTERSECTION_MAX_EMPTY_WARN", "5"))
 
-# uprises() 결과 캐시 상태 (전역)
 UPRISES_LAST_NONEMPTY: List[dict] = []
 UPRISES_LAST_TS: float | None = None
 UPRISES_EMPTY_STREAK: int = 0
 
 # =========================================
-# Upbit 관련
+# 추가 매수 제한 설정 (신규)
+# =========================================
+MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "4"))  # 최초 1회 이후 추가 가능한 횟수
+MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "500000"))  # 0이면 비활성
+
+# =========================================
+# Upbit
 # =========================================
 UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
-
 # =========================================
-# DB / 키 조회
+# DB
 # =========================================
 async def get_keys(user_no: int, server_no: int) -> Optional[tuple]:
     async with SessionLocal() as session:
@@ -115,14 +119,12 @@ async def get_keys(user_no: int, server_no: int) -> Optional[tuple]:
         result = await session.execute(sql, {"u": user_no, "s": server_no})
         return result.fetchone()
 
-
 # =========================================
-# JWT 빌드
+# JWT
 # =========================================
 def build_upbit_jwt_simple(access_key: str, secret_key: str) -> str:
     payload = {"access_key": access_key, "nonce": str(uuid.uuid4())}
     return jwt.encode(payload, secret_key, algorithm="HS256")
-
 
 def build_upbit_jwt_with_params(access_key: str, secret_key: str, params: Dict[str, Any]) -> str:
     filtered = {k: v for k, v in params.items() if v is not None}
@@ -135,7 +137,6 @@ def build_upbit_jwt_with_params(access_key: str, secret_key: str, params: Dict[s
         "query_hash_alg": "SHA512",
     }
     return jwt.encode(payload, secret_key, algorithm="HS256")
-
 
 # =========================================
 # HTTP 유틸
@@ -162,7 +163,6 @@ async def http_get_json(url: str, headers=None, params=None, timeout=10.0, max_r
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
 
-
 async def http_post_json(url: str, headers=None, params=None, timeout=10.0, max_retry=3):
     backoff = 2
     for attempt in range(1, max_retry + 1):
@@ -185,7 +185,6 @@ async def http_post_json(url: str, headers=None, params=None, timeout=10.0, max_
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
 
-
 # =========================================
 # Upbit 계좌/가격
 # =========================================
@@ -194,7 +193,6 @@ async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[st
     token = build_upbit_jwt_simple(access_key, secret_key)
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     return await http_get_json(url, headers=headers)
-
 
 async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
     if not markets:
@@ -212,7 +210,6 @@ async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
             except InvalidOperation:
                 continue
     return price_map
-
 
 def build_market_list_from_accounts(accounts, base_unit="KRW") -> List[str]:
     markets = []
@@ -247,7 +244,6 @@ def build_market_list_from_accounts(accounts, base_unit="KRW") -> List[str]:
             uniq.append(m)
     return uniq
 
-
 def get_available_krw(raw_accounts: List[Dict[str, Any]]) -> Decimal:
     for acc in raw_accounts:
         if acc.get("currency") == "KRW":
@@ -258,7 +254,6 @@ def get_available_krw(raw_accounts: List[Dict[str, Any]]) -> Decimal:
             except:
                 return Decimal("0")
     return Decimal("0")
-
 
 def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decimal], base_unit="KRW") -> List[dict]:
     enriched = []
@@ -272,6 +267,7 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
             avg_buy_price = Decimal("0")
 
         market = None
+          # This is correct indentation
         current_price = None
         pnl_percent = None
         ratio = None
@@ -292,6 +288,7 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
                 return Decimal("0")
 
         balance = to_decimal(acc.get("balance"))
+          # Indentation
         locked = to_decimal(acc.get("locked"))
 
         enriched.append({
@@ -306,7 +303,6 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
             "ratio_cur_over_avg": ratio
         })
     return enriched
-
 
 # =========================================
 # 주문
@@ -326,7 +322,6 @@ async def order_market_sell(access_key: str, secret_key: str, market: str, volum
     }
     return await http_post_json(UPBIT_ORDER_URL, headers=headers, params=params)
 
-
 async def order_market_buy_price(access_key: str, secret_key: str, market: str, krw_amount: Decimal) -> dict:
     params = {
         "market": market,
@@ -342,7 +337,6 @@ async def order_market_buy_price(access_key: str, secret_key: str, market: str, 
     }
     return await http_post_json(UPBIT_ORDER_URL, headers=headers, params=params)
 
-
 async def get_order(access_key: str, secret_key: str, uuid_: str) -> dict:
     params = {"uuid": uuid_}
     jwt_token = build_upbit_jwt_with_params(access_key, secret_key, params)
@@ -353,7 +347,6 @@ async def get_order(access_key: str, secret_key: str, uuid_: str) -> dict:
     url = "https://api.upbit.com/v1/order"
     return await http_get_json(url, headers=headers, params=params)
 
-
 # =========================================
 # 상태 객체
 # =========================================
@@ -363,6 +356,8 @@ class PositionState:
         self.last_sell_time: Dict[str, float] = {}
         self.last_buy_window: Dict[str, float] = {}
         self.intersection_last_buy_time: Dict[str, float] = {}
+        # 매수 이력
+        self.buy_info: Dict[str, Dict[str, Any]] = {}
 
     def update_or_init(self, market: str, pnl: Decimal, avg_price: Decimal):
         now = time.time()
@@ -387,7 +382,6 @@ class PositionState:
         if pnl > st["peak_pnl"]:
             st["peak_pnl"] = pnl
         st["prev_pnl"] = pnl
-          # last_update_ts 업데이트
         st["last_update_ts"] = now
         return st
 
@@ -398,6 +392,8 @@ class PositionState:
     def mark_sold(self, market: str):
         self.last_sell_time[market] = time.time()
         self.remove(market)
+        if market in self.buy_info:
+            del self.buy_info[market]
 
     def recently_sold(self, market: str) -> bool:
         ts = self.last_sell_time.get(market)
@@ -420,11 +416,41 @@ class PositionState:
             return False
         return (time.time() - ts) < cooldown
 
+    def record_buy(self, market: str, krw_amount: Decimal):
+        info = self.buy_info.get(market)
+        if info is None:
+            self.buy_info[market] = {
+                "total_buys": 1,
+                "total_invested": krw_amount
+            }
+        else:
+            info["total_buys"] += 1
+            info["total_invested"] += krw_amount
+
+    def get_buy_stats(self, market: str) -> Tuple[int, Decimal]:
+        info = self.buy_info.get(market)
+        if not info:
+            return 0, Decimal("0")
+        return info["total_buys"], info["total_invested"]
+
+    def can_additional_buy(self, market: str, next_amount: Decimal,
+                           max_additional_buys: int,
+                           max_total_invest: Decimal) -> Tuple[bool, str]:
+        total_buys, total_invested = self.get_buy_stats(market)
+        if total_buys == 0:
+            if max_total_invest > 0 and next_amount > max_total_invest:
+                return False, f"[SKIP] {market} 초기매수 금액({next_amount})>상한({max_total_invest})"
+            return True, "INIT_OK"
+        additional_done = total_buys - 1
+        if additional_done >= max_additional_buys:
+            return False, f"[SKIP] {market} 추가매수 한도 초과 (이미 {additional_done}회)"
+        if max_total_invest > 0 and (total_invested + next_amount) > max_total_invest:
+            return False, f"[SKIP] {market} 누적금액 {total_invested}+{next_amount}>{max_total_invest}"
+        return True, "OK"
 
 def apply_momentum_extension(state: dict):
-    # (원래 자리 - 생략 가능)
+    # 필요 시 Momentum 동적 확장 로직 구현
     pass
-
 
 def get_state_decimal(state: dict, key: str, default: Decimal) -> Decimal:
     v = state.get(key)
@@ -437,14 +463,12 @@ def get_state_decimal(state: dict, key: str, default: Decimal) -> Decimal:
         pass
     return default
 
-
 def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Optional[str]]:
     peak = state["peak_pnl"]
     armed = state["armed"]
     hard_tp_taken = state.get("hard_tp_taken", False)
     hard_tp2_taken = state.get("hard_tp2_taken", False)
     hard_tp2_target = get_state_decimal(state, "dynamic_hard_tp2", HARD_TP2_BASE)
-
     if hard_tp_taken and (not hard_tp2_taken) and pnl >= hard_tp2_target:
         label = "HARD_TP2"
         if state.get("dynamic_hard_tp2") is not None and hard_tp2_target != HARD_TP2_BASE:
@@ -462,7 +486,6 @@ def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Opti
             return True, f"TRAIL_DROP {drop}% >= {trail_drop_used}% (peak={peak}% now={pnl}%)", "TRAIL"
     return False, "", None
 
-
 def safe_calc_volume(balance: Decimal, portion: Decimal) -> Decimal:
     portion = min(portion, Decimal("1"))
     vol = balance if portion >= 1 else balance * portion
@@ -471,13 +494,11 @@ def safe_calc_volume(balance: Decimal, portion: Decimal) -> Decimal:
         return Decimal("0")
     return vol
 
-
 async def align_to_half_minute():
     now = time.time()
     remainder = now % 30
     if remainder > 0.01:
         await asyncio.sleep(30 - remainder)
-
 
 def is_five_minute_boundary(ts: float) -> Tuple[bool, float]:
     window_start = ts - (ts % FIVE_MIN_SECONDS)
@@ -486,15 +507,13 @@ def is_five_minute_boundary(ts: float) -> Tuple[bool, float]:
         return True, window_start
     return False, window_start
 
-
 async def sleep_until_next_boundary():
     now = time.time()
     next_boundary = math.floor(now / 30) * 30 + 30
     await asyncio.sleep(max(0, next_boundary - now))
 
-
 # =========================================
-# 교집합 데이터 안전 처리 유틸
+# 교집합 데이터 안전 처리
 # =========================================
 def _is_effectively_empty(candidates: List[dict]) -> bool:
     if not candidates:
@@ -502,7 +521,6 @@ def _is_effectively_empty(candidates: List[dict]) -> bool:
     valid = any((c.get("market") and c.get("avg_score") is not None)
                 for c in candidates if isinstance(c, dict))
     return not valid
-
 
 def _normalize_uprises(raw) -> List[dict]:
     if raw is None:
@@ -536,7 +554,6 @@ def _normalize_uprises(raw) -> List[dict]:
             return [{"market": raw["market"], "avg_score": raw["avg_score"]}]
         return []
     return []
-
 
 async def get_intersection_candidates_safe() -> Tuple[List[dict], dict]:
     """
@@ -601,9 +618,8 @@ async def get_intersection_candidates_safe() -> Tuple[List[dict], dict]:
         meta["cache_age"] = 0
         return candidates, meta
 
-
 # =========================================
-# 메인 모니터 루프
+# 메인 루프
 # =========================================
 async def monitor_positions(user_no: int, server_no: int):
     keys = await get_keys(user_no, server_no)
@@ -692,24 +708,21 @@ async def monitor_positions(user_no: int, server_no: int):
                     "portion": portion
                 })
 
-        # ---------- 매도 실행 (현재 DRY 로그) ----------
-        # ---------- 매도 실행 (LIVE 반영) ----------
+        # ---------- 매도 실행 ----------
         for so in sell_orders:
             market = so["market"]
             volume = so["volume"]
-            category = so["category"]  # HARD_TP1 | HARD_TP2 | TRAIL | None
+            category = so["category"]
             pnl = so["pnl"]
             reason = so["reason"]
             st = so["state_ref"]
-            portion = so["portion"]  # 사용한 비율 (0~1)
+            portion = so["portion"]
 
-            # 방어: 0 이하이면 스킵
             if volume <= 0:
-                print(f"[SKIP] {market} 매도 volume<=0 (calc={volume}) cat={category}")
+                print(f"[SKIP] {market} 매도 volume<=0 cat={category}")
                 continue
 
             if not LIVE_TRADING:
-                # DRY 모드
                 print(f"[DRY_SELL] {market} cat={category} vol={volume} pnl={pnl}% reason={reason}")
                 if category == "HARD_TP1":
                     st["hard_tp_taken"] = True
@@ -718,51 +731,38 @@ async def monitor_positions(user_no: int, server_no: int):
                     if portion >= 1:
                         ps.mark_sold(market)
                 else:
-                    # TRAIL 또는 일반
                     if portion >= 1:
                         ps.mark_sold(market)
                     else:
-                        # 부분매도 후 peak 재설정(선택)
                         st["peak_pnl"] = pnl
                         st["armed"] = False
                 continue
 
-            # === LIVE 모드 실제 주문 ===
             try:
                 resp = await order_market_sell(access_key, secret_key, market, volume)
                 uid = resp.get("uuid")
                 print(f"[ORDER] SELL {market} cat={category} vol={volume} pnl={pnl}% uuid={uid} reason={reason}")
-
-                # (선택) 1회 체결 확인
-                # 너무 잦은 조회를 피하려면 필요 없으면 제거 가능
                 if uid:
                     await asyncio.sleep(0.8)
                     try:
                         od = await get_order(access_key, secret_key, uid)
-                        print(
-                            f"[ORDER-CHK] SELL {market} state={od.get('state')} remaining_vol={od.get('remaining_volume')} paid_fee={od.get('paid_fee')}")
+                        print(f"[ORDER-CHK] SELL {market} state={od.get('state')} remaining_vol={od.get('remaining_volume')} paid_fee={od.get('paid_fee')}")
                     except Exception as ce:
                         print(f"[WARN] 매도 주문 조회 실패 {market} uuid={uid} err={ce}")
-
             except Exception as se:
                 print(f"[ERR] 매도 주문 실패 {market}: {se}")
-                # 실패 시 상태 변경 안 하고 다음 루프에서 다시 판단 가능
                 continue
 
-            # === 상태 갱신 ===
             if category == "HARD_TP1":
                 st["hard_tp_taken"] = True
-                # 부분매도 후 남은 물량 계속 추적
             elif category == "HARD_TP2":
                 st["hard_tp2_taken"] = True
                 if portion >= 1:
                     ps.mark_sold(market)
             else:
-                # TRAIL 혹은 일반 (SELL_PORTION). 전부 청산이면 제거
                 if portion >= 1:
                     ps.mark_sold(market)
                 else:
-                    # 부분매도 → peak 리셋 & 재무장 해제
                     st["peak_pnl"] = pnl
                     st["armed"] = False
 
@@ -780,7 +780,6 @@ async def monitor_positions(user_no: int, server_no: int):
             else:
                 if iu_meta.get("source") != "fresh":
                     print(f"[DEBUG] 교집합 후보 source={iu_meta.get('source')} size={len(intersection_candidates)} empty_streak={iu_meta.get('empty_streak')}")
-
                 intersection_candidates.sort(key=lambda x: x.get("avg_score", 0), reverse=True)
                 buys_done = 0
                 for row in intersection_candidates:
@@ -796,8 +795,15 @@ async def monitor_positions(user_no: int, server_no: int):
                         continue
                     if score_dec < INTERSECTION_MIN_SCORE:
                         continue
-                    if mkt in held_markets:
+
+                    can_buy, cb_reason = ps.can_additional_buy(
+                        mkt, INTERSECTION_BUY_KRW,
+                        MAX_ADDITIONAL_BUYS, MAX_TOTAL_INVEST_PER_MARKET
+                    )
+                    if not can_buy:
+                        print(cb_reason)
                         continue
+
                     if SKIP_BUY_IF_RECENT_SELL and ps.recently_sold(mkt):
                         continue
                     if ps.recently_bought_intersection(mkt, INTERSECTION_BUY_COOLDOWN_SEC):
@@ -806,18 +812,18 @@ async def monitor_positions(user_no: int, server_no: int):
                         print(f"[WARN] INTERSECTION_BUY_KRW({INTERSECTION_BUY_KRW}) < MIN_NOTIONAL_KRW({MIN_NOTIONAL_KRW}) → 중단")
                         break
                     if available_krw < INTERSECTION_BUY_KRW:
-                        print(f"[INFO] 교집합 {mkt}매수 KRW 부족 need={INTERSECTION_BUY_KRW} avail={available_krw}")
+                        print(f"[INFO] 교집합 {mkt} 매수 KRW 부족 need={INTERSECTION_BUY_KRW} avail={available_krw}")
                         break
 
                     if not LIVE_TRADING:
                         print(f"[DRY_INTERSECTION_BUY] src={iu_meta.get('source')} {mkt} score={score_dec} KRW={INTERSECTION_BUY_KRW}")
                         ps.mark_intersection_buy(mkt)
                         ps.data.setdefault(mkt, {})["entry_source"] = "intersection"
+                        ps.record_buy(mkt, INTERSECTION_BUY_KRW)
                         available_krw -= INTERSECTION_BUY_KRW
                         buys_done += 1
                         continue
 
-                    # 실제 주문
                     try:
                         resp = await order_market_buy_price(access_key, secret_key, mkt, INTERSECTION_BUY_KRW)
                         uid = resp.get("uuid")
@@ -831,6 +837,7 @@ async def monitor_positions(user_no: int, server_no: int):
                                 print(f"[WARN] 교집합 매수 주문 조회 실패 {mkt} uuid={uid} err={oe}")
                         ps.mark_intersection_buy(mkt)
                         ps.data.setdefault(mkt, {})["entry_source"] = "intersection"
+                        ps.record_buy(mkt, INTERSECTION_BUY_KRW)
                         available_krw -= INTERSECTION_BUY_KRW
                         buys_done += 1
                     except Exception as e:
@@ -865,21 +872,30 @@ async def monitor_positions(user_no: int, server_no: int):
                     print(f"[WARN] RANGE_BUY_KRW({RANGE_BUY_KRW}) < MIN_NOTIONAL_KRW({MIN_NOTIONAL_KRW}) → 스킵")
                     break
 
+                can_buy, cb_reason = ps.can_additional_buy(
+                    market, RANGE_BUY_KRW,
+                    MAX_ADDITIONAL_BUYS, MAX_TOTAL_INVEST_PER_MARKET
+                )
+                if not can_buy:
+                    print(cb_reason)
+                    continue
+
                 if not LIVE_TRADING:
                     print(f"[DRY_BUY] {market} pnl={pnl}% KRW={RANGE_BUY_KRW} window={int(window_start)}")
                     ps.record_buy_window(market, window_start)
                     ps.data.setdefault(market, {})["entry_source"] = "range"
+                    ps.record_buy(market, RANGE_BUY_KRW)
                     available_krw -= RANGE_BUY_KRW
                     buys_executed += 1
                     continue
 
-                # 실거래 주문 (시장가 금액 매수)
                 try:
                     resp = await order_market_buy_price(access_key, secret_key, market, RANGE_BUY_KRW)
                     uid = resp.get("uuid")
                     print(f"[ORDER] RANGE BUY {market} pnl={pnl}% KRW={RANGE_BUY_KRW} uuid={uid}")
                     ps.record_buy_window(market, window_start)
                     ps.data.setdefault(market, {})["entry_source"] = "range"
+                    ps.record_buy(market, RANGE_BUY_KRW)
                     available_krw -= RANGE_BUY_KRW
                     buys_executed += 1
                 except Exception as e:
@@ -894,7 +910,6 @@ async def monitor_positions(user_no: int, server_no: int):
 
         await sleep_until_next_boundary()
 
-
 # =========================================
 # main
 # =========================================
@@ -902,7 +917,6 @@ async def main():
     user_no = 100013
     server_no = 21
     await monitor_positions(user_no, server_no)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
