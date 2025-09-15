@@ -29,7 +29,7 @@ SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 # =========================================
 WATCH_MIN_PNL = Decimal("-1.5")
 ARM_PNL = Decimal("0.25")
-HARD_TP = Decimal("0.6")
+HARD_TP = Decimal("1.5")
 HARD_TP2_OFFSET = Decimal(os.getenv("HARD_TP2_OFFSET", "0.5"))
 HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 
@@ -39,8 +39,8 @@ TRAIL_START_PNL = Decimal("0.45")
 POLL_INTERVAL = 30
 MIN_NOTIONAL_KRW = Decimal("5500")
 
-SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "0.5"))
-HARD_TP_SELL_PORTION = Decimal(os.getenv("HARD_TP_SELL_PORTION", "0.8"))
+SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "1.0"))
+HARD_TP_SELL_PORTION = Decimal(os.getenv("HARD_TP_SELL_PORTION", "1.0"))
 HARD_TP2_SELL_PORTION = Decimal(os.getenv("HARD_TP2_SELL_PORTION", "1.0"))
 
 ENABLE_RANGE_BUY = os.getenv("ENABLE_RANGE_BUY", "1") == "1"
