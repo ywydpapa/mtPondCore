@@ -36,7 +36,7 @@ HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 TRAIL_DROP = Decimal("0.15")
 TRAIL_START_PNL = Decimal("0.45")
 
-POLL_INTERVAL = 30  # (현재 사용 안되거나 로그용이라면 그대로 두어도 무방)
+POLL_INTERVAL = 30  # 참고용
 MIN_NOTIONAL_KRW = Decimal("5500")
 
 SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "1.0"))
@@ -99,15 +99,35 @@ UPRISES_LAST_TS: float | None = None
 UPRISES_EMPTY_STREAK: int = 0
 
 # =========================================
-# 추가 매수 제한 설정 (신규)
+# 추가 매수 제한
 # =========================================
 MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "4"))
 MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "500000"))
 
 # =========================================
-# 틱 인터벌 설정 (20초로 변경)  # CHANGED
+# 틱 인터벌 (20초)
 # =========================================
-INTERVAL_SECONDS = 20  # 기존 30초 → 20초로 변경
+INTERVAL_SECONDS = 20
+
+# =========================================
+# EXCLUDE MARKETS (.env: EXCLUDE_MARKETS=["KRW-BTC","KRW-ETH"] 등)  # EXCLUDE
+# =========================================
+def parse_exclude_markets() -> set:
+    raw = os.getenv("EXCLUDE_MARKETS", "").strip()
+    if not raw:
+        return set()
+    # JSON 리스트 지원
+    if raw.startswith("["):
+        try:
+            arr = json.loads(raw)
+            return {str(x).strip() for x in arr if isinstance(x, (str,))}
+        except Exception:
+            pass
+    # 콤마 구분 지원
+    parts = [p.strip() for p in raw.split(",")]
+    return {p for p in parts if p}
+
+EXCLUDED_MARKETS = parse_exclude_markets()  # EXCLUDE
 
 # =========================================
 # Upbit
@@ -146,6 +166,8 @@ def build_upbit_jwt_with_params(access_key: str, secret_key: str, params: Dict[s
 # =========================================
 # HTTP 유틸
 # =========================================
+import httpx
+
 async def http_get_json(url: str, headers=None, params=None, timeout=10.0, max_retry=5):
     backoff = 2
     for attempt in range(1, max_retry + 1):
@@ -241,6 +263,7 @@ def build_market_list_from_accounts(accounts, base_unit="KRW") -> List[str]:
         if ENFORCE_WHITELIST and WHITELIST_MARKETS and m not in WHITELIST_MARKETS:
             continue
         markets.append(m)
+    # (Exclude 목록은 여기서는 제거하지 않음 → 보유 평가/매도는 유지)  # EXCLUDE
     seen = set()
     uniq = []
     for m in markets:
@@ -251,13 +274,13 @@ def build_market_list_from_accounts(accounts, base_unit="KRW") -> List[str]:
 
 def get_available_krw(raw_accounts: List[Dict[str, Any]]) -> Decimal:
     for acc in raw_accounts:
-        if acc.get("currency") == "KRW":
-            try:
-                bal = Decimal(str(acc.get("balance", "0")))
-                locked = Decimal(str(acc.get("locked", "0")))
-                return bal - locked
-            except:
-                return Decimal("0")
+            if acc.get("currency") == "KRW":
+                try:
+                    bal = Decimal(str(acc.get("balance", "0")))
+                    locked = Decimal(str(acc.get("locked", "0")))
+                    return bal - locked
+                except:
+                    return Decimal("0")
     return Decimal("0")
 
 def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decimal], base_unit="KRW") -> List[dict]:
@@ -270,7 +293,6 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
             avg_buy_price = Decimal(str(avg_raw)) if avg_raw not in (None, "", "0") else Decimal("0")
         except InvalidOperation:
             avg_buy_price = Decimal("0")
-
         market = None
         current_price = None
         pnl_percent = None
@@ -284,16 +306,13 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
                     ratio = (current_price / avg_buy_price).quantize(Decimal("0.0001"))
                 except:
                     pass
-
         def to_decimal(v):
             try:
                 return Decimal(str(v))
             except:
                 return Decimal("0")
-
         balance = to_decimal(acc.get("balance"))
         locked = to_decimal(acc.get("locked"))
-
         enriched.append({
             "currency": currency,
             "market": market,
@@ -495,22 +514,12 @@ def safe_calc_volume(balance: Decimal, portion: Decimal) -> Decimal:
         return Decimal("0")
     return vol
 
-# =========================================
-# (기존 align_to_half_minute → 20초 정렬)  # CHANGED
-# =========================================
 async def align_to_half_minute():
-    """
-    20초 간격 경계(초 % 20 == 0)에 맞춰 시작 대기.
-    """
     now = time.time()
     remainder = now % INTERVAL_SECONDS
-    # 부동소수 오차 여유 0.01
     if remainder > 0.01:
         await asyncio.sleep(INTERVAL_SECONDS - remainder)
 
-# =========================================
-# 경계 슬립도 20초 단위로 변경  # CHANGED
-# =========================================
 async def sleep_until_next_boundary():
     now = time.time()
     next_boundary = math.floor(now / INTERVAL_SECONDS) * INTERVAL_SECONDS + INTERVAL_SECONDS
@@ -625,6 +634,8 @@ async def monitor_positions(user_no: int, server_no: int):
     access_key, secret_key = keys
     ps = PositionState()
     print("=== 시작 ===")
+    if EXCLUDED_MARKETS:  # EXCLUDE
+        print(f"[INFO] 매수 제외 목록: {sorted(EXCLUDED_MARKETS)}")
 
     await align_to_half_minute()
 
@@ -653,6 +664,7 @@ async def monitor_positions(user_no: int, server_no: int):
         actions = []
         sell_orders: List[Dict[str, Any]] = []
 
+        # ---------- 보유 종목 매도 판단 ----------
         for it in enriched:
             market = it.get("market")
             pnl = it.get("pnl_percent")
@@ -703,6 +715,7 @@ async def monitor_positions(user_no: int, server_no: int):
                     "portion": portion
                 })
 
+        # ---------- 매도 실행 ----------
         for so in sell_orders:
             market = so["market"]
             volume = so["volume"]
@@ -756,6 +769,7 @@ async def monitor_positions(user_no: int, server_no: int):
                     st["peak_pnl"] = pnl
                     st["armed"] = False
 
+        # ---------- 교집합 매수 ----------
         if INTERSECTION_BUY_ENABLED:
             try:
                 intersection_candidates, iu_meta = await get_intersection_candidates_safe()
@@ -776,6 +790,9 @@ async def monitor_positions(user_no: int, server_no: int):
                     mkt = row.get("market")
                     score = row.get("avg_score")
                     if not mkt or score is None:
+                        continue
+                    if mkt in EXCLUDED_MARKETS:  # EXCLUDE
+                        print(f"[SKIP] {mkt} 제외 목록 (교집합)")
                         continue
                     try:
                         score_dec = Decimal(str(score))
@@ -827,6 +844,7 @@ async def monitor_positions(user_no: int, server_no: int):
                     except Exception as e:
                         print(f"[ERR] 교집합 매수 실패 {mkt}: {e}")
 
+        # ---------- Range 매수 (5분 경계) ----------
         now_ts = time.time()
         is_5m, window_start = is_five_minute_boundary(now_ts)
         if ENABLE_RANGE_BUY and is_5m:
@@ -837,6 +855,8 @@ async def monitor_positions(user_no: int, server_no: int):
                 pnl = it.get("pnl_percent")
                 cur_price = it.get("current_price")
                 if not market or pnl is None or cur_price is None:
+                    continue
+                if market in EXCLUDED_MARKETS:  # EXCLUDE
                     continue
                 if ps.recently_sold(market):
                     continue
@@ -881,6 +901,7 @@ async def monitor_positions(user_no: int, server_no: int):
                 except Exception as e:
                     print(f"[ERR] RANGE 매수 실패 {market}: {e}")
 
+        # ---------- 상태 로그 ----------
         if actions:
             print(f"\n[{time.strftime('%H:%M:%S')}] 결과:")
             for a in actions:
