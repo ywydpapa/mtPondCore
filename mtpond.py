@@ -36,7 +36,7 @@ HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 TRAIL_DROP = Decimal("0.15")
 TRAIL_START_PNL = Decimal("0.45")
 
-POLL_INTERVAL = 30
+POLL_INTERVAL = 30  # (현재 사용 안되거나 로그용이라면 그대로 두어도 무방)
 MIN_NOTIONAL_KRW = Decimal("5500")
 
 SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "1.0"))
@@ -101,8 +101,13 @@ UPRISES_EMPTY_STREAK: int = 0
 # =========================================
 # 추가 매수 제한 설정 (신규)
 # =========================================
-MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "4"))  # 최초 1회 이후 추가 가능한 횟수
-MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "500000"))  # 0이면 비활성
+MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "4"))
+MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "500000"))
+
+# =========================================
+# 틱 인터벌 설정 (20초로 변경)  # CHANGED
+# =========================================
+INTERVAL_SECONDS = 20  # 기존 30초 → 20초로 변경
 
 # =========================================
 # Upbit
@@ -267,7 +272,6 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
             avg_buy_price = Decimal("0")
 
         market = None
-          # This is correct indentation
         current_price = None
         pnl_percent = None
         ratio = None
@@ -288,7 +292,6 @@ def enrich_accounts_with_prices(accounts: List[dict], price_map: Dict[str, Decim
                 return Decimal("0")
 
         balance = to_decimal(acc.get("balance"))
-          # Indentation
         locked = to_decimal(acc.get("locked"))
 
         enriched.append({
@@ -356,7 +359,6 @@ class PositionState:
         self.last_sell_time: Dict[str, float] = {}
         self.last_buy_window: Dict[str, float] = {}
         self.intersection_last_buy_time: Dict[str, float] = {}
-        # 매수 이력
         self.buy_info: Dict[str, Dict[str, Any]] = {}
 
     def update_or_init(self, market: str, pnl: Decimal, avg_price: Decimal):
@@ -449,7 +451,6 @@ class PositionState:
         return True, "OK"
 
 def apply_momentum_extension(state: dict):
-    # 필요 시 Momentum 동적 확장 로직 구현
     pass
 
 def get_state_decimal(state: dict, key: str, default: Decimal) -> Decimal:
@@ -494,11 +495,26 @@ def safe_calc_volume(balance: Decimal, portion: Decimal) -> Decimal:
         return Decimal("0")
     return vol
 
+# =========================================
+# (기존 align_to_half_minute → 20초 정렬)  # CHANGED
+# =========================================
 async def align_to_half_minute():
+    """
+    20초 간격 경계(초 % 20 == 0)에 맞춰 시작 대기.
+    """
     now = time.time()
-    remainder = now % 30
+    remainder = now % INTERVAL_SECONDS
+    # 부동소수 오차 여유 0.01
     if remainder > 0.01:
-        await asyncio.sleep(30 - remainder)
+        await asyncio.sleep(INTERVAL_SECONDS - remainder)
+
+# =========================================
+# 경계 슬립도 20초 단위로 변경  # CHANGED
+# =========================================
+async def sleep_until_next_boundary():
+    now = time.time()
+    next_boundary = math.floor(now / INTERVAL_SECONDS) * INTERVAL_SECONDS + INTERVAL_SECONDS
+    await asyncio.sleep(max(0, next_boundary - now))
 
 def is_five_minute_boundary(ts: float) -> Tuple[bool, float]:
     window_start = ts - (ts % FIVE_MIN_SECONDS)
@@ -506,11 +522,6 @@ def is_five_minute_boundary(ts: float) -> Tuple[bool, float]:
     if lt.tm_min % 5 == 0 and lt.tm_sec == 0:
         return True, window_start
     return False, window_start
-
-async def sleep_until_next_boundary():
-    now = time.time()
-    next_boundary = math.floor(now / 30) * 30 + 30
-    await asyncio.sleep(max(0, next_boundary - now))
 
 # =========================================
 # 교집합 데이터 안전 처리
@@ -556,38 +567,24 @@ def _normalize_uprises(raw) -> List[dict]:
     return []
 
 async def get_intersection_candidates_safe() -> Tuple[List[dict], dict]:
-    """
-    uprises() 호출 + empty 처리 + 캐시 재사용
-    meta: {
-      source: fresh|cache|empty,
-      empty_streak: int,
-      fresh_ts: float or None,
-      cache_age: float or None
-    }
-    """
     global UPRISES_LAST_NONEMPTY, UPRISES_LAST_TS, UPRISES_EMPTY_STREAK
-
     meta = {
         "source": None,
         "empty_streak": UPRISES_EMPTY_STREAK,
         "fresh_ts": None,
         "cache_age": None
     }
-
     try:
         raw = topuprise.uprises()
     except Exception as e:
         raw = None
         print(f"[WARN] uprises() 호출 예외: {e}")
-
     candidates = _normalize_uprises(raw)
     now = time.time()
     meta["fresh_ts"] = now
-
     if _is_effectively_empty(candidates):
         UPRISES_EMPTY_STREAK += 1
         meta["empty_streak"] = UPRISES_EMPTY_STREAK
-
         use_cache = False
         if (INTERSECTION_USE_CACHE_ON_EMPTY
                 and UPRISES_LAST_NONEMPTY
@@ -596,7 +593,6 @@ async def get_intersection_candidates_safe() -> Tuple[List[dict], dict]:
             meta["cache_age"] = age
             if age <= INTERSECTION_CACHE_TTL_SEC:
                 use_cache = True
-
         if use_cache:
             meta["source"] = "cache"
             candidates = UPRISES_LAST_NONEMPTY
@@ -657,7 +653,6 @@ async def monitor_positions(user_no: int, server_no: int):
         actions = []
         sell_orders: List[Dict[str, Any]] = []
 
-        # ---------- 보유 종목 처리 / 매도 판단 ----------
         for it in enriched:
             market = it.get("market")
             pnl = it.get("pnl_percent")
@@ -708,7 +703,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     "portion": portion
                 })
 
-        # ---------- 매도 실행 ----------
         for so in sell_orders:
             market = so["market"]
             volume = so["volume"]
@@ -717,11 +711,9 @@ async def monitor_positions(user_no: int, server_no: int):
             reason = so["reason"]
             st = so["state_ref"]
             portion = so["portion"]
-
             if volume <= 0:
                 print(f"[SKIP] {market} 매도 volume<=0 cat={category}")
                 continue
-
             if not LIVE_TRADING:
                 print(f"[DRY_SELL] {market} cat={category} vol={volume} pnl={pnl}% reason={reason}")
                 if category == "HARD_TP1":
@@ -737,7 +729,6 @@ async def monitor_positions(user_no: int, server_no: int):
                         st["peak_pnl"] = pnl
                         st["armed"] = False
                 continue
-
             try:
                 resp = await order_market_sell(access_key, secret_key, market, volume)
                 uid = resp.get("uuid")
@@ -752,7 +743,6 @@ async def monitor_positions(user_no: int, server_no: int):
             except Exception as se:
                 print(f"[ERR] 매도 주문 실패 {market}: {se}")
                 continue
-
             if category == "HARD_TP1":
                 st["hard_tp_taken"] = True
             elif category == "HARD_TP2":
@@ -766,7 +756,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     st["peak_pnl"] = pnl
                     st["armed"] = False
 
-        # ---------- 교집합 매수 ----------
         if INTERSECTION_BUY_ENABLED:
             try:
                 intersection_candidates, iu_meta = await get_intersection_candidates_safe()
@@ -774,7 +763,6 @@ async def monitor_positions(user_no: int, server_no: int):
                 intersection_candidates = []
                 iu_meta = {"source": "error", "empty_streak": -1}
                 print(f"[WARN] 교집합 안전 호출 실패: {e}")
-
             if iu_meta.get("source") == "empty":
                 print(f"[INFO] 교집합 데이터 없음(empty_streak={iu_meta.get('empty_streak')}) → 매수 스킵")
             else:
@@ -795,7 +783,6 @@ async def monitor_positions(user_no: int, server_no: int):
                         continue
                     if score_dec < INTERSECTION_MIN_SCORE:
                         continue
-
                     can_buy, cb_reason = ps.can_additional_buy(
                         mkt, INTERSECTION_BUY_KRW,
                         MAX_ADDITIONAL_BUYS, MAX_TOTAL_INVEST_PER_MARKET
@@ -803,7 +790,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     if not can_buy:
                         print(cb_reason)
                         continue
-
                     if SKIP_BUY_IF_RECENT_SELL and ps.recently_sold(mkt):
                         continue
                     if ps.recently_bought_intersection(mkt, INTERSECTION_BUY_COOLDOWN_SEC):
@@ -814,7 +800,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     if available_krw < INTERSECTION_BUY_KRW:
                         print(f"[INFO] 교집합 {mkt} 매수 KRW 부족 need={INTERSECTION_BUY_KRW} avail={available_krw}")
                         break
-
                     if not LIVE_TRADING:
                         print(f"[DRY_INTERSECTION_BUY] src={iu_meta.get('source')} {mkt} score={score_dec} KRW={INTERSECTION_BUY_KRW}")
                         ps.mark_intersection_buy(mkt)
@@ -823,7 +808,6 @@ async def monitor_positions(user_no: int, server_no: int):
                         available_krw -= INTERSECTION_BUY_KRW
                         buys_done += 1
                         continue
-
                     try:
                         resp = await order_market_buy_price(access_key, secret_key, mkt, INTERSECTION_BUY_KRW)
                         uid = resp.get("uuid")
@@ -843,7 +827,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     except Exception as e:
                         print(f"[ERR] 교집합 매수 실패 {mkt}: {e}")
 
-        # ---------- Range 매수 (5분 경계) ----------
         now_ts = time.time()
         is_5m, window_start = is_five_minute_boundary(now_ts)
         if ENABLE_RANGE_BUY and is_5m:
@@ -871,7 +854,6 @@ async def monitor_positions(user_no: int, server_no: int):
                 if RANGE_BUY_KRW < MIN_NOTIONAL_KRW:
                     print(f"[WARN] RANGE_BUY_KRW({RANGE_BUY_KRW}) < MIN_NOTIONAL_KRW({MIN_NOTIONAL_KRW}) → 스킵")
                     break
-
                 can_buy, cb_reason = ps.can_additional_buy(
                     market, RANGE_BUY_KRW,
                     MAX_ADDITIONAL_BUYS, MAX_TOTAL_INVEST_PER_MARKET
@@ -879,7 +861,6 @@ async def monitor_positions(user_no: int, server_no: int):
                 if not can_buy:
                     print(cb_reason)
                     continue
-
                 if not LIVE_TRADING:
                     print(f"[DRY_BUY] {market} pnl={pnl}% KRW={RANGE_BUY_KRW} window={int(window_start)}")
                     ps.record_buy_window(market, window_start)
@@ -888,7 +869,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     available_krw -= RANGE_BUY_KRW
                     buys_executed += 1
                     continue
-
                 try:
                     resp = await order_market_buy_price(access_key, secret_key, market, RANGE_BUY_KRW)
                     uid = resp.get("uuid")
@@ -901,7 +881,6 @@ async def monitor_positions(user_no: int, server_no: int):
                 except Exception as e:
                     print(f"[ERR] RANGE 매수 실패 {market}: {e}")
 
-        # ---------- 상태 로그 ----------
         if actions:
             print(f"\n[{time.strftime('%H:%M:%S')}] 결과:")
             for a in actions:
@@ -910,9 +889,6 @@ async def monitor_positions(user_no: int, server_no: int):
 
         await sleep_until_next_boundary()
 
-# =========================================
-# main
-# =========================================
 async def main():
     user_no = 100013
     server_no = 21
