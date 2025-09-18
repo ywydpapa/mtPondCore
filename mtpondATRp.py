@@ -51,7 +51,7 @@ BASE_UNIT = "KRW"
 
 # DRY 모드 대응 (기존 FORCE_LIVE True 고정 제거)
 FORCE_LIVE = os.getenv("FORCE_LIVE", "0") == "1"
-LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
+LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "0") or FORCE_LIVE
 if not LIVE_TRADING:
     print("[MODE] DRY_RUN (실제 주문 미전송)")
 
