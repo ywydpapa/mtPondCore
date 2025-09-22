@@ -110,7 +110,7 @@ INTERSECTION_MAX_TICKS = int(os.getenv("INTERSECTION_MAX_TICKS", "10"))  # 10틱
 UPRISES_LAST_NONEMPTY: List[dict] = []
 UPRISES_LAST_TS: float | None = None
 UPRISES_EMPTY_STREAK: int = 0
-INTERVAL_SECONDS = 20
+INTERVAL_SECONDS = 5
 
 # --------------------------------
 # 활성 포지션 계산 함수
@@ -797,27 +797,17 @@ async def monitor_positions(user_no:int, server_no:int):
             print("[ERR] 잔고 조회 실패:", e)
             await sleep_until_next_boundary()
             continue
-
-        # (A) 현재 지원 마켓(캐시) 로드
         tradable = await load_tradable_markets()
-
-        # (B) 잔고 기반 마켓 추출
         markets_raw = build_market_list_from_accounts(raw_accounts, BASE_UNIT)
-        # (C) 거래중지(orphan) 식별
         invalid = [m for m in markets_raw if m not in tradable]
         if invalid:
-        # 너무 자주 찍히지 않도록 원하면 throttle 가능
             print(f"[LOOP] 거래지원 종료(orphan) 제외: {invalid}")
         markets = [m for m in markets_raw if m in tradable]
-        # (D) 안전 가격 조회
-
         try:
             price_map = await safe_fetch_current_prices(markets)
         except Exception as e:
-        # safe_fetch_current_prices 가 내부 처리하므로 여기 도달 거의 없음
             print(f"[WARN] safe 가격 조회 실패: {e}")
             price_map = {}
-        # (E) enrich - 가격 없는 항목 필터링
         enriched_all = enrich_accounts_with_prices(raw_accounts, price_map, BASE_UNIT)
         enriched = [r for r in enriched_all if r.get("current_price") is not None]
         available_krw = get_available_krw(raw_accounts)
