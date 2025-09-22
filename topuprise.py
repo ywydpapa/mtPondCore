@@ -12,7 +12,7 @@ API_URL = "http://ywydpapa.iptime.org:8000/api/bbtrend30"
 REFRESH_INTERVAL_SEC = 30
 TIMEOUT_SEC = 8
 DEFAULT_TOP_N = 8
-TARGET_TIMEFRAMES = ["5m", "15m", "30m"]
+TARGET_TIMEFRAMES = ["3m", "5m", "15m", "30m"]
 MIN_BANDWIDTH = 0.7   # 0.7% 미만 코인 제외 (BandWidth 단위가 %)
 
 # 스코어 / 필터 파라미터
@@ -331,7 +331,7 @@ def build_intersection_json(
     include_fields: tuple = ("BB_Pos","BandWidth","RSI","MACD_Hist","Trend10","time")
 ) -> dict:
     if tfs is None:
-        tfs = ["5m","15m","30m"]
+        tfs = ["3m","5m","15m","30m"]
     rows = store.multi_tf_intersection(
         tfs,
         lambda c: c.combined_score(),
@@ -395,7 +395,7 @@ def build_full_snapshot_json(
         "summary": store.snapshot_summary(),
         "top_per_timeframe": build_top_per_timeframe_json(top_n),
         "multi_tf_intersection": build_intersection_json(
-            tfs=intersection_tfs or ["5m","15m","30m"],
+            tfs=intersection_tfs or ["3m","5m","15m","30m"],
             per_tf_top=per_tf_top,
             final_limit=final_limit
         ),
