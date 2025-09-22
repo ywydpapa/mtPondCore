@@ -21,13 +21,10 @@ dotenv.load_dotenv()
 
 engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
-
-MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "20"))
+MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "10"))
 ALLOW_ADDITIONAL_BUY_WHEN_FULL = os.getenv("ALLOW_ADDITIONAL_BUY_WHEN_FULL", "1") == "1"
-
 # (옵션) 초과 시 자동 정리 기능 확장용 환경변수 (현재는 사용 안 하더라도 틀 제공)
 PRUNE_EXCESS_ENABLED = os.getenv("PRUNE_EXCESS_ENABLED", "0") == "1"
 TARGET_ACTIVE_MARKETS = int(os.getenv("TARGET_ACTIVE_MARKETS", "0"))  # 0이면 비활성
@@ -41,21 +38,41 @@ HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 
 TRAIL_DROP = Decimal("0.15")
 TRAIL_START_PNL = Decimal("0.45")
+INTERSECTION_BUY_ENABLED = os.getenv("INTERSECTION_BUY_ENABLED", "1") == "1"
+INTERSECTION_MIN_SCORE = Decimal(os.getenv("INTERSECTION_MIN_SCORE", "10"))
+INTERSECTION_BUY_KRW = Decimal(os.getenv("INTERSECTION_BUY_KRW", "200000"))
+RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
+MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "5"))
+MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "400000"))
+INTERSECTION_MAX_BUY_PER_CYCLE = int(os.getenv("INTERSECTION_MAX_BUY_PER_CYCLE", "1"))
+INTERSECTION_BUY_COOLDOWN_SEC = int(os.getenv("INTERSECTION_BUY_COOLDOWN_SEC", "999999"))
+ENABLE_STOP_TRAIL = os.getenv("ENABLE_STOP_TRAIL", "1") == "1"
+STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.7"))
+STOP_SELL_PORTION = Decimal(os.getenv("STOP_SELL_PORTION", "0.10"))
+STOP_PEAK_INCREMENT = Decimal(os.getenv("STOP_PEAK_INCREMENT", "0.1"))
+STOP_MAX_SELLS = int(os.getenv("STOP_MAX_SELLS", "6"))
+STOP_DISABLE_NEW_BUYS = os.getenv("STOP_DISABLE_NEW_BUYS", "1") == "1"
+STOP_REBOUND_COOLDOWN_SEC = int(os.getenv("STOP_REBOUND_COOLDOWN_SEC", "30"))
+STOP_RECOVERY_EXIT_PNL = os.getenv("STOP_RECOVERY_EXIT_PNL", None)
+if STOP_RECOVERY_EXIT_PNL is not None:
+    try: STOP_RECOVERY_EXIT_PNL = Decimal(str(STOP_RECOVERY_EXIT_PNL))
+    except: STOP_RECOVERY_EXIT_PNL = None
+STOP_COOLDOWN_BATCH_SELL = os.getenv("STOP_COOLDOWN_BATCH_SELL", "1") == "1"
+STOP_COOLDOWN_MAX_BATCH = int(os.getenv("STOP_COOLDOWN_MAX_BATCH", "5"))
+STOP_RECOVERY_REQUIRE_COOLDOWN = os.getenv("STOP_RECOVERY_REQUIRE_COOLDOWN", "1") == "1"
+STOP_RECOVERY_LOG = os.getenv("STOP_RECOVERY_LOG", "1") == "1"
+UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
-POLL_INTERVAL = 30
+POLL_INTERVAL = 5
 MIN_NOTIONAL_KRW = Decimal("5500")
-
 SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "1.0"))
 HARD_TP_SELL_PORTION = Decimal(os.getenv("HARD_TP_SELL_PORTION", "0.7"))
 HARD_TP2_SELL_PORTION = Decimal(os.getenv("HARD_TP2_SELL_PORTION", "1.0"))
-
 ENABLE_RANGE_BUY = os.getenv("ENABLE_RANGE_BUY", "1") == "1"
 BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-0.2"))
 BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.15"))
-RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
 MAX_BUY_PER_WINDOW = int(os.getenv("MAX_BUY_PER_WINDOW", "999"))
 SKIP_BUY_IF_RECENT_SELL = True
-
 STOP_SIMPLE_MODE = os.getenv("STOP_SIMPLE_MODE", "1") == "1"
 STOP_INITIAL_SELL_PORTION = Decimal(os.getenv("STOP_INITIAL_SELL_PORTION", "0.5"))  # 최초 50%
 STOP_FINAL_MOVE_THRESHOLD = Decimal(os.getenv("STOP_FINAL_MOVE_THRESHOLD", "0.1"))  # PNL 절대변동 0.1%
@@ -82,17 +99,9 @@ MOMENTUM_TIER3_SEC = int(os.getenv("MOMENTUM_TIER3_SEC", "300"))
 MOMENTUM_TIER3_TP_OFFSET = Decimal(os.getenv("MOMENTUM_TIER3_TP_OFFSET", "0.3"))
 MOMENTUM_TIER3_TRAIL_EXTRA = Decimal(os.getenv("MOMENTUM_TIER3_TRAIL_EXTRA", "0.10"))
 MOMENTUM_MAX_EXTRA_CAP = Decimal(os.getenv("MOMENTUM_MAX_EXTRA_CAP", "1.2"))
-
-INTERSECTION_BUY_ENABLED = os.getenv("INTERSECTION_BUY_ENABLED", "1") == "1"
-INTERSECTION_MIN_SCORE = Decimal(os.getenv("INTERSECTION_MIN_SCORE", "10"))
-INTERSECTION_BUY_KRW = Decimal(os.getenv("INTERSECTION_BUY_KRW", "200000"))
-INTERSECTION_MAX_BUY_PER_CYCLE = int(os.getenv("INTERSECTION_MAX_BUY_PER_CYCLE", "1"))
-INTERSECTION_BUY_COOLDOWN_SEC = int(os.getenv("INTERSECTION_BUY_COOLDOWN_SEC", "999999"))
-
 INTERSECTION_USE_CACHE_ON_EMPTY = os.getenv("INTERSECTION_USE_CACHE_ON_EMPTY", "1") == "1"
 INTERSECTION_CACHE_TTL_SEC = int(os.getenv("INTERSECTION_CACHE_TTL_SEC", "180"))
 INTERSECTION_MAX_EMPTY_WARN = int(os.getenv("INTERSECTION_MAX_EMPTY_WARN", "5"))
-
 # === (NEW) Intersection Tick Filter ===
 INTERSECTION_TICK_FILTER_ENABLED = os.getenv("INTERSECTION_TICK_FILTER_ENABLED", "1") == "1"
 INTERSECTION_TARGET_PROFIT_PCT = Decimal(os.getenv("INTERSECTION_TARGET_PROFIT_PCT", "0.4"))  # %
@@ -101,10 +110,6 @@ INTERSECTION_MAX_TICKS = int(os.getenv("INTERSECTION_MAX_TICKS", "10"))  # 10틱
 UPRISES_LAST_NONEMPTY: List[dict] = []
 UPRISES_LAST_TS: float | None = None
 UPRISES_EMPTY_STREAK: int = 0
-
-MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "5"))
-MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "400000"))
-
 INTERVAL_SECONDS = 20
 
 # --------------------------------
@@ -252,22 +257,6 @@ def parse_exclude_markets() -> set:
 EXCLUDED_MARKETS = parse_exclude_markets()
 
 # Stop trail
-ENABLE_STOP_TRAIL = os.getenv("ENABLE_STOP_TRAIL", "1") == "1"
-STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.7"))
-STOP_SELL_PORTION = Decimal(os.getenv("STOP_SELL_PORTION", "0.10"))
-STOP_PEAK_INCREMENT = Decimal(os.getenv("STOP_PEAK_INCREMENT", "0.30"))
-STOP_MAX_SELLS = int(os.getenv("STOP_MAX_SELLS", "6"))
-STOP_DISABLE_NEW_BUYS = os.getenv("STOP_DISABLE_NEW_BUYS", "1") == "1"
-STOP_REBOUND_COOLDOWN_SEC = int(os.getenv("STOP_REBOUND_COOLDOWN_SEC", "30"))
-STOP_RECOVERY_EXIT_PNL = os.getenv("STOP_RECOVERY_EXIT_PNL", None)
-if STOP_RECOVERY_EXIT_PNL is not None:
-    try: STOP_RECOVERY_EXIT_PNL = Decimal(str(STOP_RECOVERY_EXIT_PNL))
-    except: STOP_RECOVERY_EXIT_PNL = None
-STOP_COOLDOWN_BATCH_SELL = os.getenv("STOP_COOLDOWN_BATCH_SELL", "1") == "1"
-STOP_COOLDOWN_MAX_BATCH = int(os.getenv("STOP_COOLDOWN_MAX_BATCH", "5"))
-STOP_RECOVERY_REQUIRE_COOLDOWN = os.getenv("STOP_RECOVERY_REQUIRE_COOLDOWN", "1") == "1"
-STOP_RECOVERY_LOG = os.getenv("STOP_RECOVERY_LOG", "1") == "1"
-UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
 async def get_keys(user_no: int, server_no: int) -> Optional[tuple]:
     async with SessionLocal() as session:
@@ -623,6 +612,103 @@ async def get_intersection_candidates_safe():
         meta["source"]="fresh"; meta["empty_streak"]=0; meta["cache_age"]=0
         return cands, meta
 
+
+# ===== 추가: 전역 캐시 =====
+TRADABLE_MARKETS_CACHE = set()
+TRADABLE_MARKETS_CACHE_TS = 0
+TRADABLE_CACHE_TTL_SEC = 3600  # 1시간
+
+async def load_tradable_markets():
+    global TRADABLE_MARKETS_CACHE, TRADABLE_MARKETS_CACHE_TS
+    now = time.time()
+    if TRADABLE_MARKETS_CACHE and (now - TRADABLE_MARKETS_CACHE_TS) < TRADABLE_CACHE_TTL_SEC:
+        return TRADABLE_MARKETS_CACHE
+    try:
+        # Upbit: GET /v1/market/all
+        # 응답: [{"market":"KRW-BTC","korean_name":"비트코인","english_name":"Bitcoin"}, ...]
+        async with httpx.AsyncClient(timeout=5) as cli:
+            r = await cli.get("https://api.upbit.com/v1/market/all")
+            r.raise_for_status()
+            data = r.json()
+        TRADABLE_MARKETS_CACHE = {d["market"] for d in data}
+        TRADABLE_MARKETS_CACHE_TS = now
+    except Exception as e:
+        print(f"[WARN] 시장목록 갱신 실패: {e} (이전 캐시 사용)")
+    return TRADABLE_MARKETS_CACHE
+
+# ===== 추가: 안전한 시세 조회 래퍼 =====
+async def safe_fetch_current_prices(markets):
+    """
+    markets: list[str]
+    반환: {market: price} (조회 성공분만)
+    404 발생하는 마켓은 제외하고 로그만 남김
+    """
+    if not markets:
+        return {}
+    # 기존 fetch_current_prices 가 여러 마켓을 콤마로 받는 형태라고 가정
+    try:
+        return await fetch_current_prices(markets)
+    except Exception as e:
+        # 1) 전체 실패 → 개별 분리
+        err_txt = str(e)
+        if "404" not in err_txt:
+            # 404 가 아닌 다른 네트워크 오류면 그대로 경고 후 일부라도 시도
+            print(f"[WARN] 일괄시세 조회 실패: {e} → 개별 재시도")
+        invalid = []
+        price_map = {}
+        for m in markets:
+            try:
+                one = await fetch_current_prices([m])
+                price_map.update(one)
+            except Exception as ie:
+                if "404" in str(ie):
+                    invalid.append(m)
+                else:
+                    print(f"[WARN] 단일티커 실패 {m}: {ie}")
+        if invalid:
+            print(f"[INIT] 거래불가(orphan)로 제외된 마켓: {invalid}")
+        return price_map
+
+# ===== (선택) enrich 보조: 가격 없으면 skip =====
+def enrich_accounts_with_prices_safe(accounts, price_map, base_unit):
+    enriched = []
+    for acc in accounts:
+        mkt = acc.get("market")
+        if not mkt:
+            continue
+        price = price_map.get(mkt)
+        if price is None:
+            # 가격 조회 안됨 → orphan or 비거래
+            continue
+        # 기존 enrich_accounts_with_prices 와 동일한 필드 생성 (예시)
+        enriched.append({
+            "market": mkt,
+            "balance": acc.get("balance"),
+            "avg_buy_price": acc.get("avg_buy_price"),
+            "current_price": price,
+            # pnl 계산 등 기존 로직 호출 또는 재사용
+            "pnl_percent": calc_pnl_percent(acc, price)  # 가정
+        })
+    return enriched
+
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+
+def calc_pnl_percent(account: dict, current_price) -> Decimal:
+    try:
+        avg_buy_price = Decimal(str(account.get("avg_buy_price", "0")))
+        balance = Decimal(str(account.get("balance", "0")))
+        locked = Decimal(str(account.get("locked", "0")))
+        qty = balance + locked
+        if qty <= 0 or avg_buy_price <= 0:
+            return Decimal("0")
+        cur = Decimal(str(current_price))
+        pnl = (cur - avg_buy_price) / avg_buy_price * Decimal("100")
+        # 필요에 따라 자리수 조정
+        return pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError):
+        return Decimal("0")
+
+
 async def monitor_positions(user_no:int, server_no:int):
     keys = await get_keys(user_no, server_no)
     active_flag = await get_active_flag(user_no)
@@ -646,30 +732,58 @@ async def monitor_positions(user_no:int, server_no:int):
             print(f"[INFO] SIMPLE_STOP initial_portion={STOP_INITIAL_SELL_PORTION} final_move={STOP_FINAL_MOVE_THRESHOLD}%")
     print(f"[INFO] MAX_ACTIVE_MARKETS={MAX_ACTIVE_MARKETS} ALLOW_ADDITIONAL_BUY_WHEN_FULL={ALLOW_ADDITIONAL_BUY_WHEN_FULL}")
 
-    # 초기 계좌 스냅샷
     try:
         init_accounts = await fetch_upbit_accounts(access_key, secret_key)
-        init_markets = build_market_list_from_accounts(init_accounts, BASE_UNIT)
-        init_prices = await fetch_current_prices(init_markets)
-        init_enriched = enrich_accounts_with_prices(init_accounts, init_prices, BASE_UNIT)
+
+        # 1) 현재 지원 마켓 목록
+        tradable = await load_tradable_markets()
+
+        # 2) 잔고에서 마켓 추출
+        raw_markets = build_market_list_from_accounts(init_accounts, BASE_UNIT)
+
+        # 3) 트레이더블/오펀 분리
+        tradable_markets = [m for m in raw_markets if m in tradable]
+        orphan_markets = [m for m in raw_markets if m not in tradable]
+
+        if orphan_markets:
+            print(f"[INIT] 거래지원 종료로 추정되는 잔고 {len(orphan_markets)}개 제외: {orphan_markets}")
+
+        # 4) 가격 조회 (404 안전)
+        init_prices = await safe_fetch_current_prices(tradable_markets)
+
+        # 5) enrich (가격 없는 건 skip)
+        init_enriched = enrich_accounts_with_prices_safe(init_accounts, init_prices, BASE_UNIT)
+
+        skipped = set(tradable_markets) - set(init_prices.keys())
+        if skipped:
+            print(f"[INIT] 가격 미확보로 제외된 마켓: {sorted(skipped)}")
+
         for it in init_enriched:
-            mkt = it.get("market"); bal = it.get("balance"); avg = it.get("avg_buy_price")
-            if not mkt or not bal or not avg or bal <= 0 or avg <= 0:
+            mkt = it.get("market");
+            bal = it.get("balance");
+            avg = it.get("avg_buy_price")
+            if not mkt or not bal or not avg:
+                continue
+            try:
+                if bal <= 0 or avg <= 0:
+                    continue
+            except:
                 continue
             est = (bal * avg).quantize(Decimal("0.0001"))
             ps.buy_info[mkt] = {"total_buys": 1, "total_invested": est}
             st = ps.data.setdefault(mkt, {})
             st["entry_source"] = "pre_existing"
-            # stop 관련 기본 필드
             for k, v in {
-                "stop_triggered": False, "stop_last_peak": None, "stop_sells_done": 0, "worst_pnl": Decimal("0"),
-                "stop_last_sell_ts": None, "stop_cooldown_flag": False, "stop_pending_peak": None,
-                "stop_cooldown_start_ts": None
+                "stop_triggered": False, "stop_last_peak": None, "stop_sells_done": 0,
+                "worst_pnl": Decimal("0"), "stop_last_sell_ts": None, "stop_cooldown_flag": False,
+                "stop_pending_peak": None, "stop_cooldown_start_ts": None
             }.items():
                 st.setdefault(k, v)
-        print(f"[INFO] 초기 추적 {len(ps.buy_info)}개")
+
+        print(f"[INFO] 초기 추적 {len(ps.buy_info)}개 (orphan={len(orphan_markets)}, skipped_prices={len(skipped)})")
     except Exception as e:
-        print(f"[WARN] 초기화 실패: {e}")
+        # 여기서도 완전히 멈추지 않고 빈 상태로 진행
+        print(f"[WARN] 초기화 부분적 실패 (계속 진행): {e}")
 
     await align_to_half_minute()
 
@@ -1332,7 +1446,7 @@ async def sleep_until_next_boundary():
     await asyncio.sleep(max(0,nxt-now))
 
 async def main():
-    user_no = int(os.getenv("USER_NO", "100013"))
+    user_no = int(os.getenv("USER_NO", "100020"))
     server_no = int(os.getenv("SERVER_NO", "21"))
     await run_mtpond_controller(user_no, server_no)
 
