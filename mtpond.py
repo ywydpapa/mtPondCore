@@ -33,7 +33,6 @@ SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
 BASE_UNIT = "KRW"
-
 # ============================================================
 # 4. STATIC CONFIG (재시작 필요 / 거의 고정)
 # ============================================================
@@ -44,7 +43,6 @@ HARD_TP2_OFFSET = Decimal(os.getenv("HARD_TP2_OFFSET", "0.5"))
 HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 TRAIL_DROP = Decimal("0.15")
 TRAIL_START_PNL = Decimal("0.45")
-
 ENABLE_STOP_TRAIL = os.getenv("ENABLE_STOP_TRAIL", "1") == "1"   # (구 StopTrail 플래그, 신규 손절 사용시 실질적 비활성화)
 STOP_SELL_PORTION = Decimal(os.getenv("STOP_SELL_PORTION", "0.10"))
 STOP_MAX_SELLS = int(os.getenv("STOP_MAX_SELLS", "6"))
@@ -57,48 +55,38 @@ STOP_RECOVERY_LOG = os.getenv("STOP_RECOVERY_LOG", "1") == "1"
 STOP_SIMPLE_MODE = os.getenv("STOP_SIMPLE_MODE", "1") == "1"     # (구 단순 Stop 모드)
 STOP_INITIAL_SELL_PORTION = Decimal(os.getenv("STOP_INITIAL_SELL_PORTION", "0.5"))
 STOP_FINAL_MOVE_THRESHOLD = Decimal(os.getenv("STOP_FINAL_MOVE_THRESHOLD", "0.1"))
-
 # === 새 1회성 손절 로직 관련 ===
 ENABLE_NEW_STOP = os.getenv("ENABLE_NEW_STOP", "1") == "1"        # 새 손절 로직 스위치
 STOP_LOSS_FIRST_PORTION = Decimal(os.getenv("STOP_LOSS_FIRST_PORTION", "0.5"))     # 최초 손절 비율 (기본 50%)
 STOP_LOSS_MIN_REMAIN_KRW = Decimal(os.getenv("STOP_LOSS_MIN_REMAIN_KRW", "5000"))  # 50% 손절 후 남기는 최소 평가금 기준
 STOP_SECOND_EXIT_EXTRA_PNL = Decimal(os.getenv("STOP_SECOND_EXIT_EXTRA_PNL", "0.3"))  # (구 로직 잔존 변수, 미사용)
-
 USE_LIMIT_SELL_ON_TRAIL = os.getenv("USE_LIMIT_SELL_ON_TRAIL", "1") == "1"
 LIMIT_SELL_REPRICE_INTERVAL_SEC = int(os.getenv("LIMIT_SELL_REPRICE_INTERVAL_SEC", "5"))  # (현재 재호가 미사용)
 LIMIT_SELL_UNFILLED_TIMEOUT_SEC = int(os.getenv("LIMIT_SELL_UNFILLED_TIMEOUT_SEC", "25"))
 LIMIT_SELL_FALLBACK_TO_MARKET = os.getenv("LIMIT_SELL_FALLBACK_TO_MARKET", "1") == "1"
 LIMIT_SELL_PRICE_MODE = os.getenv("LIMIT_SELL_PRICE_MODE", "bid")  # 'bid' or 'mid'
 LIMIT_SELL_BID_OFFSET_TICKS = int(os.getenv("LIMIT_SELL_BID_OFFSET_TICKS", "0"))   # (현재 구현 offset 적용 X)
-
 SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "1.0"))
 HARD_TP_SELL_PORTION = Decimal(os.getenv("HARD_TP_SELL_PORTION", "0.7"))
 HARD_TP2_SELL_PORTION = Decimal(os.getenv("HARD_TP2_SELL_PORTION", "1.0"))
-
 INTERVAL_SECONDS = 5
 FIVE_MIN_SECONDS = 300
 MIN_NOTIONAL_KRW = Decimal("5500")
 MAX_BACKOFF = 120
-
 FORCE_LIVE = True
 LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
-
 WHITELIST_MARKETS: List[str] = []
 ENFORCE_WHITELIST = False
-
 INTERSECTION_USE_CACHE_ON_EMPTY = os.getenv("INTERSECTION_USE_CACHE_ON_EMPTY", "1") == "1"
 INTERSECTION_CACHE_TTL_SEC = int(os.getenv("INTERSECTION_CACHE_TTL_SEC", "180"))
 INTERSECTION_MAX_EMPTY_WARN = int(os.getenv("INTERSECTION_MAX_EMPTY_WARN", "5"))
-
 INTERSECTION_BUY_ENABLED = os.getenv("INTERSECTION_BUY_ENABLED", "1") == "1"
 INTERSECTION_MIN_SCORE = Decimal(os.getenv("INTERSECTION_MIN_SCORE", "10"))
 INTERSECTION_MAX_BUY_PER_CYCLE = int(os.getenv("INTERSECTION_MAX_BUY_PER_CYCLE", "1"))
 INTERSECTION_BUY_COOLDOWN_SEC = int(os.getenv("INTERSECTION_BUY_COOLDOWN_SEC", "999999"))
-
 ENABLE_RANGE_BUY = os.getenv("ENABLE_RANGE_BUY", "1") == "1"
 MAX_BUY_PER_WINDOW = int(os.getenv("MAX_BUY_PER_WINDOW", "999"))
 SKIP_BUY_IF_RECENT_SELL = True
-
 ENABLE_DYNAMIC_MOMENTUM_TP = os.getenv("ENABLE_DYNAMIC_MOMENTUM_TP", "1") == "1"
 MOMENTUM_TIER1_SEC = int(os.getenv("MOMENTUM_TIER1_SEC", "60"))
 MOMENTUM_TIER1_TP_OFFSET = Decimal(os.getenv("MOMENTUM_TIER1_TP_OFFSET", "0.8"))
@@ -110,14 +98,13 @@ MOMENTUM_TIER3_SEC = int(os.getenv("MOMENTUM_TIER3_SEC", "300"))
 MOMENTUM_TIER3_TP_OFFSET = Decimal(os.getenv("MOMENTUM_TIER3_TP_OFFSET", "0.3"))
 MOMENTUM_TIER3_TRAIL_EXTRA = Decimal(os.getenv("MOMENTUM_TIER3_TRAIL_EXTRA", "0.10"))
 MOMENTUM_MAX_EXTRA_CAP = Decimal(os.getenv("MOMENTUM_MAX_EXTRA_CAP", "1.2"))
-
 INTERSECTION_TICK_FILTER_ENABLED = os.getenv("INTERSECTION_TICK_FILTER_ENABLED", "1") == "1"
 INTERSECTION_TARGET_PROFIT_PCT = Decimal(os.getenv("INTERSECTION_TARGET_PROFIT_PCT", "0.4"))
 INTERSECTION_MAX_TICKS = int(os.getenv("INTERSECTION_MAX_TICKS", "10"))
-
 UPRISES_LAST_NONEMPTY: List[dict] = []
 UPRISES_LAST_TS: float | None = None
 UPRISES_EMPTY_STREAK: int = 0
+
 
 UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
@@ -127,6 +114,30 @@ NORMALIZE_MARGIN_PERCENT = os.getenv("NORMALIZE_MARGIN_PERCENT", "0") == "1"
 MARGIN_PERCENT_DIVISOR = Decimal(os.getenv("MARGIN_PERCENT_DIVISOR", "1"))
 ALLOW_ADDITIONAL_BUY_WHEN_FULL = os.getenv("ALLOW_ADDITIONAL_BUY_WHEN_FULL","1")=="1"
 MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS","5"))
+
+AVG_DOWN_ENABLED=1
+AVG_DOWN_FACTOR=2          # 초기 진입(첫 매수) 금액의 배수
+AVG_DOWN_BOLL_PERIOD=20
+AVG_DOWN_BOLL_MULT=2
+AVG_DOWN_LOWER_TOUCH_TOL=0.002   # 0.2% 여유 허용
+AVG_DOWN_REBOUND_PCT=1.0         # 하단터치 저점 대비 +1% 이상 반등 시
+AVG_DOWN_MIN_PNL=-2.0            # 최소 손익률(예: -2% 이하)에서만 전략 고려 (필요시)
+AVG_DOWN_GLOBAL_COOLDOWN_SEC=60  # 한 종목 수행 후 다른 종목 대기
+AVG_DOWN_MARKET_COOLDOWN_SEC=999999  # 동일 종목 2회 제한(사실상 1회)
+AVG_DOWN_TIMEFRAME_MIN=1         # 캔들 분 단위 (1분봉 권장)
+AVG_DOWN_CANDLE_COUNT=120
+AVG_DOWN_REQUIRE_MIN_VOL_KRW=10000  # 최소 추가매수 금액
+
+AVG_DOWN_TP_ENABLED = os.getenv("AVG_DOWN_TP_ENABLED", "1") == "1"
+AVG_DOWN_TP_ARM_PNL = Decimal(os.getenv("AVG_DOWN_TP_ARM_PNL", "0.20"))
+AVG_DOWN_TP_HARD_PNL = Decimal(os.getenv("AVG_DOWN_TP_HARD_PNL", "0.40"))
+AVG_DOWN_TP_TRAIL_START = Decimal(os.getenv("AVG_DOWN_TP_TRAIL_START", "0.40"))
+AVG_DOWN_TP_TRAIL_DROP = Decimal(os.getenv("AVG_DOWN_TP_TRAIL_DROP", "0.15"))
+AVG_DOWN_TP_SELL_PORTION = Decimal(os.getenv("AVG_DOWN_TP_SELL_PORTION", "1.0"))
+AVG_DOWN_TP_RESET_PEAK = os.getenv("AVG_DOWN_TP_RESET_PEAK", "1") == "1"
+
+
+AVG_DOWN_ACTIVE = None  # {"market": "...", "ts": float}
 
 # ============================================================
 # 5. RUNTIME CONFIG
@@ -436,6 +447,48 @@ def adjust_price_to_tick(price: float) -> float:
     else: unit = 0.01
     return math.floor(price / unit) * unit
 
+# ===================== (B) 캔들 & 볼린저 계산 함수 추가 =====================
+async def fetch_minute_candles(market: str, unit: int = 1, count: int = 120):
+    """
+    Upbit 분봉 캔들 (최신순 반환) → 시간 오름차순으로 리턴
+    """
+    url = f"https://api.upbit.com/v1/candles/minutes/{unit}"
+    params = {"market": market, "count": count}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get(url, params=params)
+    if r.status_code != 200:
+        raise RuntimeError(f"candles status={r.status_code} body={r.text[:120]}")
+    data = r.json()
+    if not data:
+        return []
+    # 최신이 앞 → 뒤집기
+    data.reverse()
+    # 각 항목: opening_price, high_price, low_price, trade_price(종가), timestamp 등
+    return data
+
+def compute_bollinger_from_candles(candles: list, period: int, mult: Decimal):
+    """
+    candles: 시간 오름차순 list, 각 item['trade_price'] 사용
+    return: (lower, middle, upper, last_close)
+    """
+    if len(candles) < period:
+        return None
+    closes = [Decimal(str(c["trade_price"])) for c in candles]
+    window = closes[-period:]
+    sma = sum(window) / Decimal(period)
+    # 표준편차
+    # (population)
+    mean = sma
+    var = sum((c - mean) * (c - mean) for c in window) / Decimal(period)
+    try:
+        std = var.sqrt()
+    except:
+        std = Decimal("0")
+    upper = sma + mult * std
+    lower = sma - mult * std
+    last_close = closes[-1]
+    return (lower, sma, upper, last_close)
+
 # ============================================================
 # 10. 시세 조회 보조
 # ============================================================
@@ -588,22 +641,84 @@ class PositionState:
     def update_or_init(self, market, pnl: Decimal, avg_price: Decimal):
         now = time.time()
         st = self.data.get(market)
+
+        # 신규 초기화
         if st is None or st.get("avg_buy_price") != avg_price:
             self.data[market] = {
-                "peak_pnl": pnl, "prev_pnl": pnl, "armed": False, "avg_buy_price": avg_price,
-                "hard_tp_taken": False, "hard_tp2_taken": False, "dynamic_hard_tp2": None,
-                "trail_drop_dynamic": None, "entry_ts": now, "htp1_time": None,
-                "momentum_tag": None, "last_update_ts": now,
+                "peak_pnl": pnl,          # 진입 후 최고 PNL
+                "min_pnl": pnl,           # 진입 후 최저 PNL (추가)
+                "max_drawdown": Decimal("0"),  # 관측된 최대 드로다운 (추가)
+                "last_drawdown": Decimal("0"), # 직전 갱신 시점의 드로다운 (추가)
+                "max_runup": Decimal("0"),     # 최저점 이후 최대 반등폭 (추가)
+                "prev_pnl": pnl,
+                "armed": False,
+                "avg_buy_price": avg_price,
+                "hard_tp_taken": False,
+                "hard_tp2_taken": False,
+                "dynamic_hard_tp2": None,
+                "trail_drop_dynamic": None,
+                "entry_ts": now,
+                "htp1_time": None,
+                "momentum_tag": None,
+                "last_update_ts": now,
                 "entry_source": self.data.get(market, {}).get("entry_source"),
-                "stop_triggered": False, "stop_last_peak": None, "stop_sells_done": 0,
-                "worst_pnl": pnl, "stop_last_sell_ts": None,
-                "stop_cooldown_flag": False, "stop_pending_peak": None, "stop_cooldown_start_ts": None
+                "stop_triggered": False,
+                "stop_last_peak": None,
+                "stop_sells_done": 0,
+                "worst_pnl": pnl,
+                "stop_last_sell_ts": None,
+                "stop_cooldown_flag": False,
+                "stop_pending_peak": None,
+                "stop_cooldown_start_ts": None,
+                "avg_down_done": False,
+                "avg_down_candidate": False,
+                "avg_down_touch_ts": None,
+                "avg_down_touch_price": None,
+                "avg_down_buy_uuid": None,
+                "first_buy_amount": None,
+                "avg_down_tp_mode": False,
+                "avg_down_tp_completed": False,
+                "avg_down_tp_baseline_pnl": None,
+                "avg_down_tp_peak_offset": Decimal("0"),
+                "avg_down_tp_armed": False
             }
             return self.data[market]
+
+        # --- 기존 peak 갱신 ---
         if pnl > st["peak_pnl"]:
             st["peak_pnl"] = pnl
+
+        # --- 신규: min_pnl (최저 PNL) 갱신 ---
+        # (peak 갱신 이후에 처리해도 문제 없음. 독립적인 최소값 추적)
+        if pnl < st.get("min_pnl", pnl):
+            st["min_pnl"] = pnl
+
+        # --- 드로다운 계산 (peak 대비 현재 하락폭) ---
+        # peak_pnl >= pnl 일 때만 유효
+        try:
+            drawdown = st["peak_pnl"] - pnl if pnl < st["peak_pnl"] else Decimal("0")
+        except Exception:
+            drawdown = Decimal("0")
+
+        st["last_drawdown"] = drawdown
+
+        # --- 최대 드로다운 갱신 ---
+        if drawdown > st.get("max_drawdown", Decimal("0")):
+            st["max_drawdown"] = drawdown
+
+        # --- 런업(run-up): 최저점 대비 현재 반등폭 ---
+        # min_pnl 은 손익률 자체이므로 (현재 pnl - min_pnl)가 반등폭
+        try:
+            runup = pnl - st["min_pnl"] if pnl > st["min_pnl"] else Decimal("0")
+        except Exception:
+            runup = Decimal("0")
+        if runup > st.get("max_runup", Decimal("0")):
+            st["max_runup"] = runup
+
+        # --- 기존 worst_pnl 로직 (stop_triggered 시에만) 유지 ---
         if st.get("stop_triggered") and pnl < st.get("worst_pnl", pnl):
             st["worst_pnl"] = pnl
+
         st["prev_pnl"] = pnl
         st["last_update_ts"] = now
         return st
@@ -652,6 +767,10 @@ class PositionState:
         else:
             info["total_buys"] += 1
             info["total_invested"] += krw_amount
+        if market in self.buy_info and "first_buy_amount" not in self.data.get(market, {}):
+           st = self.data.setdefault(market, {})
+           if st.get("first_buy_amount") is None:
+               st["first_buy_amount"] = krw_amount
 
     def get_buy_stats(self, market):
         info = self.buy_info.get(market)
@@ -688,6 +807,44 @@ def get_state_decimal(state: dict, key: str, default: Decimal):
     except:
         pass
     return default
+
+def decide_avg_down_tp(pnl: Decimal, state: dict):
+    """
+    Avg-Down 이후 전용 TP 판단.
+    pnl: 전체 포지션 현재 PNL%
+    state: 포지션 상태 dict
+    반환: (sell_bool, reason, category) 또는 (False,"",None)
+    """
+    if not state.get("avg_down_tp_mode") or state.get("avg_down_tp_completed"):
+        return False, "", None
+    try:
+        baseline = Decimal(str(state.get("avg_down_tp_baseline_pnl")))
+    except:
+        baseline = pnl
+    offset = pnl - baseline  # Offset PNL
+    # 최고 Offset 갱신
+    prev_peak = state.get("avg_down_tp_peak_offset", Decimal("0"))
+    if offset > prev_peak:
+        state["avg_down_tp_peak_offset"] = offset
+
+    armed = state.get("avg_down_tp_armed", False)
+
+    # 1) 하드 TP (즉시 매도)
+    if offset >= AVG_DOWN_TP_HARD_PNL:
+        return True, f"AD_TP_HARD offset={offset}% >= {AVG_DOWN_TP_HARD_PNL}%", "AD_TP_HARD"
+
+    # 2) ARM 조건
+    if (not armed) and offset >= AVG_DOWN_TP_ARM_PNL:
+        state["avg_down_tp_armed"] = True
+        return False, f"AD_TP_ARM offset={offset}% >= {AVG_DOWN_TP_ARM_PNL}%", None
+
+    # 3) 트레일 (armed 상태)
+    if armed and prev_peak >= AVG_DOWN_TP_TRAIL_START:
+        drop = prev_peak - offset
+        if drop >= AVG_DOWN_TP_TRAIL_DROP:
+            return True, f"AD_TP_TRAIL drop={drop}% >= {AVG_DOWN_TP_TRAIL_DROP}% (peakOff={prev_peak} nowOff={offset})", "AD_TP_TRAIL"
+
+    return False, "", None
 
 def decide_sell(market, pnl: Decimal, state: dict):
     if state.get("stop_triggered") and not ENABLE_NEW_STOP:
@@ -813,6 +970,19 @@ async def order_market_buy_price(access_key, secret_key, market, krw_amount: Dec
     params = {"market": market, "side": "bid", "price": str(krw_amount), "ord_type": "price"}
     jwt_t = build_upbit_jwt_with_params(access_key, secret_key, params)
     headers = {"Authorization": f"Bearer {jwt_t}", "Accept": "application/json"}
+    return await http_post_json(UPBIT_ORDER_URL, headers=headers, params=params)
+
+async def order_limit_buy(access_key: str,secret_key: str,market: str,volume: Decimal,price: Decimal):
+    params = { "market": market, "side": "bid", "volume": str(volume), "price": str(price), "ord_type": "limit",}
+    jwt_t = build_upbit_jwt_with_params(access_key, secret_key, params)
+    headers = { "Authorization": f"Bearer {jwt_t}", "Accept": "application/json" }
+    return await http_post_json(UPBIT_ORDER_URL, headers=headers, params=params)
+
+
+async def order_limit_sell( access_key: str, secret_key: str, market: str, volume: Decimal, price: Decimal):
+    params = { "market": market, "side": "ask", "volume": str(volume), "price": str(price), "ord_type": "limit", }
+    jwt_t = build_upbit_jwt_with_params(access_key, secret_key, params)
+    headers = { "Authorization": f"Bearer {jwt_t}", "Accept": "application/json"}
     return await http_post_json(UPBIT_ORDER_URL, headers=headers, params=params)
 
 async def get_order(access_key, secret_key, uuid_):
@@ -1148,6 +1318,179 @@ async def monitor_positions(user_no: int, server_no: int):
                     print(f"[TP-LIMIT] 주문조회 실패 market={market} uuid={uid} e={e}")
                     continue
 
+            if AVG_DOWN_ENABLED:
+                # 안전한 setdefault (초기화 안 되어 있을 가능성 대비)
+                for k, v in (
+                    ("avg_down_done", False),
+                    ("avg_down_candidate", False),
+                    ("avg_down_touch_ts", None),
+                    ("avg_down_touch_price", None),
+                    ("avg_down_buy_uuid", None),
+                    ("first_buy_amount", None),
+                    ("avg_down_tp_mode", False),
+                    ("avg_down_tp_completed", False),
+                    ("avg_down_tp_baseline_pnl", None),
+                    ("avg_down_tp_peak_offset", Decimal("0")),
+                    ("avg_down_tp_armed", False),):
+                    st.setdefault(k, v)
+
+                # 최초 진입 추정 (first_buy_amount 없으면 추정)
+                if st.get("first_buy_amount") is None:
+                    # buy_info 에서 첫 진입 금액 추적 실패 시 현재 잔고 * 평균단가 추정
+                    total_buys, total_inv = ps.get_buy_stats(market)
+                    if total_buys >= 1:
+                        # 추정: 첫 매수 금액 = total_inv / total_buys (단순 평균) 보다
+                        # 더 정확히 하려면 별도 first 기록 필요. 여기서는 첫 번째 기록이 없으므로 근사치 사용.
+                        st["first_buy_amount"] = (total_inv / total_buys).quantize(
+                            Decimal("0.0001")) if total_buys > 0 else None
+                    if st["first_buy_amount"] is None and avg and bal:
+                        try:
+                            est = (bal * avg)
+                            st["first_buy_amount"] = est.quantize(Decimal("0.0001"))
+                        except:
+                            pass
+
+                if not st["avg_down_done"]:
+                    # PNL 조건 (예: -2% 이하에서만)
+                    if pnl <= AVG_DOWN_MIN_PNL:
+                        new_min_hit = (pnl == st.get("min_pnl"))  # update_or_init 후 peak/min 갱신됨
+                        global AVG_DOWN_ACTIVE
+                        now_ts = time.time()
+                        # 글로벌 락 만료 여부
+                        lock_busy = False
+                        if AVG_DOWN_ACTIVE:
+                            # 다른 종목이 실행 중
+                            if AVG_DOWN_ACTIVE["market"] != market:
+                                # 만료?
+                                if (now_ts - AVG_DOWN_ACTIVE["ts"]) < AVG_DOWN_GLOBAL_COOLDOWN_SEC:
+                                    lock_busy = True
+                                else:
+                                    # 락 만료
+                                    AVG_DOWN_ACTIVE = None
+                        if not lock_busy:
+                            try:
+                                # (1) 하단 터치 감시
+                                if new_min_hit and not st["avg_down_candidate"]:
+                                    # 캔들 조회 & 밴드
+                                    try:
+                                        candles = await fetch_minute_candles(market, AVG_DOWN_TIMEFRAME_MIN,
+                                                                             AVG_DOWN_CANDLE_COUNT)
+                                        bb = compute_bollinger_from_candles(candles, AVG_DOWN_BOLL_PERIOD,
+                                                                            AVG_DOWN_BOLL_MULT)
+                                    except Exception as ce:
+                                        bb = None
+                                        if str(ce):
+                                            print(f"[AVG_DOWN] 캔들/BB 실패 {market}: {ce}")
+                                    if bb:
+                                        lower, mid, upper, last_close = bb
+                                        # 하단 터치 판단
+                                        if last_close <= lower * (Decimal("1") + AVG_DOWN_LOWER_TOUCH_TOL):
+                                            st["avg_down_touch_ts"] = now_ts
+                                            st["avg_down_touch_price"] = last_close
+                                            st["avg_down_candidate"] = True
+                                            # 글로벌 소유권 예약(잠정) - 아직 매수는 아니므로 필요 없으면 주석 처리 가능
+                                            # AVG_DOWN_ACTIVE = {"market": market, "ts": now_ts}
+                                            print(
+                                                f"[AVG_DOWN] LOWER TOUCH 감지 {market} price={last_close} lower={lower}")
+                                # (2) 반전 감시 & 실행
+                                elif st["avg_down_candidate"]:
+                                    touch_price = st.get("avg_down_touch_price")
+                                    if touch_price:
+                                        try:
+                                            candles = await fetch_minute_candles(market, AVG_DOWN_TIMEFRAME_MIN,
+                                                                                 AVG_DOWN_CANDLE_COUNT)
+                                            bb = compute_bollinger_from_candles(candles, AVG_DOWN_BOLL_PERIOD,
+                                                                                AVG_DOWN_BOLL_MULT)
+                                        except Exception as ce2:
+                                            bb = None
+                                            print(f"[AVG_DOWN] 재계산 실패 {market}: {ce2}")
+                                        if bb:
+                                            lower, mid, upper, last_close = bb
+                                            # 반등 조건
+                                            condA = last_close >= mid
+                                            condB = (last_close - touch_price) / touch_price * Decimal(
+                                                "100") >= AVG_DOWN_REBOUND_PCT
+                                            if condA or condB:
+                                                # 실행 준비
+                                                # 글로벌 락 다시 점검 / 확보
+                                                if AVG_DOWN_ACTIVE and AVG_DOWN_ACTIVE["market"] not in (None, market):
+                                                    # 다른 종목이 이미 확정 실행 중
+                                                    pass
+                                                else:
+                                                    # 금액 계산
+                                                    total_buys, total_inv = ps.get_buy_stats(market)
+                                                    first_amt = st.get("first_buy_amount") or (
+                                                        total_inv / total_buys if total_buys else None)
+                                                    if first_amt is None:
+                                                        # 추정 불가시 스킵
+                                                        print(f"[AVG_DOWN] first_amt 추정불가 skip {market}")
+                                                    else:
+                                                        target_amount = (first_amt * AVG_DOWN_FACTOR).quantize(
+                                                            Decimal("0.0001"))
+                                                        # 한도/가용 KRW 적용
+                                                        remaining_cap = MAX_TOTAL_INVEST_PER_MARKET - total_inv if MAX_TOTAL_INVEST_PER_MARKET > 0 else target_amount
+                                                        buy_amt = min(target_amount, remaining_cap, available_krw)
+                                                        if buy_amt < AVG_DOWN_REQUIRE_MIN_VOL_KRW:
+                                                            print(
+                                                                f"[AVG_DOWN] 금액부족 skip {market} need>={AVG_DOWN_REQUIRE_MIN_VOL_KRW} got={buy_amt}")
+                                                        else:
+                                                            # 실행
+                                                            if not LIVE_TRADING:
+                                                                print(
+                                                                    f"[DRY_AVG_DOWN] {market} buy_amt={buy_amt} rebound condA={condA} condB={condB} from={touch_price} now={last_close}")
+
+                                                                ps.record_buy(market, buy_amt)
+                                                                st["avg_down_done"] = True
+                                                                st["avg_down_candidate"] = False
+                                                                AVG_DOWN_ACTIVE = {"market": market, "ts": now_ts}
+                                                                if AVG_DOWN_TP_ENABLED and not st.get("avg_down_tp_mode") and not st.get("avg_down_tp_completed"):
+                                                                    st["avg_down_tp_mode"] = True
+                                                                    st["avg_down_tp_completed"] = False
+                                                                    st["avg_down_tp_baseline_pnl"] = pnl
+                                                                    st["avg_down_tp_peak_offset"] = Decimal("0")
+                                                                    st["avg_down_tp_armed"] = False
+                                                                    if AVG_DOWN_TP_RESET_PEAK:
+                                                                        st["peak_pnl"] = pnl
+                                                                        st["min_pnl"] = pnl
+                                                                    print(f"[AD_TP] 모드 활성화 {market} baseline={pnl}%")
+                                                                if AVG_DOWN_TP_ENABLED and not st.get("avg_down_tp_mode") and not st.get("avg_down_tp_completed"):
+                                                                    st["avg_down_tp_mode"] = True
+                                                                    st["avg_down_tp_completed"] = False
+                                                                    st["avg_down_tp_baseline_pnl"] = pnl
+                                                                    st["avg_down_tp_peak_offset"] = Decimal("0")
+                                                                    st["avg_down_tp_armed"] = False
+                                                                    if AVG_DOWN_TP_RESET_PEAK:
+                                                                        st["peak_pnl"] = pnl
+                                                                        st["min_pnl"] = pnl
+                                                                print(f"[AD_TP] 모드 활성화 {market} baseline={pnl}% (DRY)")
+
+                                                            else:
+                                                                try:
+                                                                    resp = await order_market_buy_price(access_key,
+                                                                                                        secret_key,
+                                                                                                        market, buy_amt)
+                                                                    uid = resp.get("uuid")
+                                                                    print(
+                                                                        f"[ORDER] AVG_DOWN BUY {market} amt={buy_amt} uid={uid} rebound condA={condA} condB={condB} from={touch_price} now={last_close}")
+                                                                    st["avg_down_buy_uuid"] = uid
+                                                                    ps.record_buy(market, buy_amt)
+                                                                    st["avg_down_done"] = True
+                                                                    st["avg_down_candidate"] = False
+                                                                    AVG_DOWN_ACTIVE = {"market": market, "ts": now_ts}
+                                                                except Exception as eod:
+                                                                    print(f"[ERR] AVG_DOWN 주문실패 {market}: {eod}")
+                            except Exception as eavg:
+                                print(f"[AVG_DOWN] 로직 예외 {market}: {eavg}")
+                    else:
+                        # PNL 조건 벗어나면 candidate 초기화(선택적)
+                        # st["avg_down_candidate"] = False
+                        pass
+
+                # 동일 종목 후속 재실행 제한
+                if st.get("avg_down_done"):
+                    # 시장별 쿨다운 (사실상 1회 제한, 시간 지나도 안 풀고 싶으면 조건 유지)
+                    pass
+
             # (B) 새 손절 로직
             if ENABLE_NEW_STOP:
                 new_stage = st.get("new_stop_stage")
@@ -1189,11 +1532,58 @@ async def monitor_positions(user_no: int, server_no: int):
                 # (구) 기존 손절 로직 유지가 필요하면 여기에 삽입 (현재 비활성 컨셉)
                 pass
 
+            ad_tp_sell = False
+            ad_tp_reason = ""
+            ad_tp_category = None
+            if AVG_DOWN_TP_ENABLED and st.get("avg_down_tp_mode") and not st.get("avg_down_tp_completed"):
+                ad_tp_sell, ad_tp_reason, ad_tp_category = decide_avg_down_tp(pnl, st)
+                if ad_tp_sell:
+                    # 별도 sell_orders 큐에 추가
+                    portion = AVG_DOWN_TP_SELL_PORTION
+                    volume = safe_calc_volume(bal, portion)
+                    if volume > 0:
+                        sell_orders.append({
+                            "market": market,
+                            "volume": volume,
+                            "pnl": pnl,
+                            "category": ad_tp_category,
+                            "reason": ad_tp_reason,
+                            "state_ref": st,
+                            "portion": portion
+                        })
+                # 상태 출력 리스트(actions)에 넣어 추적 (평가만 했을 경우)
+                actions.append({
+                    "market": market,
+                    "pnl": pnl,
+                    "peak": st["peak_pnl"],
+                    "drawdown": st.get("last_drawdown"),
+                    "max_dd": st.get("max_drawdown"),
+                    "min_pnl": st.get("min_pnl"),
+                    "armed": st.get("avg_down_tp_armed") if st.get("avg_down_tp_mode") else st["armed"],
+                    "sell": ad_tp_sell,
+                    "cat": ad_tp_category,
+                    "reason": ad_tp_reason if ad_tp_reason else ("AD_TP_MODE" if st.get("avg_down_tp_mode") else "")
+                })
+                # 전용 TP가 발동되었으면 일반 decide_sell은 skip
+                if ad_tp_sell:
+                    continue
+                # 전용 모드 활성 중이고 아직 미체결 → 일반 로직과 병행하지 않으려면 여기서 continue
+                # 일반 로직도 병행하여 고차 조건을 허용하려면 제거
+                # 여기서는 병행 억제:
+                continue
             # (C) 일반 익절/트레일
             sell, reason, category = decide_sell(market, pnl, st)
             actions.append({
-                "market": market, "pnl": pnl, "peak": st["peak_pnl"],
-                "armed": st["armed"], "sell": sell, "cat": category, "reason": reason
+                "market": market,
+                "pnl": pnl,
+                "peak": st["peak_pnl"],
+                "drawdown": st.get("last_drawdown"),
+                "max_dd": st.get("max_drawdown"),
+                "min_pnl": st.get("min_pnl"),
+                "armed": st["armed"],
+                "sell": sell,
+                "cat": category,
+                "reason": reason
             })
             if sell:
                 if category == "HARD_TP1":
@@ -1273,6 +1663,20 @@ async def monitor_positions(user_no: int, server_no: int):
                         if cur_price:
                             try: realized += cur_price * volume
                             except: pass
+                if category in ("AD_TP_HARD", "AD_TP_TRAIL"):
+                    print(f"[DRY_AD_TP] {market} {category} vol={volume} pnl={pnl}% {reason}")
+                    st["avg_down_tp_mode"] = False
+                    st["avg_down_tp_completed"] = True
+                    if portion >= 1:
+                        ps.mark_sold(market)
+                    else:
+                        ps.reduce_invested_after_sell(market, portion)
+                    if cur_price:
+                        try:
+                            realized += cur_price * volume
+                        except:
+                            pass
+                    continue
 
                 if not limit_used:
                     print(f"[DRY_SELL] {market} {category} vol={volume} pnl={pnl}% {reason}")
@@ -1330,6 +1734,25 @@ async def monitor_positions(user_no: int, server_no: int):
                     if peak_ok:
                         await place_limit_tp_order(access_key, secret_key, market, volume, category, st)
                         use_limit = True
+                if category in ("AD_TP_HARD", "AD_TP_TRAIL"):
+                    # 공통 처리: 전용모드 종료
+                    st["avg_down_tp_mode"] = False
+                    st["avg_down_tp_completed"] = True
+                    # 이후 전액매도면 mark_sold, 부분매도면 peak 리셋
+                    if portion >= 1:
+                        ps.mark_sold(market)
+                    else:
+                        ps.reduce_invested_after_sell(market, portion)
+                    # 추가로 일반 peak 초기화 (선택)
+                    # st["peak_pnl"] = pnl
+                    # st["armed"] = False
+                    # 이미 처리 후 continue
+                    if cur_price and portion > 0:
+                        try:
+                            realized += cur_price * volume
+                        except:
+                            pass
+                    continue
 
                 if use_limit:
                     continue
@@ -1532,11 +1955,14 @@ async def monitor_positions(user_no: int, server_no: int):
                 status = "HOLD"
                 if a["sell"]:
                     status = "SELL"
-                elif cat in ("STOP_ENTER", "STOP_WAIT", "STOP_HOLD", "STOP_COOLDOWN", "STOP_EXIT"):
-                    status = cat
                 elif a["reason"].startswith("ARMED"):
                     status = "ARM"
-                print(f"  {a['market']} pnl={a['pnl']} peak={a['peak']} armed={a['armed']} cat={cat} -> {status} {a['reason']}")
+                # drawdown / max_dd 출력 추가
+                print(
+                    f"  {a['market']} pnl={a['pnl']} peak={a['peak']} "
+                    f"min={a['min_pnl']} dd={a['drawdown']} maxDD={a['max_dd']} "
+                    f"armed={a['armed']} cat={cat} -> {status} {a['reason']}"
+                )
 
         await dynamic_sleep()
 
