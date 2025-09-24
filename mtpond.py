@@ -10,7 +10,7 @@ import time
 import math
 import json
 from typing import Optional, Dict, Any, List, Tuple
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_FLOOR
 import dotenv
 import httpx
 import jwt
@@ -18,6 +18,7 @@ import topuprise
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text, false
+
 # ============================================================
 # 2. 환경 로드
 # ============================================================
@@ -170,6 +171,15 @@ PASSIVE_FORCE_INCREASE_TOL = Decimal(os.getenv("PASSIVE_FORCE_INCREASE_TOL","0")
 
 FULL_LIMIT_SELL_ADOPT = os.getenv("FULL_LIMIT_SELL_ADOPT", "1") == "1"
 FULL_LIMIT_SELL_DEBUG = os.getenv("FULL_LIMIT_SELL_DEBUG", "0") == "1"
+
+MIN_ORDER_NOTIONAL_KRW = Decimal(os.getenv("MIN_ORDER_NOTIONAL_KRW", "5500"))
+ORDER_NOTIONAL_BUFFER_PCT = Decimal(os.getenv("ORDER_NOTIONAL_BUFFER_PCT", "0.01"))
+DUST_ABS_VOLUME_THRESHOLD = Decimal(os.getenv("DUST_ABS_VOLUME_THRESHOLD", "0.000001"))
+DUST_CLEANUP_ENABLED = os.getenv("DUST_CLEANUP_ENABLED","1") == "1"
+DUST_LOG_INTERVAL_SEC = int(os.getenv("DUST_LOG_INTERVAL_SEC","600"))
+
+DUST_LAST_LOG: dict[str,float] = {}
+
 
 # ============================================================
 # 5. RUNTIME CONFIG
@@ -370,7 +380,17 @@ async def upbit_request(method: str,
                     continue
                 raise RuntimeError(f"Too many requests 429 body={resp.text}")
             if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code} body={resp.text}")
+                # 400 중 재시도 무의미한 insufficient_funds_* 즉시 반환
+               if resp.status_code == 400:
+                  try:
+                     j = resp.json()
+                     err_name = (j.get("error") or {}).get("name")
+                     if err_name and err_name.startswith("insufficient_funds_"):
+                       # 재시도하지 않고 바로 예외
+                         raise RuntimeError(f"HTTP 400 body={resp.text}")
+                  except Exception:
+                     pass
+               raise RuntimeError(f"HTTP {resp.status_code} body={resp.text}")
             if not expect_json:
                 return {"raw": resp.text}
             try:
@@ -456,6 +476,44 @@ async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
             except:
                 pass
     return out
+
+def parse_decimal(x) -> Decimal:
+    return Decimal(str(x))
+
+def quantize_volume(vol: Decimal) -> Decimal:
+    # 업비트 다수 코인 8자리 허용. 필요하다면 마켓별 precision 맵 도입
+    return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+def is_dust_volume(volume: Decimal,
+                   price: Decimal,
+                   min_notional: Decimal = MIN_ORDER_NOTIONAL_KRW,
+                   buffer_pct: Decimal = ORDER_NOTIONAL_BUFFER_PCT,
+                   abs_threshold: Decimal = DUST_ABS_VOLUME_THRESHOLD) -> tuple[bool,str]:
+    """
+    반환: (is_dust, reason)
+    """
+    if volume <= 0:
+        return True, "zero_or_negative"
+    if volume < abs_threshold:
+        return True, f"abs_lt_{abs_threshold}"
+    notional = volume * price
+    min_req = min_notional * (Decimal("1") + buffer_pct)
+    if notional < min_req:
+        return True, f"notional_lt_{min_req}"
+    # 양쪽 조건 통과 → 최종 반올림 후 0 이 되는지 체크
+    vol_q = quantize_volume(volume)
+    if vol_q <= 0:
+        return True, "quantized_zero"
+    return False, ""
+
+def log_dust_once(market: str, volume: Decimal, price: Decimal, reason: str):
+    now = time.time()
+    prev = DUST_LAST_LOG.get(market, 0)
+    if now - prev >= DUST_LOG_INTERVAL_SEC:
+        print(f"[DUST][SKIP] {market} vol={volume} price={price} notional={(volume*price):.8f} reason={reason}")
+        DUST_LAST_LOG[market] = now
+
+
 # ============================================================
 # 8. DB / 계정 키
 # ============================================================
@@ -482,23 +540,47 @@ async def get_orderbook_top(market: str):
     if not bids:
         raise RuntimeError("no orderbook units")
     top = bids[0]
-    best_bid = float(top["bid_price"])
-    best_ask = float(top["ask_price"])
+    best_bid = Decimal(str(top["bid_price"]))
+    best_ask = Decimal(str(top["ask_price"]))
     return best_bid, best_ask
-def adjust_price_to_tick(price: float | Decimal) -> float:
-    p = float(price)
-    if p >= 2_000_000: unit = 1000
-    elif p >= 1_000_000: unit = 500
-    elif p >= 500_000: unit = 100
-    elif p >= 100_000: unit = 50
-    elif p >= 10_000: unit = 10
-    elif p >= 1_000: unit = 5
-    elif p >= 100: unit = 1
-    elif p >= 10: unit = 0.1
-    elif p >= 1: unit = 0.01
-    else: unit = 0.001
-    aligned = math.floor(p / unit) * unit
-    return float(f"{aligned:.8f}")
+
+def to_decimal(x):
+    if isinstance(x, Decimal):
+        return x
+    return Decimal(str(x))
+
+def adjust_price_to_tick(raw_price) -> Decimal:
+    """
+    Upbit 호가 규칙에 맞게 '내림' 정렬.
+    입력: str|float|Decimal
+    출력: Decimal (필요 시 str(...) 로 API 전달)
+    """
+    price = to_decimal(raw_price)
+    p = float(price)  # 구간 결정 용도
+    if p >= 2_000_000: unit = Decimal("1000")
+    elif p >= 1_000_000: unit = Decimal("500")
+    elif p >= 500_000: unit = Decimal("100")
+    elif p >= 100_000: unit = Decimal("50")
+    elif p >= 10_000: unit = Decimal("10")
+    elif p >= 1_000: unit = Decimal("5")
+    elif p >= 100: unit = Decimal("1")
+    elif p >= 10: unit = Decimal("0.1")
+    elif p >= 1: unit = Decimal("0.01")
+    else: unit = Decimal("0.001")
+    steps = (price / unit).to_integral_value(rounding=ROUND_FLOOR)
+    aligned = steps * unit
+    quant = aligned.quantize(unit) if unit < 1 else aligned.quantize(Decimal("1"))
+    return quant
+
+
+def format_display_volume(vol: Decimal) -> str:
+    # 8자리 이하에서는 그대로, 다만 abs < 0.000001 이면 "~0 (<1e-6)" 표기
+    if vol == 0:
+        return "0"
+    if abs(vol) < Decimal("0.000001"):
+        return f"~0 ({vol})"
+    return f"{vol.normalize()}"
+
 # ============================================================
 # 10. 캔들 & 볼린저
 # ============================================================
@@ -618,7 +700,7 @@ async def place_preplaced_hard_tp(access_key: str, secret_key: str, market: str,
     target_price_raw = avg_buy_price * (Decimal("1") + HARD_TP / Decimal("100"))
     try:
         best_bid, best_ask = await get_orderbook_top(market)
-        base_price = float(target_price_raw)
+        base_price = target_price_raw
         if base_price < best_ask:
             base_price = best_ask
         limit_price = adjust_price_to_tick(base_price)
@@ -782,7 +864,6 @@ class PositionState:
                 "pre_tp_volume": None,
                 "pre_tp_partial_filled": False,
                 "pre_tp_source": None,
-                # Full limit sell 관리 필드
                 "full_limit_uuid": None,
                 "full_limit_price": None,
                 "full_limit_volume": None,
@@ -1127,8 +1208,30 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
             continue
         if not target_price or target_price <= 0:
             continue
-        adj_price = Decimal(str(adjust_price_to_tick(float(target_price))))
+        adj_price = adjust_price_to_tick(target_price)
         st = ps.data.setdefault(market, {})
+        if DUST_CLEANUP_ENABLED:
+            is_dust, dust_reason = is_dust_volume(total_qty, adj_price)
+            if is_dust:
+                st["full_limit_dust_flag"] = True
+                st["full_limit_dust_reason"] = dust_reason
+                # 기존 주문이 존재한다면 굳이 유지할 필요도 없음 (거래금액 미만이라 체결 안 될 것)
+                if st.get("full_limit_uuid"):
+                    try:
+                        await cancel_order(access_key, secret_key, st["full_limit_uuid"])
+                        if FULL_LIMIT_SELL_DEBUG:
+                            print(f"[FLS][DUST_CANCEL] {market} uuid={st['full_limit_uuid']} reason={dust_reason}")
+                    except Exception as ce:
+                        if FULL_LIMIT_SELL_DEBUG:
+                            print(f"[FLS][DUST_CANCEL_FAIL] {market} err={ce}")
+                    for k in ("full_limit_uuid", "full_limit_price", "full_limit_volume", "full_limit_ts"):
+                        st.pop(k, None)
+                log_dust_once(market, total_qty, Decimal(str(adj_price)), dust_reason)
+                continue
+        else:
+            if st.get("full_limit_dust_flag"):
+                st.pop("full_limit_dust_flag", None)
+                st.pop("full_limit_dust_reason", None)
         # 기존 full limit 주문 정보
         fl_uuid = st.get("full_limit_uuid")
         fl_price = st.get("full_limit_price")
@@ -1330,7 +1433,7 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
         except:
             continue
         total_qty = bal + locked
-        if total_qty <= 0:
+        if (bal <= 0) and (locked <= 0):
             continue
 
         market = f"{BASE_UNIT}-{currency}"
@@ -1389,7 +1492,23 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
         if target_price is None or target_price <= 0:
             continue
 
-        adj_price = Decimal(str(adjust_price_to_tick(float(target_price))))
+        adj_price = adjust_price_to_tick(target_price)
+         # Dust / 최소 주문 금액 검사 (가용 수량 기준)
+        usable_qty_initial = bal  # 최초에는 가용(balance)만 사용
+        if usable_qty_initial <= 0:
+         # locked > 0 이고 bal == 0 ⇒ 기존 주문 체결중 or 대기중
+           if PASSIVE_LIMIT_SELL_DEBUG:
+              print(f"[PASSIVE][HOLD-LOCKED] {market} balance=0 locked={locked}")
+           continue
+          # 호가 단위 영향 전에 미리 volume quantize
+        usable_qty_initial = quantize_volume(usable_qty_initial)
+        if usable_qty_initial <= 0:
+            continue
+        dust_flag, dust_reason = is_dust_volume(usable_qty_initial, adj_price,min_notional = PASSIVE_LIMIT_SELL_MIN_NOTIONAL,buffer_pct = ORDER_NOTIONAL_BUFFER_PCT)
+        if dust_flag:
+            if PASSIVE_LIMIT_SELL_DEBUG:
+                print(f"[PASSIVE][DUST] {market} reason={dust_reason} qty={usable_qty_initial} price={adj_price}")
+            continue
 
         pl_uuid = st.get("passive_limit_uuid")
         pl_price = st.get("passive_limit_price")
@@ -1426,6 +1545,7 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                         st.pop(k, None)
                     if total_qty > 0:
                         need_place = True
+
                         reason = f"prev_state={state_val}"
                 else:
                     # 수량/가격 확인
@@ -1485,22 +1605,42 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                 for k in ("passive_limit_uuid","passive_limit_price","passive_limit_volume","passive_limit_ts"):
                     st.pop(k, None)
                 need_place = True
-
+                await asyncio.sleep(0.25)
+                ref = await refetch_single_account(access_key, secret_key, market.split("-")[1])
+                if ref:
+                    try:
+                        new_bal = Decimal(str(ref.get("balance", "0")))
+                        new_locked = Decimal(str(ref.get("locked", "0")))
+                        usable_after_cancel = quantize_volume(new_bal)
+                        if new_locked > 0:
+                            # 아직 locked 남아있으면 다음 루프에서 재시도
+                            if PASSIVE_LIMIT_SELL_DEBUG:
+                                print(f"[PASSIVE][WAIT_UNLOCK] {market} bal={new_bal} locked={new_locked}")
+                                continue
+                        if usable_after_cancel <= 0:
+                            continue
+                        usable_qty_initial = usable_after_cancel
+                    except:
+                       pass
+                need_place = True
         if need_place:
-            notional_check = total_qty * adj_price
+            order_qty = quantize_volume(usable_qty_initial)
+            if order_qty <= 0:
+                continue
+            notional_check = order_qty * adj_price
             if notional_check < PASSIVE_LIMIT_SELL_MIN_NOTIONAL:
                 if PASSIVE_LIMIT_SELL_DEBUG:
                     print(f"[PASSIVE][SKIP] {market} notional {notional_check} < min {PASSIVE_LIMIT_SELL_MIN_NOTIONAL}")
-                continue
+                    continue
             try:
                 resp = await order_limit_sell(access_key, secret_key, market, total_qty, adj_price)
                 uuid_new = resp.get("uuid")
                 if uuid_new:
                     st["passive_limit_uuid"] = uuid_new
                     st["passive_limit_price"] = adj_price
-                    st["passive_limit_volume"] = str(total_qty)
+                    st["passive_limit_volume"] = str(order_qty)
                     st["passive_limit_ts"] = time.time()
-                    print(f"[PASSIVE][PLACE] {market} vol={total_qty} price={adj_price} reason={reason} uuid={uuid_new}")
+                    print(f"[PASSIVE][PLACE] {market} vol={order_qty} price={adj_price} reason={reason} uuid={uuid_new}")
                 else:
                     print(f"[PASSIVE][FAIL] uuid 없음 {market} resp={resp}")
             except Exception as pe:
