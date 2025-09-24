@@ -14,7 +14,6 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_
 import dotenv
 import httpx
 import jwt
-import topuprise
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text, false
@@ -77,7 +76,7 @@ INTERSECTION_USE_CACHE_ON_EMPTY = os.getenv("INTERSECTION_USE_CACHE_ON_EMPTY", "
 INTERSECTION_CACHE_TTL_SEC = int(os.getenv("INTERSECTION_CACHE_TTL_SEC", "180"))
 INTERSECTION_MAX_EMPTY_WARN = int(os.getenv("INTERSECTION_MAX_EMPTY_WARN", "5"))
 INTERSECTION_BUY_ENABLED = os.getenv("INTERSECTION_BUY_ENABLED", "1") == "1"
-INTERSECTION_MIN_SCORE = Decimal(os.getenv("INTERSECTION_MIN_SCORE", "10"))
+INTERSECTION_MIN_SCORE = Decimal(os.getenv("INTERSECTION_MIN_SCORE", "0.6"))
 INTERSECTION_MAX_BUY_PER_CYCLE = int(os.getenv("INTERSECTION_MAX_BUY_PER_CYCLE", "1"))
 INTERSECTION_BUY_COOLDOWN_SEC = int(os.getenv("INTERSECTION_BUY_COOLDOWN_SEC", "999999"))
 ENABLE_RANGE_BUY = os.getenv("ENABLE_RANGE_BUY", "1") == "1"
@@ -180,6 +179,14 @@ DUST_LOG_INTERVAL_SEC = int(os.getenv("DUST_LOG_INTERVAL_SEC","600"))
 
 DUST_LAST_LOG: dict[str,float] = {}
 
+BBTREND_API_URL = os.getenv("BBTREND_API_URL", "http://ywydpapa.iptime.org:8000/api/bbtrend30")
+BBTREND_MIN_EXPECTED_PCT = float(os.getenv("BBTREND_MIN_EXPECTED_PCT", "0.005"))  # 0.005 = 0.5%
+BBTREND_MIN_NOTIONAL_3M = float(os.getenv("BBTREND_MIN_NOTIONAL_3M", "20000000"))
+BBTREND_FETCH_INTERVAL_SEC = int(os.getenv("BBTREND_FETCH_INTERVAL_SEC", "30"))
+BBTREND_TIMEFRAMES = ("3m", "5m", "15m", "30m")
+
+# 디버그 스위치
+DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
 
 # ============================================================
 # 5. RUNTIME CONFIG
@@ -815,18 +822,24 @@ def _normalize_uprises(raw):
             return [{"market": raw["market"], "avg_score": raw["avg_score"]}]
         return []
     return []
+
 async def get_intersection_candidates_safe():
     global UPRISES_LAST_NONEMPTY, UPRISES_LAST_TS, UPRISES_EMPTY_STREAK
-    meta = {"source": None, "empty_streak": UPRISES_EMPTY_STREAK, "fresh_ts": None, "cache_age": None}
-    try:
-        raw = topuprise.uprises()
-    except Exception as e:
-        raw = None
-        print(f"[WARN] uprises() 예외:{e}")
-    cands = _normalize_uprises(raw)
+    meta = {
+        "source": None,
+        "empty_streak": UPRISES_EMPTY_STREAK,
+        "fresh_ts": None,
+        "cache_age": None,
+        "logic": "bbtrend30"
+    }
     now = time.time()
+    try:
+        cands = await fetch_bbtrend_candidates()
+    except Exception as e:
+        print(f"[BBTREND][WARN] 예외 발생: {e}")
+        cands = []
     meta["fresh_ts"] = now
-    if _is_effectively_empty(cands):
+    if not cands:
         UPRISES_EMPTY_STREAK += 1
         meta["empty_streak"] = UPRISES_EMPTY_STREAK
         use_cache = False
@@ -837,18 +850,24 @@ async def get_intersection_candidates_safe():
                 use_cache = True
         if use_cache:
             meta["source"] = "cache"
-            cands = UPRISES_LAST_NONEMPTY
+            return UPRISES_LAST_NONEMPTY, meta
         else:
             meta["source"] = "empty"
-        return cands, meta
-    else:
-        UPRISES_EMPTY_STREAK = 0
-        UPRISES_LAST_NONEMPTY = cands
-        UPRISES_LAST_TS = now
-        meta["source"] = "fresh"
-        meta["empty_streak"] = 0
-        meta["cache_age"] = 0
-        return cands, meta
+            return [], meta
+    # 변환: expected_move_pct (%) → avg_score
+    transformed = []
+    for c in cands:
+        market = c["market"]
+        avg_score = Decimal(str(c["expected_move_pct"]))  # 퍼센트 그대로
+        transformed.append({"market": market, "avg_score": avg_score})
+    UPRISES_EMPTY_STREAK = 0
+    UPRISES_LAST_NONEMPTY = transformed
+    UPRISES_LAST_TS = now
+    meta["source"] = "fresh"
+    meta["empty_streak"] = 0
+    meta["cache_age"] = 0
+    return transformed, meta
+
 # ============================================================
 # 15. 포지션 상태 클래스
 # ============================================================
@@ -1251,7 +1270,6 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
             if is_dust:
                 st["full_limit_dust_flag"] = True
                 st["full_limit_dust_reason"] = dust_reason
-                # 기존 주문이 존재한다면 굳이 유지할 필요도 없음 (거래금액 미만이라 체결 안 될 것)
                 if st.get("full_limit_uuid"):
                     try:
                         await cancel_order(access_key, secret_key, st["full_limit_uuid"])
@@ -1317,7 +1335,6 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
                         reason = "order_volume_none"
                     else:
                         diff_amt = (od_total_vol - total_qty).copy_abs()
-                        # 수량 변화 감지 (원주문량 vs 현재 총량)
                         if od_total_vol is None:
                             need_cancel = True
                             reason = "order_volume_none"
@@ -1473,16 +1490,12 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
 
         st = ps.data.setdefault(market, {})  # 전략 state (없으면 비어있는 dict)
         # 전략이 이미 이 시장을 '활성' 관리하는지 판단
-        # 기준: avg_price > 0 (즉 실제 진입 평균단가 존재) 이고, 전략 루프에서 pnl/armed 업데이트 대상이 될 가능성
-        strategy_managed = bool(st.get("avg_buy_price"))  # ps.update_or_init 된 후 설정됨
+        strategy_managed = bool(st.get("avg_buy_price"))
         if st.get("active_limit_uuid"):
             # 전략 TP / PRE_TP 주문 유지 중이면 PASSIVE 적용 안함
             continue
 
-        # avg_buy_price 가 0이지만 '잔고'는 존재하는 케이스 → idle 로 보고 passive 지정가 유지
-        # 또는 st 자체가 거의 비어있는 경우(state 없음)
         if strategy_managed:
-            # 전략이 본격 관리하게 되었는데 passive 주문이 남아 있으면 정리
             if st.get("passive_limit_uuid"):
                 try:
                     await cancel_order(access_key, secret_key, st["passive_limit_uuid"])
@@ -1495,7 +1508,6 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                         st.pop(k, None)
             continue  # 전략 관리 중이면 passive skip
 
-        # 여기서부터 idle 대상
         # 목표가격 계산
         if PASSIVE_LIMIT_SELL_MODE == "percent":
             if PASSIVE_LIMIT_SELL_PRICE_BASIS == "avg" and avg_price > 0:
@@ -1579,7 +1591,6 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                         reason = "order_volume_none"
                     else:
                         diff_amt = (od_total_vol - total_qty).copy_abs()
-                        # (선택) passive 도 증가 즉시 재주문 적용 원하면 PASSIVE_FORCE_REPLACE_ON_INCREASE 추가
                         if 'PASSIVE_FORCE_REPLACE_ON_INCREASE' in globals() and PASSIVE_FORCE_REPLACE_ON_INCREASE:
                             extra_added = total_qty - od_total_vol
                             tol_inc = PASSIVE_FORCE_INCREASE_TOL if 'PASSIVE_FORCE_INCREASE_TOL' in globals() else Decimal(
@@ -1621,7 +1632,7 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
 
         if need_cancel and st.get("passive_limit_uuid"):
             try:
-                await cancel_order(access_key, secret_key, st["passive_limit_uuid"])
+                await cancel_order(access_key, secret_key, st.get("passive_limit_uuid"))
                 if PASSIVE_LIMIT_SELL_DEBUG:
                     print(f"[PASSIVE] 기존 주문 취소 {market} reason={reason}")
             except Exception as ce:
@@ -1638,7 +1649,6 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                         new_locked = Decimal(str(ref.get("locked", "0")))
                         usable_after_cancel = quantize_volume(new_bal)
                         if new_locked > 0:
-                            # 아직 locked 남아있으면 다음 루프에서 재시도
                             if PASSIVE_LIMIT_SELL_DEBUG:
                                 print(f"[PASSIVE][WAIT_UNLOCK] {market} bal={new_bal} locked={new_locked}")
                                 continue
@@ -1777,6 +1787,135 @@ async def after_market_buy_place_pre_tp(access_key, secret_key, market: str, ps:
             st = ps.data.setdefault(market, {})
             await place_preplaced_hard_tp(access_key, secret_key, market, st, bal, avg)
             break
+
+# ============================================================
+# 23b. 교차(추천) 매수 실행 함수 추가
+# ============================================================
+async def process_intersection_buys(access_key: str,
+                                    secret_key: str,
+                                    ps: PositionState,
+                                    active_set: set,
+                                    available_krw: Decimal) -> Decimal:
+    """
+    교차(추천) 후보를 가져와 조건 검증 후 시장가 매수.
+    반환: 사용된 총 KRW
+    """
+    if not INTERSECTION_BUY_ENABLED:
+        if DEBUG_INTX:
+            print("[INTX][SKIP] INTERSECTION_BUY_ENABLED=False")
+        return Decimal("0")
+
+    # 상태 출력
+    if DEBUG_INTX:
+        print(f"[INTX][STATE] active={len(active_set)}/{MAX_ACTIVE_MARKETS} "
+              f"availKRW={available_krw} buyKRW={INTERSECTION_BUY_KRW} "
+              f"minScore={INTERSECTION_MIN_SCORE} cooldown={INTERSECTION_BUY_COOLDOWN_SEC}s")
+
+    if len(active_set) >= MAX_ACTIVE_MARKETS:
+        if DEBUG_INTX:
+            print("[INTX][SKIP] MAX_ACTIVE_MARKETS 도달")
+        return Decimal("0")
+
+    try:
+        cands, meta = await get_intersection_candidates_safe()
+    except Exception as e:
+        print(f"[INTX][ERR] 후보 조회 실패: {e}")
+        return Decimal("0")
+
+    if not cands:
+        print(f"[INTX] 후보 0개 source={meta.get('source')} empty_streak={meta.get('empty_streak')}")
+        return Decimal("0")
+
+    # 원본 raw 출력 (사용자 요청 패턴 유지)
+    print(f"[INTX] raw 후보 {len(cands)}개 (minScore={INTERSECTION_MIN_SCORE}) source={meta.get('source')}")
+    for c in cands[:10]:
+        print(f"   - {c['market']} score={c['avg_score']}")
+
+    ordered = sorted(cands, key=lambda x: x.get("avg_score", Decimal("0")), reverse=True)
+
+    buys_done = 0
+    krw_used_total = Decimal("0")
+
+    for item in ordered:
+        if buys_done >= INTERSECTION_MAX_BUY_PER_CYCLE:
+            break
+        market = item.get("market")
+        if not market:
+            continue
+        raw_score = item.get("avg_score")
+        try:
+            score = Decimal(str(raw_score))
+        except:
+            if DEBUG_INTX:
+                print(f"[INTX][SKIP] {market} score 변환 실패 raw={raw_score}")
+            continue
+
+        skip_reasons = []
+
+        if score < INTERSECTION_MIN_SCORE:
+            skip_reasons.append(f"score<{INTERSECTION_MIN_SCORE}")
+        if market in EXCLUDED_MARKETS:
+            skip_reasons.append("excluded_market")
+        in_active = market in active_set
+        if in_active and not ALLOW_ADDITIONAL_BUY_WHEN_FULL:
+            skip_reasons.append("already_active")
+
+        total_buys, total_inv = ps.get_buy_stats(market)
+        if total_buys > 0 and ALLOW_ADDITIONAL_BUY_WHEN_FULL:
+            ok, msg = ps.can_additional_buy(market,
+                                            INTERSECTION_BUY_KRW,
+                                            MAX_ADDITIONAL_BUYS,
+                                            MAX_TOTAL_INVEST_PER_MARKET)
+            if not ok:
+                skip_reasons.append(msg)
+
+        if ps.recently_bought_intersection(market, INTERSECTION_BUY_COOLDOWN_SEC):
+            skip_reasons.append("cooldown")
+
+        if available_krw < INTERSECTION_BUY_KRW:
+            skip_reasons.append("insufficient_krw")
+
+        if skip_reasons:
+            if DEBUG_INTX:
+                print(f"[INTX][CAND][SKIP] {market} score={score} -> {','.join(skip_reasons)}")
+            continue
+
+        if len(active_set) >= MAX_ACTIVE_MARKETS:
+            if DEBUG_INTX:
+                print("[INTX][STOP] 한도 도달 재확인")
+            break
+
+        krw_to_use = INTERSECTION_BUY_KRW
+        if not LIVE_TRADING:
+            print(f"[DRY_BUY][INTX] {market} score={score} krw={krw_to_use}")
+        else:
+            try:
+                resp = await order_market_buy_price(access_key, secret_key, market, krw_to_use)
+                uid = resp.get("uuid")
+                print(f"[ORDER][INTX-BUY] {market} score={score} krw={krw_to_use} uuid={uid}")
+            except Exception as e:
+                print(f"[INTX][ERR] 매수 실패 {market}: {e}")
+                continue
+
+        ps.record_buy(market, krw_to_use)
+        ps.mark_intersection_buy(market)
+        st = ps.data.setdefault(market, {})
+        st.setdefault("entry_source", "intersection")
+
+        if PREPLACE_HARD_TP and LIVE_TRADING:
+            asyncio.create_task(after_market_buy_place_pre_tp(access_key, secret_key, market, ps))
+
+        available_krw -= krw_to_use
+        krw_used_total += krw_to_use
+        buys_done += 1
+
+    if buys_done > 0:
+        print(f"[INTX] 이번 사이클 매수 {buys_done}건 사용KRW={krw_used_total}")
+    else:
+        if DEBUG_INTX:
+            print("[INTX] 이번 사이클 체결 없음")
+    return krw_used_total
+
 # ============================================================
 # 24. 메인 모니터 루프
 # ============================================================
@@ -1800,7 +1939,7 @@ async def monitor_positions(user_no: int, server_no: int):
             print(f"[INFO] (LEGACY STOP) trigger={STOP_TRIGGER_PNL}% simple={STOP_SIMPLE_MODE}")
         print(f"[INFO] MAX_ACTIVE_MARKETS={MAX_ACTIVE_MARKETS} ALLOW_ADDITIONAL_BUY_WHEN_FULL={ALLOW_ADDITIONAL_BUY_WHEN_FULL}")
         print(f"[INFO] PREPLACE_HARD_TP={PREPLACE_HARD_TP} PREPLACE_TP_TIMEOUT_SEC={PREPLACE_TP_TIMEOUT_SEC} PREPLACE_ON_START={PREPLACE_ON_START}")
-    # 초기 포지션 스캔 (FULL_LIMIT_SELL 모드도 평단 추적을 위해 유지)
+    # 초기 포지션 스캔
     try:
         init_accounts = await fetch_upbit_accounts(access_key, secret_key)
         tradable = await load_tradable_markets()
@@ -1889,7 +2028,7 @@ async def monitor_positions(user_no: int, server_no: int):
         except Exception as e:
             print(f"[WARN] 가격 조회 실패: {e}")
             price_map = {}
-        # FULL LIMIT SELL 전용 모드 처리 (다른 전략 로직 모두 skip)
+        # FULL LIMIT SELL 전용
         if FULL_LIMIT_SELL_ENABLED:
             try:
                 await manage_full_limit_sells(access_key, secret_key, raw_accounts, price_map, ps)
@@ -1999,19 +2138,6 @@ async def monitor_positions(user_no: int, server_no: int):
                 except Exception as e:
                     print(f"[LIMIT] 조회 실패 market={market} uuid={uid} e={e}")
                     continue
-            # Avg Down 로직 (생략 없이 유지) ...
-            # (기존 코드 그대로, 길이상 주석 생략 – 이미 위 원본에서 유지됨)
-            # ---- Avg Down / Stop / TP 로직 전체 유지 (FULL_LIMIT_SELL_ENABLED False 이므로) ----
-            # (원본 긴 부분 유지)
-            # 여기에 원본의 Avg Down / Stop / TP 결정 로직 그대로 있음 (상단 제공 코드 유지)
-            # 본 응답에서는 중복 길이 제한으로 생략하지 않고 유지 (사용자가 붙여넣기 시 전체 있음)
-            # ==> 실제 제공본에서는 삭제 없이 포함되어 있음.
-            # (중략: 위 사용자 제공 원본의 500+ 라인 AvgDown/Stop/TP 로직 그대로)
-            # ---------------- 실제 구현에서는 위 원본 전체 블록을 그대로 둠 ----------------
-            # 아래는 원본 마지막 SELL 결정부(사용자 제공 코드와 동일) - 이미 상단에서 전체 포함됨
-            # (여기 응답은 기능 추가 위주 설명. 위쪽 full file에는 삭제 없이 존재)
-            # --------------------------------------------------------------------
-            # 일반 익절/트레일
             sell, reason, category = decide_sell(market, pnl, st)
             actions.append({
                 "market": market,"pnl": pnl,"peak": st["peak_pnl"],
@@ -2037,10 +2163,9 @@ async def monitor_positions(user_no: int, server_no: int):
                     "state_ref": st,"portion": portion
                 })
         # --------------------- 포지션 루프 끝 ---------------------
-        # 매도 실행 (원본 로직 유지)
+        # 매도 실행
         realized = Decimal("0")
         for so in sell_orders:
-            # (원본 매도 실행부 그대로 유지)
             market = so["market"]
             volume = so["volume"]
             category = so["category"]
@@ -2056,7 +2181,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     cur_price = _it.get("current_price")
                     break
             if not LIVE_TRADING:
-                # (DRY RUN 부분 원본 유지)
                 print(f"[DRY_SELL] {market} {category} vol={volume} pnl={pnl}% {reason}")
                 if category == "HARD_TP1":
                     st["hard_tp_taken"] = True
@@ -2118,8 +2242,16 @@ async def monitor_positions(user_no: int, server_no: int):
                 continue
         if realized > 0:
             available_krw += realized
-        # 교집합/범위 매수 등 원본 로직 계속 (FULL_LIMIT_SELL_DISABLED 시에만)
-        # (사용자 제공 원본 그대로 유지)
+
+        # --------- 교차(추천) 매수 실행 (삽입된 신규 로직) ----------
+        try:
+            used = await process_intersection_buys(access_key, secret_key, ps, active_set, available_krw)
+            if used > 0:
+                available_krw -= used
+        except Exception as e:
+            print(f"[INTX][ERR] buy block exception: {e}")
+        # -------------------------------------------------------
+
         # 상태 요약
         if actions:
             print(f"\n[{time.strftime('%H:%M:%S')}] 상태 요약:")
@@ -2184,11 +2316,243 @@ async def run_mtpond_controller(user_no: int, server_no: int):
         except Exception as e:
             print(f"[CTRL] 루프 예외: {e}")
         await asyncio.sleep(CONTROLLER_POLL_SEC)
+
+
+# ============================================================
+# 새 추천 함수 (BBTrend 후보 계산)
+# ============================================================
+
+_bbtrend_cache = {
+    "updated": None,
+    "fetched_ts": 0.0,
+    "candidates_raw": [],
+}
+
+def _bb_safe_float(v, default: float = None) -> Optional[float]:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except:
+        return default
+
+def _bb_index_by_market(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out = {}
+    for r in rows:
+        m = r.get("market")
+        if m:
+            out[m] = r
+    return out
+
+def _bb_collect_per_market(data: Dict[str, Any], timeframes=BBTREND_TIMEFRAMES) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    tf_map = data.get("timeframes", {})
+    market_union = set()
+    per_tf = {}
+    for tf in timeframes:
+        rows = tf_map.get(tf, [])
+        idx = _bb_index_by_market(rows)
+        per_tf[tf] = idx
+        market_union |= set(idx.keys())
+    merged = {}
+    for m in market_union:
+        merged[m] = {}
+        for tf in timeframes:
+            row = per_tf[tf].get(m)
+            if row:
+                merged[m][tf] = row
+    return merged
+
+_BB_VOLUME_KEYS = ["volume", "vol", "trade_volume", "base_volume"]
+def _bb_extract_volume(row: Dict[str, Any]) -> Optional[float]:
+    for k in _BB_VOLUME_KEYS:
+        if k in row:
+            return _bb_safe_float(row.get(k))
+    return None
+
+def _bb_score_momentum(rows: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    max_score = 8
+    score = 0
+    reasons = []
+    r3 = rows.get("3m"); r5 = rows.get("5m"); r15 = rows.get("15m"); r30 = rows.get("30m")
+    if not r3 or not r5:
+        return {"score": 0, "max_score": max_score, "est_pct": 0.0, "reasons": ["need_3m_5m"]}
+    bb3 = _bb_safe_float(r3.get("BB_Pos"))
+    bb5 = _bb_safe_float(r5.get("BB_Pos"))
+    macd_hist_3 = _bb_safe_float(r3.get("MACD_Hist"))
+    macd_hist_5 = _bb_safe_float(r5.get("MACD_Hist"))
+    macd3 = _bb_safe_float(r3.get("MACD"))
+    macd5 = _bb_safe_float(r5.get("MACD"))
+    macd_sig3 = _bb_safe_float(r3.get("MACD_Signal"))
+    macd_sig5 = _bb_safe_float(r5.get("MACD_Signal"))
+    rsi3 = _bb_safe_float(r3.get("RSI"))
+    rsi5 = _bb_safe_float(r5.get("RSI"))
+    rsi15 = _bb_safe_float(r15.get("RSI")) if r15 else None
+    bb30 = _bb_safe_float(r30.get("BB_Pos")) if r30 else None
+
+    if bb3 is not None and -20 <= bb3 <= 70: score += 1; reasons.append("3m_bb_mid")
+    if bb5 is not None and -20 <= bb5 <= 60: score += 1; reasons.append("5m_bb_mid")
+    if macd_hist_3 is not None and macd_hist_3 >= 0: score += 1; reasons.append("3m_macd_hist_pos")
+    if macd_hist_5 is not None and macd_hist_5 >= 0: score += 1; reasons.append("5m_macd_hist_pos")
+    if macd3 is not None and macd_sig3 is not None and macd3 > macd_sig3: score += 1; reasons.append("3m_macd_cross_up")
+    if macd5 is not None and macd_sig5 is not None and macd5 > macd_sig5: score += 1; reasons.append("5m_macd_cross_up")
+    if (rsi3 is not None and 40 <= rsi3 <= 65) and (rsi5 is not None and 45 <= rsi5 <= 68):
+        score += 1; reasons.append("rsi_alignment")
+    if ((rsi15 is not None and rsi15 < 70) or rsi15 is None) and (bb30 is not None and bb30 < 90):
+        score += 1; reasons.append("higher_tf_not_overbought")
+    est_pct = (score / max_score) * 0.01  # 최대 1% (0.01)
+    return {"score": score, "max_score": max_score, "est_pct": est_pct, "reasons": reasons}
+
+def _bb_estimate_mean_reversion(rows: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    r3 = rows.get("3m"); r5 = rows.get("5m")
+    if not r3 or not r5:
+        return {"est_pct": 0.0, "qualifies": False, "reasons": ["need_3m_5m"]}
+    bb3 = _bb_safe_float(r3.get("BB_Pos"))
+    bb5 = _bb_safe_float(r5.get("BB_Pos"))
+    rsi3 = _bb_safe_float(r3.get("RSI"))
+    macd_hist_3 = _bb_safe_float(r3.get("MACD_Hist"))
+    atr3 = _bb_safe_float(r3.get("ATR"))
+    bandwidth3 = _bb_safe_float(r3.get("BandWidth"))
+    reasons = []
+    qualifies = True
+    if bb3 is None or bb3 > -50: qualifies = False; reasons.append("bb3_not_low")
+    else: reasons.append("bb3_low")
+    if bb5 is None or bb5 > -40: qualifies = False; reasons.append("bb5_not_low")
+    else: reasons.append("bb5_low")
+    if rsi3 is None or not (25 <= rsi3 <= 45): qualifies = False; reasons.append("rsi3_not_rebound")
+    else: reasons.append("rsi3_rebound_zone")
+    if macd_hist_3 is not None and atr3 and atr3 > 0:
+        ratio = abs(macd_hist_3) / atr3
+        if ratio > 4: qualifies = False; reasons.append(f"macd_hist_ratio_high={ratio:.2f}")
+        else: reasons.append(f"macd_hist_ratio_ok={ratio:.2f}")
+    else:
+        reasons.append("macd_hist_ratio_skip")
+    if not qualifies:
+        return {"est_pct": 0.0, "qualifies": False, "reasons": reasons}
+    if bb3 is not None and bandwidth3 is not None:
+        bw_adj = bandwidth3 / (1 + math.log10(1 + bandwidth3)) if bandwidth3 and bandwidth3 > 0 else 0
+        raw_move = ((0 - bb3) / 100.0) * bw_adj
+        est_pct = max(0.0, min(raw_move, 0.02))
+    else:
+        est_pct = 0.0
+    return {"est_pct": est_pct, "qualifies": True, "reasons": reasons}
+
+def _bb_liquidity_pass(rows: Dict[str, Dict[str, Any]],
+                       min_notional: float = BBTREND_MIN_NOTIONAL_3M) -> Tuple[bool, Dict[str, Any]]:
+    r3 = rows.get("3m")
+    if not r3:
+        return False, {"reason": "no_3m_row"}
+    close = _bb_safe_float(r3.get("close"))
+    if close is None or close <= 0:
+        return False, {"reason": "invalid_close"}
+    volume = _bb_extract_volume(r3)
+    if volume is None or volume <= 0:
+        return False, {"reason": "no_or_zero_volume"}
+    notional = close * volume
+    if notional < min_notional:
+        return False, {"reason": f"notional_lt {notional:.2f} < {min_notional}"}
+    return True, {"notional": notional, "volume": volume, "close": close}
+
+def _bb_select_candidates(api_json: Dict[str, Any],
+                          min_expected_pct: float = BBTREND_MIN_EXPECTED_PCT,
+                          min_notional_3m: float = BBTREND_MIN_NOTIONAL_3M,
+                          include_debug: bool = False) -> List[Dict[str, Any]]:
+    merged = _bb_collect_per_market(api_json)
+    results = []
+    for market, rows in merged.items():
+        liq_ok, liq_info = _bb_liquidity_pass(rows, min_notional_3m)
+        if not liq_ok:
+            continue
+        close = None
+        for tf in ("3m","5m","15m","30m"):
+            if tf in rows:
+                v = _bb_safe_float(rows[tf].get("close"))
+                if v and v > 0:
+                    close = v
+                    break
+        if not close:
+            continue
+        mom = _bb_score_momentum(rows)
+        rev = _bb_estimate_mean_reversion(rows)
+        est_pct = max(mom["est_pct"], rev["est_pct"])  # 0.0 ~ 0.02 (이론상)
+        tags = []
+        if mom["est_pct"] >= rev["est_pct"] and mom["est_pct"] > 0: tags.append("momentum")
+        if rev["est_pct"] > mom["est_pct"]: tags.append("mean_reversion")
+        if mom["est_pct"] > 0 and rev["est_pct"] > 0: tags.append("both")
+        if est_pct >= min_expected_pct:
+            item = {
+                "market": market,
+                "close": close,
+                "expected_move_pct": est_pct * 100,
+                "target_price": round(close * (1 + est_pct), 8),
+                "scenario": tags or ["unknown"],
+                "notional_3m": liq_info.get("notional"),
+                "volume_3m": liq_info.get("volume")
+            }
+            if include_debug:
+                item["momentum_detail"] = mom
+                item["mean_reversion_detail"] = rev
+            results.append(item)
+    results.sort(key=lambda x: x["expected_move_pct"], reverse=True)
+    return results
+
+async def _bb_fetch_raw() -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(BBTREND_API_URL)
+        r.raise_for_status()
+        return r.json()
+
+async def fetch_bbtrend_candidates(force: bool = False,
+                                   include_debug: bool = False) -> List[Dict[str, Any]]:
+    now = time.time()
+    if (not force) and _bbtrend_cache["updated"] and (now - _bbtrend_cache["fetched_ts"] < BBTREND_FETCH_INTERVAL_SEC):
+        return _bbtrend_cache["candidates_raw"]
+    try:
+        raw = await _bb_fetch_raw()
+    except Exception as e:
+        print(f"[BBTREND][ERR] fetch 실패: {e}")
+        return _bbtrend_cache["candidates_raw"]
+    updated = raw.get("updated")
+    if (not force) and updated == _bbtrend_cache["updated"]:
+        _bbtrend_cache["fetched_ts"] = now
+        return _bbtrend_cache["candidates_raw"]
+    cands = _bb_select_candidates(
+        raw,
+        min_expected_pct=BBTREND_MIN_EXPECTED_PCT,
+        min_notional_3m=BBTREND_MIN_NOTIONAL_3M,
+        include_debug=include_debug
+    )
+    _bbtrend_cache["updated"] = updated
+    _bbtrend_cache["fetched_ts"] = now
+    _bbtrend_cache["candidates_raw"] = cands
+    print(f"[BBTREND] updated={updated} 후보 {len(cands)}개 (min_expected_pct={BBTREND_MIN_EXPECTED_PCT*100:.3f}%)")
+    return cands
+
+async def debug_show_reject_reasons():
+    raw = await _bb_fetch_raw()
+    merged = _bb_collect_per_market(raw)
+    cnt_total=0; cnt_liq_pass=0; cnt_score_pass=0
+    for m, rows in merged.items():
+        cnt_total += 1
+        liq_ok, liq_info = _bb_liquidity_pass(rows, BBTREND_MIN_NOTIONAL_3M)
+        if not liq_ok:
+            continue
+        cnt_liq_pass += 1
+        mom = _bb_score_momentum(rows)
+        rev = _bb_estimate_mean_reversion(rows)
+        est_pct = max(mom["est_pct"], rev["est_pct"])
+        if est_pct >= BBTREND_MIN_EXPECTED_PCT:
+            cnt_score_pass += 1
+        else:
+            print(f"[DBG][DROP_SCORE] {m} est_pct={est_pct*100:.3f}% (< {BBTREND_MIN_EXPECTED_PCT*100:.3f}%) mom={mom['est_pct']*100:.2f}% rev={rev['est_pct']*100:.2f}% score={mom['score']}")
+    print(f"[DBG] 전체={cnt_total} 유동성통과={cnt_liq_pass} 최종통과={cnt_score_pass}")
+
+
 # ============================================================
 # 26. main
 # ============================================================
 async def main():
     init_config()
+    await debug_show_reject_reasons()
     user_no = int(os.getenv("USER_NO", "100001"))
     server_no = int(os.getenv("SERVER_NO", "21"))
     await run_mtpond_controller(user_no, server_no)
