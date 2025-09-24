@@ -10,7 +10,7 @@ import time
 import math
 import json
 from typing import Optional, Dict, Any, List, Tuple
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_FLOOR
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 import dotenv
 import httpx
 import jwt
@@ -154,8 +154,8 @@ FULL_LIMIT_SELL_REPRICE_INTERVAL_SEC = int(os.getenv("FULL_LIMIT_SELL_REPRICE_IN
 # ------------------------------------------------------------
 PASSIVE_LIMIT_SELL_ENABLED = os.getenv("PASSIVE_LIMIT_SELL_ENABLED", "0") == "1"
 PASSIVE_LIMIT_SELL_MODE = os.getenv("PASSIVE_LIMIT_SELL_MODE", "percent")  # percent | fixed
-PASSIVE_LIMIT_SELL_PERCENT = Decimal(os.getenv("PASSIVE_LIMIT_SELL_PERCENT", "1.5"))
-PASSIVE_LIMIT_SELL_PRICE_BASIS = os.getenv("PASSIVE_LIMIT_SELL_PRICE_BASIS", "current")  # current | avg
+PASSIVE_LIMIT_SELL_PERCENT = Decimal(os.getenv("PASSIVE_LIMIT_SELL_PERCENT", "0.6"))
+PASSIVE_LIMIT_SELL_PRICE_BASIS = os.getenv("PASSIVE_LIMIT_SELL_PRICE_BASIS", "avg")  # current | avg
 PASSIVE_LIMIT_SELL_FIXED_PRICE = Decimal(os.getenv("PASSIVE_LIMIT_SELL_FIXED_PRICE", "0"))
 PASSIVE_LIMIT_SELL_REPRICE_DIFF_TOL_PCT = Decimal(os.getenv("PASSIVE_LIMIT_SELL_REPRICE_DIFF_TOL_PCT", "0.25"))
 PASSIVE_LIMIT_SELL_REPRICE_INTERVAL_SEC = int(os.getenv("PASSIVE_LIMIT_SELL_REPRICE_INTERVAL_SEC", "600"))
@@ -549,29 +549,70 @@ def to_decimal(x):
         return x
     return Decimal(str(x))
 
-def adjust_price_to_tick(raw_price) -> Decimal:
-    """
-    Upbit 호가 규칙에 맞게 '내림' 정렬.
-    입력: str|float|Decimal
-    출력: Decimal (필요 시 str(...) 로 API 전달)
-    """
-    price = to_decimal(raw_price)
-    p = float(price)  # 구간 결정 용도
-    if p >= 2_000_000: unit = Decimal("1000")
-    elif p >= 1_000_000: unit = Decimal("500")
-    elif p >= 500_000: unit = Decimal("100")
-    elif p >= 100_000: unit = Decimal("50")
-    elif p >= 10_000: unit = Decimal("10")
-    elif p >= 1_000: unit = Decimal("5")
-    elif p >= 100: unit = Decimal("1")
-    elif p >= 10: unit = Decimal("0.1")
-    elif p >= 1: unit = Decimal("0.01")
-    else: unit = Decimal("0.001")
-    steps = (price / unit).to_integral_value(rounding=ROUND_FLOOR)
-    aligned = steps * unit
-    quant = aligned.quantize(unit) if unit < 1 else aligned.quantize(Decimal("1"))
-    return quant
 
+# 환경변수로 디버깅 on/off
+TICK_DEBUG = os.getenv("TICK_DEBUG", "0") == "1"
+
+def get_tick_unit(price: Decimal) -> Decimal:
+    p = float(price)
+    if p >= 2_000_000: return Decimal("1000")
+    if p >= 1_000_000: return Decimal("1000")
+    if p >= 500_000:   return Decimal("500")
+    if p >= 100_000:   return Decimal("100")
+    if p >= 50_000:    return Decimal("50")
+    if p >= 10_000:    return Decimal("10")
+    if p >= 5_000:     return Decimal("5")
+    if p >= 1_000:     return Decimal("1")
+    if p >= 100:       return Decimal("1")
+    if p >= 10:        return Decimal("0.1")
+    if p >= 1:         return Decimal("0.01")
+    if p >= 0.1:       return Decimal("0.001")
+    if p >= 0.01:      return Decimal("0.0001")
+    if p >= 0.001:     return Decimal("0.00001")
+    if p >= 0.0001:    return Decimal("0.000001")
+    if p >= 0.00001:   return Decimal("0.0000001")
+    return Decimal("0.00000001")
+
+def adjust_price_to_tick(raw_price,
+                         side: str | None = None,
+                         mode: str = "auto") -> Decimal:
+    price = to_decimal(raw_price)
+    if price <= 0:
+        return Decimal("0")
+    unit = get_tick_unit(price)
+
+    if mode == "auto":
+        if side == "ask":
+            mode_eff = "ceil"
+        elif side == "bid":
+            mode_eff = "floor"
+        else:
+            mode_eff = "floor"
+    else:
+        mode_eff = mode
+
+    steps = price / unit
+    if mode_eff == "floor":
+        steps_i = steps.to_integral_value(rounding=ROUND_FLOOR)
+    elif mode_eff == "ceil":
+        steps_i = steps.to_integral_value(rounding=ROUND_CEILING)
+    elif mode_eff == "round":
+        # 표준 반올림 (0.5 up)
+        steps_i = (steps + Decimal("0.5")).to_integral_value(rounding=ROUND_FLOOR)
+    else:
+        steps_i = steps.to_integral_value(rounding=ROUND_FLOOR)
+
+    adjusted = steps_i * unit
+
+    # 정밀도 quantize
+    if unit >= 1:
+        adjusted_q = adjusted.quantize(Decimal("1"))
+    else:
+        adjusted_q = adjusted.quantize(unit)
+
+    if TICK_DEBUG:
+        print(f"[TICK] raw={price} unit={unit} side={side} mode={mode} -> {adjusted_q}")
+    return adjusted_q
 
 def format_display_volume(vol: Decimal) -> str:
     # 8자리 이하에서는 그대로, 다만 abs < 0.000001 이면 "~0 (<1e-6)" 표기
@@ -1162,11 +1203,6 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
                                   raw_accounts: List[Dict[str, Any]],
                                   price_map: Dict[str, Decimal],
                                   ps: PositionState):
-    """
-    FULL_LIMIT_SELL_ENABLED 활성화 시:
-      - 각 코인(보유량 + locked) 전체를 단일 지정가 매도 주문으로 유지
-      - 수량 증가/감소 or 가격 재조정 필요 시 기존 주문 취소 후 재주문
-    """
     now = time.time()
     for acc in raw_accounts:
         currency = acc.get("currency")
@@ -1403,18 +1439,7 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                                      raw_accounts: List[Dict[str, Any]],
                                      price_map: Dict[str, Decimal],
                                      ps: PositionState):
-    """
-    정상 전략(FULL_LIMIT_SELL_ENABLED == False)을 돌리면서
-    '전략이 현재 관리하지 않는(Idle)' 보유 코인에 대해 전체 지정가 매도 주문을 1개 유지한다.
 
-    Idle 판별(기본 버전):
-      - avg_buy_price 가 0/None 이어서 메인 루프 pnl 계산/decide_sell 에서 사실상 건너뛰는 코인
-      또는
-      - ps.data 에 아직 state 가 생성되지 않은 코인
-    제외 조건:
-      - 이미 전략 active_limit_uuid 가 있는 시장
-      - FULL_LIMIT_SELL(전역) 실행 중
-    """
     if FULL_LIMIT_SELL_ENABLED:
         return  # 전역 full limit 모드와 동시 사용 방지
 
