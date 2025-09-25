@@ -218,7 +218,7 @@ def init_config(force: bool = False):
     BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-0.2"))
     BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.15"))
     STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.2"))
-    LOSS_CUT_RATE = Decimal(STOP_TRIGGER_PNL) + Decimal(1.0)
+    LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-3.0"))
     STOP_PEAK_INCREMENT = Decimal(os.getenv("STOP_PEAK_INCREMENT", "0.1"))
     ADDITIONAL_BUY_KRW = Decimal("0")
     USE_TICK_RATE = False
@@ -240,7 +240,7 @@ def apply_dynamic_config(cfg: dict):
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, INTERSECTION_BUY_KRW
     global MAX_TOTAL_INVEST_PER_MARKET, BUY_RANGE_LOW, BUY_RANGE_HIGH
     global STOP_TRIGGER_PNL, STOP_PEAK_INCREMENT, ADDITIONAL_BUY_KRW
-    global USE_TICK_RATE, TICK_RATE
+    global USE_TICK_RATE, TICK_RATE, LOSS_CUT_RATE
     def to_decimal_safe(v, name):
         try:
             if v is None or str(v).strip() == "":
@@ -297,9 +297,9 @@ def apply_dynamic_config(cfg: dict):
             if val is not None:
                 mn, mx = Decimal("-15"), Decimal("-0.1")
                 if mn <= val <= mx:
-                    if val != STOP_TRIGGER_PNL:
-                        changes.append(f"STOP_TRIGGER_PNL {STOP_TRIGGER_PNL} -> {val}")
-                        STOP_TRIGGER_PNL = val
+                    if val != LOSS_CUT_RATE:
+                        changes.append(f"LOSS_CUT_RATE {LOSS_CUT_RATE} -> {val}")
+                        LOSS_CUT_RATE = val
                 else:
                     print(f"[CFG] lcRate 범위초과 {val} (허용 {mn} ~ {mx})")
         if "lcGap" in cfg:
