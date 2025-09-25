@@ -33,7 +33,6 @@ BASE_UNIT = "KRW"
 # ============================================================
 # 4. STATIC CONFIG (재시작 필요 / 거의 고정)
 # ============================================================
-LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-2.5"))
 # 지속 하락 판단 (최근 N개 1분봉 중 하락봉 개수와 총 낙폭)
 FALLING_LOOKBACK = int(os.getenv("FALLING_LOOKBACK", "6"))
 FALLING_MIN_DROPS = int(os.getenv("FALLING_MIN_DROPS", "4"))
@@ -210,7 +209,7 @@ def init_config(force: bool = False):
         return
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, INTERSECTION_BUY_KRW
     global MAX_TOTAL_INVEST_PER_MARKET, BUY_RANGE_LOW, BUY_RANGE_HIGH
-    global STOP_TRIGGER_PNL, STOP_PEAK_INCREMENT
+    global STOP_TRIGGER_PNL, STOP_PEAK_INCREMENT, LOSS_CUT_RATE
     global ADDITIONAL_BUY_KRW, USE_TICK_RATE, TICK_RATE
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "10"))
     RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
@@ -219,6 +218,7 @@ def init_config(force: bool = False):
     BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-0.2"))
     BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.15"))
     STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.2"))
+    LOSS_CUT_RATE = Decimal(STOP_TRIGGER_PNL) + Decimal(1.0)
     STOP_PEAK_INCREMENT = Decimal(os.getenv("STOP_PEAK_INCREMENT", "0.1"))
     ADDITIONAL_BUY_KRW = Decimal("0")
     USE_TICK_RATE = False
