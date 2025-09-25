@@ -31,6 +31,12 @@ API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
 BASE_UNIT = "KRW"
 # ============================================================
+# 3b. 주기 리셋 설정
+# ============================================================
+PERIODIC_RESET_SEC = int(os.getenv("PERIODIC_RESET_SEC", "1800"))  # 30분
+class ResetRequested(Exception):
+    pass
+# ============================================================
 # 4. STATIC CONFIG (재시작 필요 / 거의 고정)
 # ============================================================
 # 지속 하락 판단 (최근 N개 1분봉 중 하락봉 개수와 총 낙폭)
@@ -1900,6 +1906,7 @@ async def process_intersection_buys(access_key: str,
 # 24. 메인 모니터 루프
 # ============================================================
 async def monitor_positions(user_no: int, server_no: int):
+    start_ts = time.time()  # 주기 리셋 기준 시각
     keys = await get_keys(user_no, server_no)
     if not keys:
         print("[ERR] API 키 없음 → 종료")
@@ -2408,7 +2415,12 @@ async def monitor_positions(user_no: int, server_no: int):
                     f"min={a['min_pnl']} dd={a['drawdown']} maxDD={a['max_dd']} "
                     f"armed={a['armed']} cat={cat} -> {status} {a['reason']}"
                 )
+        # --- 주기 리셋 체크 (루프 말미, 모든 작업 처리 후) ---
+        if PERIODIC_RESET_SEC > 0 and (time.time() - start_ts) >= PERIODIC_RESET_SEC:
+            print(f"[RESET] periodic reset requested after {PERIODIC_RESET_SEC}s")
+            raise ResetRequested()
         await dynamic_sleep()
+
 
 # ============================================================
 # 25. Controller
@@ -2455,9 +2467,22 @@ async def run_mtpond_controller(user_no: int, server_no: int):
             if active_flag is True and task and task.done():
                 print(f"[CTRL {now}] 모니터 태스크 종료 감지 → 재시작")
                 task = asyncio.create_task(monitor_positions(user_no, server_no))
+        except ResetRequested:
+            # 모니터 태스크가 주기 리셋을 요청 → 즉시 재기동
+            print("[CTRL] ResetRequested caught → restarting monitor task")
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"[CTRL] cancel on ResetRequested: {e}")
+            task = asyncio.create_task(monitor_positions(user_no, server_no))
         except Exception as e:
             print(f"[CTRL] 루프 예외: {e}")
         await asyncio.sleep(CONTROLLER_POLL_SEC)
+
 
 
 # ============================================================
