@@ -1372,7 +1372,7 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
         else:
             continue
 
-        adj_price = adjust_price_to_tick(target_price)
+        adj_price = adjust_price_to_tick(target_price,side="ask" )
         st = ps.data.setdefault(market, {})
 
         # 취소/재배치 판단
