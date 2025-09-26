@@ -2278,37 +2278,61 @@ async def monitor_positions(user_no: int, server_no: int):
             if not market or pnl is None or cur_price is None:
                 continue
             st = ps.data.get(market) or {}
+
             if not st.get("stop_mode_active"):
                 continue
-            if st.get("martingale_count", 0) >= MAX_MARTIN:
+            cur_martin = int(st.get("martingale_count", 0))
+            if cur_martin >= MAX_MARTIN:
                 continue
-            # 누적 투자액 조회
+
+            # 현재까지의 총 매수금
             _, total_inv = ps.get_buy_stats(market)
             if total_inv <= 0:
                 continue
-            buy_amt = (total_inv * 2).quantize(Decimal("0.0001"))
+
+            # 직전 마틴 추가금
+            last_martin_amt = st.get("last_martin_amount")
+            try:
+                last_martin_amt = Decimal(str(last_martin_amt)) if last_martin_amt is not None else None
+            except:
+                last_martin_amt = None
+
+            # 마틴 추가금 계산:
+            # - 첫 마틴: buy_amt = total_inv * 2
+            # - 이후 마틴: buy_amt = last_martin_amt * 2
+            if cur_martin == 0:
+                buy_amt = (total_inv * Decimal("2")).quantize(Decimal("0.0001"))
+            else:
+                if last_martin_amt is None or last_martin_amt <= 0:
+                    # 안전장치: 기록이 없다면 total_inv 기준으로 재시작
+                    buy_amt = (total_inv * Decimal("2")).quantize(Decimal("0.0001"))
+                else:
+                    buy_amt = (last_martin_amt * Decimal("2")).quantize(Decimal("0.0001"))
+
+            # 최소주문/가용 현금 체크
             if buy_amt < MIN_ORDER_NOTIONAL_KRW:
+                print(f"[MARTIN][SKIP] {market} 추가금 {buy_amt} < 최소주문 {MIN_ORDER_NOTIONAL_KRW}")
                 continue
             if available_krw < buy_amt:
                 print(f"[MARTIN][SKIP] {market} KRW 부족 ({available_krw} < {buy_amt})")
                 continue
-            # 누적 한도 및 추가매수 가능 여부
-            ok, msg = ps.can_additional_buy(market, buy_amt, MAX_ADDITIONAL_BUYS, MAX_TOTAL_INVEST_PER_MARKET)
-            if not ok:
-                print(f"[MARTIN][SKIP] {market} {msg}")
-                continue
+
+            # 일반 누적 한도는 마틴에 적용하지 않음. (요구사항대로 별도 트랙)
             try:
                 if not LIVE_TRADING:
-                    print(f"[MARTIN][DRY-BUY] {market} stop_mode pnl={pnl}% buyKRW={buy_amt} (total_inv={total_inv} → x2)")
+                    print(
+                        f"[MARTIN][DRY-BUY] {market} m#{cur_martin + 1} pnl={pnl}% buyKRW={buy_amt} (total_inv={total_inv}, last={last_martin_amt})")
                 else:
                     resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
-                    print(f"[MARTIN][BUY] {market} pnl={pnl}% 금액={buy_amt} uuid={resp.get('uuid')}")
+                    print(f"[MARTIN][BUY] {market} m#{cur_martin + 1} pnl={pnl}% 금액={buy_amt} uuid={resp.get('uuid')}")
                 ps.record_buy(market, buy_amt)
-                st["martingale_count"] = st.get("martingale_count", 0) + 1
+                st["martingale_count"] = cur_martin + 1
                 st["last_martin_ts"] = time.time()
+                st["last_martin_amount"] = buy_amt
                 st.setdefault("entry_source", "martin")
                 martin_used_krw_total += buy_amt
-                # 선지정 TP 배치
+
+                # 선지정 TP
                 if PREPLACE_HARD_TP and LIVE_TRADING:
                     asyncio.create_task(after_market_buy_place_pre_tp(access_key, secret_key, market, ps))
             except Exception as e:
