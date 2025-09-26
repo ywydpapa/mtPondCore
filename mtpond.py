@@ -201,7 +201,7 @@ BBTREND_MIN_EXPECTED_PCT = float(os.getenv("BBTREND_MIN_EXPECTED_PCT", "0.005"))
 BBTREND_MIN_NOTIONAL_3M = float(os.getenv("BBTREND_MIN_NOTIONAL_3M", "20000000"))
 BBTREND_FETCH_INTERVAL_SEC = int(os.getenv("BBTREND_FETCH_INTERVAL_SEC", "30"))
 BBTREND_TIMEFRAMES = ("3m", "5m", "15m", "30m")
-MAX_MARTIN = int(os.getenv("MAX_MARTIN", "2"))
+MAX_MARTIN = int(os.getenv("MAX_MARTIN", "1"))
 # 디버그 스위치
 DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
 
