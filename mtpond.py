@@ -170,7 +170,7 @@ FORCE_REPLACE_MIN_INTERVAL_SEC = int(os.getenv("FORCE_REPLACE_MIN_INTERVAL_SEC",
 # ------------------------------------------------------------
 PASSIVE_LIMIT_SELL_ENABLED = os.getenv("PASSIVE_LIMIT_SELL_ENABLED", "0") == "1"
 PASSIVE_LIMIT_SELL_MODE = os.getenv("PASSIVE_LIMIT_SELL_MODE", "percent")  # percent | fixed
-PASSIVE_LIMIT_SELL_PERCENT = Decimal(os.getenv("PASSIVE_LIMIT_SELL_PERCENT", "0.6"))
+PASSIVE_LIMIT_SELL_PERCENT = Decimal(os.getenv("PASSIVE_LIMIT_SELL_PERCENT", "0.65"))
 PASSIVE_LIMIT_SELL_PRICE_BASIS = os.getenv("PASSIVE_LIMIT_SELL_PRICE_BASIS", "avg")  # current | avg
 PASSIVE_LIMIT_SELL_FIXED_PRICE = Decimal(os.getenv("PASSIVE_LIMIT_SELL_FIXED_PRICE", "0"))
 PASSIVE_LIMIT_SELL_REPRICE_DIFF_TOL_PCT = Decimal(os.getenv("PASSIVE_LIMIT_SELL_REPRICE_DIFF_TOL_PCT", "0.25"))
@@ -207,7 +207,7 @@ DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
 ENABLE_MARTIN = os.getenv("ENABLE_MARTIN", "0") #작동시키려면 1
 ENABLE_STOP = os.getenv("ENABLE_STOP", "1") == "1"
 
-MIN_SELL_MARGIN_PCT= os.getenv("MIN_SELL_MARGIN_PCT","0.35")
+MIN_SELL_MARGIN_PCT= os.getenv("MIN_SELL_MARGIN_PCT","0.65")
 
 
 # ============================================================
@@ -1353,22 +1353,22 @@ async def place_limit_tp_order(access_key: str, secret_key: str, market: str, vo
     except Exception as e:
         print(f"[TP-LIMIT] 호가조회 실패 → 시장가 대체 market={market} e={e}")
         return await order_market_sell(access_key, secret_key, market, volume)
-
-    # 계정에서 avg 확보
+# 계정에서 평균가
     base = market.split("-")[1]
     acc = await refetch_single_account(access_key, secret_key, base)
     avg_buy_price = Decimal(str(acc.get("avg_buy_price", "0"))) if acc else Decimal("0")
 
     MIN_SELL_MARGIN_PCT = Decimal(os.getenv("MIN_SELL_MARGIN_PCT", "0.15"))
 
-    # 최소마진 기반 가격
-    limit_price = adjust_price_to_tick(best_bid, side="ask")
+        # 최소마진 + 1틱 보호 + 최우선호가 + (5틱 > 최소마진)이면 5틱 가격 사용
     if avg_buy_price > 0:
-        min_margin_price = compute_min_margin_limit_price(avg_buy_price, MIN_SELL_MARGIN_PCT, prefer_side="ask")
-        one_tick_profit = adjust_price_to_tick(avg_buy_price + get_tick_unit(avg_buy_price), side="ask")
-        # 손해 방지: 최우선 매도호가(best_ask) 이상, 최소마진, 최소 1틱 이익을 모두 만족
-        limit_price = max(min_margin_price, one_tick_profit, best_ask)
-        limit_price = adjust_price_to_tick(limit_price, side="ask")
+        limit_price = compute_safe_min_sell_price_with_5ticks(
+            avg_buy_price=avg_buy_price,
+            best_ask=best_ask,
+            min_margin_pct=MIN_SELL_MARGIN_PCT
+        )
+    else:
+        limit_price = adjust_price_to_tick(best_bid, side="ask")
 
     if limit_price <= 0:
         print(f"[TP-LIMIT] limit_price 비정상 → 시장가 대체 market={market}")
@@ -1735,6 +1735,41 @@ def compute_min_margin_limit_price(avg_buy_price: Decimal,
     raw = avg_buy_price * (Decimal("1") + (min_margin_pct / Decimal("100")))
     return adjust_price_to_tick(raw, side="ask", mode="auto")
 
+def pct_gain(from_p: Decimal, to_p: Decimal) -> Decimal:
+    if from_p is None or from_p <= 0:
+        return Decimal("0")
+    try:
+        return ((to_p - from_p) / from_p) * Decimal("100")
+    except Exception:
+        return Decimal("0")
+
+def compute_safe_min_sell_price_with_5ticks(avg_buy_price: Decimal,
+                                            best_ask: Decimal | None,
+                                            min_margin_pct: Decimal) -> Decimal:
+
+    if avg_buy_price is None or avg_buy_price <= 0:
+        return Decimal("0")
+    one_tick = get_tick_unit(avg_buy_price)
+    # 1틱/5틱 이익 가격
+    one_tick_profit_price = adjust_price_to_tick(avg_buy_price + one_tick, side="ask")
+    five_ticks_price = adjust_price_to_tick(avg_buy_price + (one_tick * 5), side="ask")
+    # 최소마진 가격
+    min_margin_price = compute_min_margin_limit_price(avg_buy_price, min_margin_pct, prefer_side="ask")
+    # 5틱 이익이 최소마진율을 초과?
+    five_tick_gain_pct = pct_gain(avg_buy_price, five_ticks_price)
+    use_five_ticks = (five_tick_gain_pct > min_margin_pct)
+
+    if use_five_ticks:
+        base = five_ticks_price
+    else:
+        # 최소마진/1틱이익 중 더 높은 기준
+        base = max(min_margin_price, one_tick_profit_price)
+
+    if best_ask is not None and best_ask > 0:
+        base = max(base, adjust_price_to_tick(best_ask, side="ask"))
+
+    return adjust_price_to_tick(base, side="ask")
+
 async def force_replace_limit_tp_after_buy(access_key: str, secret_key: str,
                                            market: str,
                                            avg_buy_price: Decimal,
@@ -1751,11 +1786,15 @@ async def force_replace_limit_tp_after_buy(access_key: str, secret_key: str,
     limit_price = compute_min_margin_limit_price(avg_buy_price, min_margin_pct, prefer_side="ask")
     try:
         best_bid, best_ask = await get_orderbook_top(market)
-        one_tick_profit = adjust_price_to_tick(avg_buy_price + get_tick_unit(avg_buy_price), side="ask")
-        limit_price = max(limit_price, one_tick_profit, best_ask)
     except Exception as e:
         print(f"[PATCH][TP-REPLACE][WARN] orderbook fail {market}: {e}")
-    limit_price = adjust_price_to_tick(limit_price, side="ask")
+        best_ask = None
+
+    limit_price = compute_safe_min_sell_price_with_5ticks(
+        avg_buy_price=avg_buy_price,
+        best_ask=best_ask,
+        min_margin_pct=min_margin_pct
+    )
 
     # 3) 상태 필드 초기화(선지정/수동/전체 지정가 충돌 방지)
     if state is not None:
