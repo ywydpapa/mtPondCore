@@ -2014,6 +2014,12 @@ async def monitor_positions(user_no: int, server_no: int):
     except Exception as e:
         print(f"[WARN] 초기화 부분 실패 (진행): {e}")
 
+    try:
+        await restart_reseed_after_cancellation(access_key, secret_key, ps, init_accounts, init_prices)
+        print("[INIT] 재시작 초기화(일괄 취소→재배치) 완료")
+    except Exception as e:
+        print(f"[INIT][WARN] 재시작 초기화 실패 (다음 루프에서 보정): {e}")
+
     await align_to_half_minute()
     prev_active_count = None
 
@@ -2837,12 +2843,93 @@ def process_immediate_sells(exchange, annotated, LOSS_CUT_RATE, mode="spot", min
     return results
 
 # ============================================================
+# X. 재시작 초기화: 전체 지정가 매도 취소 후 재배치
+# ============================================================
+async def cancel_all_waiting_orders_for_markets(access_key: str, secret_key: str, markets: List[str]):
+    # 모든 대기(wait) 주문 일괄 취소 (종류 가리지 않고), 마켓별로 반복
+    for m in markets:
+        try:
+            ok = await cancel_all_open_orders_for_market(access_key, secret_key, m, max_rounds=4, sleep_between=0.3)
+            if not ok:
+                print(f"[RESTART][WARN] 일부 주문이 남아있음 market={m}")
+        except Exception as e:
+            print(f"[RESTART][ERR] cancel all orders fail market={m}: {e}")
+
+async def restart_reseed_after_cancellation(access_key: str,
+                                            secret_key: str,
+                                            ps: "PositionState",
+                                            raw_accounts: List[Dict[str, Any]],
+                                            price_map: Dict[str, Decimal]):
+    # 잔고 기준 마켓 목록
+    markets = build_market_list_from_accounts(raw_accounts, BASE_UNIT)
+    # 1) 대기 주문 모두 취소
+    await cancel_all_waiting_orders_for_markets(access_key, secret_key, markets)
+    # 2) 잠깐 대기 후 언락 보장
+    await asyncio.sleep(0.4)
+    # 3) 잔고 재조회
+    try:
+        acc2 = await fetch_upbit_accounts(access_key, secret_key)
+    except Exception as e:
+        print(f"[RESTART][ERR] accounts reload fail: {e}")
+        acc2 = raw_accounts
+
+    # 4) 모드별 재배치
+    if FULL_LIMIT_SELL_ENABLED:
+        try:
+            await manage_full_limit_sells(access_key, secret_key, acc2, price_map, ps)
+            print("[RESTART] FULL_LIMIT_SELL 재배치 완료")
+        except Exception as e:
+            print(f"[RESTART][ERR] FLS 재배치 실패: {e}")
+        return
+
+    # FULL_LIMIT_SELL 비활성 시
+    # 4-a) PASSIVE 모드 재배치
+    if PASSIVE_LIMIT_SELL_ENABLED:
+        try:
+            await manage_passive_limit_sells(access_key, secret_key, acc2, price_map, ps)
+            print("[RESTART] PASSIVE_LIMIT_SELL 재배치 완료")
+        except Exception as e:
+            print(f"[RESTART][ERR] PASSIVE 재배치 실패: {e}")
+
+    # 4-b) PREPLACE_ON_START가 켜져 있으면 각 포지션에 선지정 TP 재배치
+    if PREPLACE_HARD_TP and PREPLACE_ON_START:
+        for acc in acc2:
+            c = acc.get("currency"); u = acc.get("unit_currency")
+            if not c or u != BASE_UNIT or c == BASE_UNIT:
+                continue
+            market = f"{BASE_UNIT}-{c}"
+            price = price_map.get(market)
+            if price is None:
+                continue
+            try:
+                bal = Decimal(str(acc.get("balance", "0")))
+                locked = Decimal(str(acc.get("locked", "0")))
+                avg_raw = acc.get("avg_buy_price")
+                avg = Decimal(str(avg_raw)) if avg_raw not in (None, "", "0") else Decimal("0")
+            except:
+                bal = Decimal("0"); locked = Decimal("0"); avg = Decimal("0")
+
+            total_qty = bal + locked
+            if avg <= 0 or total_qty <= 0:
+                continue
+
+            st = ps.data.setdefault(market, {})
+            # 선지정 TP 중복 방지 필드 제거
+            for k in ("active_limit_uuid","limit_submit_ts","limit_pending_category","limit_pending_volume","pre_tp_uuid"):
+                st.pop(k, None)
+            # 재배치
+            try:
+                await place_preplaced_hard_tp(access_key, secret_key, market, st, total_qty, avg)
+            except Exception as e:
+                print(f"[RESTART][WARN] preplace TP 실패 {market}: {e}")
+        print("[RESTART] PREPLACE_HARD_TP 재배치 완료")
+
+
+# ============================================================
 # 26. main
 # ============================================================
 async def main():
     init_config()
-    # 디버그: BBTrend 거절 사유 표시(선택)
-    # await debug_show_reject_reasons()
     user_no = int(os.getenv("USER_NO", "100001"))
     server_no = int(os.getenv("SERVER_NO", "21"))
     await run_mtpond_controller(user_no, server_no)
