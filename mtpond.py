@@ -204,6 +204,8 @@ BBTREND_TIMEFRAMES = ("3m", "5m", "15m", "30m")
 MAX_MARTIN = int(os.getenv("MAX_MARTIN", "1"))
 # 디버그 스위치
 DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
+ENABLE_MARTIN = os.getenv("ENABLE_MARTIN", "1") == "0"
+ENABLE_STOP = os.getenv("ENABLE_STOP", "1") == "1"
 
 # ============================================================
 # 5. RUNTIME CONFIG
@@ -237,16 +239,35 @@ def apply_dynamic_config(cfg: dict):
         "MAX_ACTIVE_MARKETS","RANGE_BUY_KRW","INTERSECTION_BUY_KRW",
         "MAX_TOTAL_INVEST_PER_MARKET","BUY_RANGE_LOW","BUY_RANGE_HIGH",
         "STOP_TRIGGER_PNL","STOP_PEAK_INCREMENT","ADDITIONAL_BUY_KRW",
-        "USE_TICK_RATE","TICK_RATE"
-    ]
+        "USE_TICK_RATE","TICK_RATE"]
     miss = [k for k in required_globals if k not in globals()]
+
+    global ENABLE_MARTIN, ENABLE_STOP  # 전역 먼저
+    changes = []
+
+    if "martinYN" in cfg:
+        flag = (str(cfg.get("martinYN")).upper() == "Y")
+        if flag != ENABLE_MARTIN:
+            changes.append(f"ENABLE_MARTIN {ENABLE_MARTIN} -> {flag}")
+            ENABLE_MARTIN = flag
+    if "stopYN" in cfg:
+        flag = (str(cfg.get("stopYN")).upper() == "Y")
+        if flag != ENABLE_STOP:
+            changes.append(f"ENABLE_STOP {ENABLE_STOP} -> {flag}")
+            ENABLE_STOP = flag
+
     if miss:
         print(f"[CFG] 전역 미초기화 감지:{miss} → init_config() 필요")
+        # 이미 changes에 ENABLE_* 변경이 담겼다면, 여기서도 출력해 주면 디버깅에 좋습니다.
+        if changes:
+            print("[CFG] 업데이트:\n  " + "\n  ".join(changes))
         return
+
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, INTERSECTION_BUY_KRW
     global MAX_TOTAL_INVEST_PER_MARKET, BUY_RANGE_LOW, BUY_RANGE_HIGH
     global STOP_TRIGGER_PNL, STOP_PEAK_INCREMENT, ADDITIONAL_BUY_KRW
     global USE_TICK_RATE, TICK_RATE, LOSS_CUT_RATE
+
     def to_decimal_safe(v, name):
         try:
             if v is None or str(v).strip() == "":
@@ -255,6 +276,7 @@ def apply_dynamic_config(cfg: dict):
         except Exception:
             print(f"[CFG] {name} 변환 실패 value={v}")
             return None
+
     changes = []
     try:
         if "maxCoincnt" in cfg:
@@ -338,6 +360,7 @@ def apply_dynamic_config(cfg: dict):
         print("[CFG] 업데이트:\n  " + "\n  ".join(changes))
     else:
         print("[CFG] 변경 없음")
+
 def get_preplace_portion():
     if PREPLACE_TP_PORTION:
         try:
@@ -347,6 +370,8 @@ def get_preplace_portion():
         except:
             pass
     return HARD_TP_SELL_PORTION
+
+
 # ============================================================
 # 6. Exclude Markets 파싱
 # ============================================================
@@ -1430,9 +1455,12 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
                         if od_total_vol is None:
                             need_cancel = True; reason = "order_volume_none"
                         else:
-                            diff_amt = (od_total_vol - total_qty).copy_abs()
+                            # 비교 기준을 '현재 주문 가능 수량(bal)'로 통일하여
+                            # 재주문 직후 locked 반영으로 인한 오판을 방지
+                            diff_amt = (od_total_vol - bal).copy_abs()
                             if diff_amt > FULL_LIMIT_SELL_AMOUNT_TOL:
-                                need_cancel = True; reason = f"qty_mismatch orig={od_total_vol} now={total_qty}"
+                                need_cancel = True
+                                reason = f"qty_mismatch orig={od_total_vol} now_bal={bal}"
                             else:
                                 if od_price is None:
                                     need_cancel = True; reason = "no_price_in_order"
@@ -1601,13 +1629,15 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
                         if od_total_vol is None:
                             need_cancel = True; reason = "order_volume_none"
                         else:
-                            diff_amt = (od_total_vol - total_qty).copy_abs()
+                            diff_amt = (od_total_vol - bal).copy_abs()
+                            total_qty = max(Decimal("0"), bal + locked)
                             if PASSIVE_FORCE_REPLACE_ON_INCREASE:
                                 extra_added = total_qty - od_total_vol
                                 if extra_added > PASSIVE_FORCE_INCREASE_TOL:
                                     need_cancel = True; reason = f"qty_increase +{extra_added}"
                             if (not need_cancel) and diff_amt > PASSIVE_LIMIT_SELL_AMOUNT_TOL:
-                                need_cancel = True; reason = f"qty_mismatch orig={od_total_vol} now={total_qty}"
+                                need_cancel = True
+                                reason = f"qty_mismatch orig={od_total_vol} now_bal={bal}"
                             if (not need_cancel):
                                 if od_price is None:
                                     need_cancel = True; reason = "no_price_in_order"
@@ -1802,7 +1832,6 @@ async def process_intersection_buys(access_key: str,
         if DEBUG_INTX:
             print("[INTX][SKIP] MAX_ACTIVE_MARKETS 도달")
         return Decimal("0")
-
     try:
         cands, meta = await get_intersection_candidates_safe()
     except Exception as e:
@@ -1837,7 +1866,10 @@ async def process_intersection_buys(access_key: str,
             continue
 
         skip_reasons = []
-
+        if not ENABLE_MARTIN:
+            _, total_inv = ps.get_buy_stats(market)
+            if (total_inv + INTERSECTION_BUY_KRW) > MAX_TOTAL_INVEST_PER_MARKET:
+                skip_reasons.append("max_invest_limit_reached_martin_off")
         if score < INTERSECTION_MIN_SCORE:
             skip_reasons.append(f"score<{INTERSECTION_MIN_SCORE}")
         if market in EXCLUDED_MARKETS:
@@ -1907,6 +1939,11 @@ async def process_intersection_buys(access_key: str,
 # ============================================================
 async def monitor_positions(user_no: int, server_no: int):
     start_ts = time.time()  # 주기 리셋 기준 시각
+    print(f"[INFO] ENABLE_MARTIN={ENABLE_MARTIN} ENABLE_STOP={ENABLE_STOP}")
+    if not ENABLE_MARTIN:
+        print(f"[INFO] 마틴 비활성화: 일반 매수만 수행, 누적 투자금은 MAX_TOTAL_INVEST_PER_MARKET({MAX_TOTAL_INVEST_PER_MARKET})까지만 허용")
+    if not ENABLE_STOP:
+        print("[INFO] 자동 손절 비활성화: STOP/Loss-Cut 로직 전부 미작동")
     keys = await get_keys(user_no, server_no)
     if not keys:
         print("[ERR] API 키 없음 → 종료")
@@ -2204,73 +2241,146 @@ async def monitor_positions(user_no: int, server_no: int):
                 continue
             st = ps.data.setdefault(market, {})
             ps.ensure_stop_fields(market)
-            # stop_mode 토글
-            if pnl <= STOP_TRIGGER_PNL:
-                if not st["stop_mode_active"]:
-                    print(f"[STOP-MODE][ON] {market} pnl={pnl}% <= trigger {STOP_TRIGGER_PNL}%")
-                st["stop_mode_active"] = True
+            # stop_mode 토글도 STOP 기능에 종속
+            if ENABLE_STOP:
+                if pnl <= STOP_TRIGGER_PNL:
+                    if not st["stop_mode_active"]:
+                        print(f"[STOP-MODE][ON] {market} pnl={pnl}% <= trigger {STOP_TRIGGER_PNL}%")
+                    st["stop_mode_active"] = True
+                else:
+                    if st["stop_mode_active"]:
+                        print(f"[STOP-MODE][OFF] {market} pnl={pnl}% > trigger {STOP_TRIGGER_PNL}%")
+                    st["stop_mode_active"] = False
             else:
-                if st["stop_mode_active"]:
-                    print(f"[STOP-MODE][OFF] {market} pnl={pnl}% > trigger {STOP_TRIGGER_PNL}%")
-                st["stop_mode_active"] = False
+                st["stop_mode_active"] = False  # 강제 OFF
 
-            # 즉시 손절 단순화: pnl ≤ LOSS_CUT_RATE이면 무조건 손절
-            if pnl <= LOSS_CUT_RATE:
+            # 즉시 손절 후보도 STOP이 켜진 경우에만 수집
+            if ENABLE_STOP and pnl <= LOSS_CUT_RATE:
                 immediate_sells.append({
                     "market": market,
                     "pnl": pnl,
                     "balance": bal,
                     "current_price": cur_price
                 })
-
         # 즉시 손절 먼저 처리 (모든 대기 주문 취소 → 언락 → 시장가 전량)
-        for item in immediate_sells:
-            mkt = item["market"]
-            st = ps.data.get(mkt) or {}
+        if ENABLE_STOP:
+            for item in immediate_sells:
+                mkt = item["market"]
+                st = ps.data.get(mkt) or {}
 
-            # 활성/수동 지정가/선지정 TP 등 취소
-            for k in ("active_limit_uuid", "passive_limit_uuid", "full_limit_uuid", "pre_tp_uuid"):
-                uid = st.get(k)
-                if uid:
-                    try:
-                        await cancel_order(access_key, secret_key, uid)
-                        if k != "pre_tp_uuid":
-                            st[k] = None
-                    except Exception as ce:
-                        print(f"[LOSS-CUT][WARN] cancel {k} {mkt} err={ce}")
+                # 활성/수동 지정가/선지정 TP 등 취소
+                for k in ("active_limit_uuid", "passive_limit_uuid", "full_limit_uuid", "pre_tp_uuid"):
+                    uid = st.get(k)
+                    if uid:
+                        try:
+                            await cancel_order(access_key, secret_key, uid)
+                            if k != "pre_tp_uuid":
+                                st[k] = None
+                        except Exception as ce:
+                            print(f"[LOSS-CUT][WARN] cancel {k} {mkt} err={ce}")
 
-            await cancel_all_open_orders_for_market(access_key, secret_key, mkt, max_rounds=4, sleep_between=0.3)
-            bal_now, locked_now = await wait_unlock_and_get_balance(access_key, secret_key, mkt, timeout=2.0, poll=0.25)
-            vol = safe_calc_volume(bal_now, Decimal("1"))
-            if vol <= 0:
-                print(f"[LOSS-CUT][SKIP] {mkt} unlocked but no balance (bal={bal_now}, locked={locked_now})")
-                continue
-
-            try:
-                best_bid, _best_ask = await get_orderbook_top(mkt)
-                notional = vol * best_bid
-                if notional < MIN_ORDER_NOTIONAL_KRW:
-                    print(f"[LOSS-CUT][SKIP] {mkt} notional {notional} < MIN_ORDER_NOTIONAL_KRW {MIN_ORDER_NOTIONAL_KRW}")
+                await cancel_all_open_orders_for_market(access_key, secret_key, mkt, max_rounds=4, sleep_between=0.3)
+                bal_now, locked_now = await wait_unlock_and_get_balance(access_key, secret_key, mkt, timeout=2.0,
+                                                                        poll=0.25)
+                vol = safe_calc_volume(bal_now, Decimal("1"))
+                if vol <= 0:
+                    print(f"[LOSS-CUT][SKIP] {mkt} unlocked but no balance (bal={bal_now}, locked={locked_now})")
                     continue
-            except Exception:
-                pass
 
-            try:
-                if not LIVE_TRADING:
-                    print(f"[LOSS-CUT][DRY] {mkt} pnl={item['pnl']}% (<= {LOSS_CUT_RATE}%) → SELL ALL vol={vol}")
-                else:
-                    resp = await order_market_sell(access_key, secret_key, mkt, vol)
-                    print(f"[LOSS-CUT] {mkt} pnl={item['pnl']}% → SELL ALL uuid={resp.get('uuid')} vol={vol}")
-                # 손절 후 상태 초기화
-                st["stop_mode_active"] = False
-                st["martingale_count"] = 0
-                st["last_martin_ts"] = None
-                ps.mark_sold(mkt)
-            except Exception as e:
-                print(f"[LOSS-CUT][ERR] {mkt} market sell fail: {e}")
+                try:
+                    best_bid, _best_ask = await get_orderbook_top(mkt)
+                    notional = vol * best_bid
+                    if notional < MIN_ORDER_NOTIONAL_KRW:
+                        print(
+                            f"[LOSS-CUT][SKIP] {mkt} notional {notional} < MIN_ORDER_NOTIONAL_KRW {MIN_ORDER_NOTIONAL_KRW}")
+                        continue
+                except Exception:
+                    pass
 
-        # 마틴 추가매수: stop_mode_active이고 martingale_count < MAX_MARTIN일 때 누적×2 매수 (마켓당 1건)
-        martin_used_krw_total = Decimal("0")
+                try:
+                    if not LIVE_TRADING:
+                        print(f"[LOSS-CUT][DRY] {mkt} pnl={item['pnl']}% (<= {LOSS_CUT_RATE}%) → SELL ALL vol={vol}")
+                    else:
+                        resp = await order_market_sell(access_key, secret_key, mkt, vol)
+                        print(f"[LOSS-CUT] {mkt} pnl={item['pnl']}% → SELL ALL uuid={resp.get('uuid')} vol={vol}")
+                    # 손절 후 상태 초기화
+                    st["stop_mode_active"] = False
+                    st["martingale_count"] = 0
+                    st["last_martin_ts"] = None
+                    ps.mark_sold(mkt)
+                except Exception as e:
+                    print(f"[LOSS-CUT][ERR] {mkt} market sell fail: {e}")
+            # 마틴 추가매수: stop_mode_active이고 martingale_count < MAX_MARTIN일 때 누적×2 매수 (마켓당 1건)
+            martin_used_krw_total = Decimal("0")
+            if ENABLE_MARTIN:
+                for it in enriched:
+                    market = it.get("market")
+                    pnl = it.get("pnl_percent")
+                    cur_price = it.get("current_price")
+                    if not market or pnl is None or cur_price is None:
+                        continue
+                    st = ps.data.get(market) or {}
+
+                    if not st.get("stop_mode_active"):
+                        continue
+                    cur_martin = int(st.get("martingale_count", 0))
+                    if cur_martin >= MAX_MARTIN:
+                        continue
+
+                    # 현재까지의 총 매수금
+                    _, total_inv = ps.get_buy_stats(market)
+                    if total_inv <= 0:
+                        continue
+
+                    last_martin_amt = st.get("last_martin_amount")
+                    try:
+                        last_martin_amt = Decimal(str(last_martin_amt)) if last_martin_amt is not None else None
+                    except:
+                        last_martin_amt = None
+
+                    if cur_martin == 0:
+                        buy_amt = (total_inv * Decimal("2")).quantize(Decimal("0.0001"))
+                    else:
+                        buy_amt = ((last_martin_amt or total_inv) * Decimal("2")).quantize(Decimal("0.0001"))
+
+                    if buy_amt < MIN_ORDER_NOTIONAL_KRW:
+                        print(f"[MARTIN][SKIP] {market} 추가금 {buy_amt} < 최소주문 {MIN_ORDER_NOTIONAL_KRW}")
+                        continue
+                    if available_krw < buy_amt:
+                        print(f"[MARTIN][SKIP] {market} KRW 부족 ({available_krw} < {buy_amt})")
+                        continue
+
+                    try:
+                        if not LIVE_TRADING:
+                            print(
+                                f"[MARTIN][DRY-BUY] {market} m#{cur_martin + 1} pnl={pnl}% buyKRW={buy_amt} (total_inv={total_inv}, last={last_martin_amt})")
+                        else:
+                            resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
+                            print(
+                                f"[MARTIN][BUY] {market} m#{cur_martin + 1} pnl={pnl}% 금액={buy_amt} uuid={resp.get('uuid')}")
+                        ps.record_buy(market, buy_amt)
+                        st["martingale_count"] = cur_martin + 1
+                        st["last_martin_ts"] = time.time()
+                        st["last_martin_amount"] = buy_amt
+                        st.setdefault("entry_source", "martin")
+                        martin_used_krw_total += buy_amt
+
+                        if PREPLACE_HARD_TP and LIVE_TRADING:
+                            asyncio.create_task(after_market_buy_place_pre_tp(access_key, secret_key, market, ps))
+                    except Exception as e:
+                        print(f"[MARTIN][ERR] {market} buy fail: {e}")
+
+                if martin_used_krw_total > 0:
+                    available_krw -= martin_used_krw_total
+            else:
+                # 마틴 OFF → 상태 리셋(선택)
+                for it in enriched:
+                    mkt = it.get("market")
+                    st = ps.data.get(mkt) or {}
+                    st["martingale_count"] = 0
+                    st["last_martin_ts"] = None
+                    st["last_martin_amount"] = None
+
         for it in enriched:
             market = it.get("market")
             pnl = it.get("pnl_percent")
