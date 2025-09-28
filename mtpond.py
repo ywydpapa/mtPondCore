@@ -317,7 +317,7 @@ def apply_dynamic_config(cfg: dict):
                 return None
             return Decimal(str(v))
         except Exception:
-            print(f("[CFG] {name} 변환 실패 value={v}"))
+            print(f"[CFG] {name} 변환 실패 value={v}")
 
     # 1) 마틴/손절 플래그 우선 적용
     flag_martin = _bool_from_cfg(cfg, "martinYN", "ENABLE_MARTIN", "0")
@@ -976,51 +976,6 @@ def _normalize_uprises(raw):
         return []
     return []
 
-async def get_intersection_candidates_safe():
-    global UPRISES_LAST_NONEMPTY, UPRISES_LAST_TS, UPRISES_EMPTY_STREAK
-    meta = {
-        "source": None,
-        "empty_streak": UPRISES_EMPTY_STREAK,
-        "fresh_ts": None,
-        "cache_age": None,
-        "logic": "bbtrend30"
-    }
-    now = time.time()
-    try:
-        cands = await fetch_bbtrend_candidates()
-    except Exception as e:
-        print(f"[BBTREND][WARN] 예외 발생: {e}")
-        cands = []
-    meta["fresh_ts"] = now
-    if not cands:
-        UPRISES_EMPTY_STREAK += 1
-        meta["empty_streak"] = UPRISES_EMPTY_STREAK
-        use_cache = False
-        if INTERSECTION_USE_CACHE_ON_EMPTY and UPRISES_LAST_NONEMPTY and UPRISES_LAST_TS:
-            age = now - UPRISES_LAST_TS
-            meta["cache_age"] = age
-            if age <= INTERSECTION_CACHE_TTL_SEC:
-                use_cache = True
-        if use_cache:
-            meta["source"] = "cache"
-            return UPRISES_LAST_NONEMPTY, meta
-        else:
-            meta["source"] = "empty"
-            return [], meta
-    # 변환: expected_move_pct (%) → avg_score
-    transformed = []
-    for c in cands:
-        market = c["market"]
-        avg_score = Decimal(str(c["expected_move_pct"]))  # 퍼센트 그대로
-        transformed.append({"market": market, "avg_score": avg_score})
-    UPRISES_EMPTY_STREAK = 0
-    UPRISES_LAST_NONEMPTY = transformed
-    UPRISES_LAST_TS = now
-    meta["source"] = "fresh"
-    meta["empty_streak"] = 0
-    meta["cache_age"] = 0
-    return transformed, meta
-
 # ============================================================
 # 15. 포지션 상태 클래스
 # ============================================================
@@ -1162,21 +1117,81 @@ class PositionState:
         if not info:
             return 0, Decimal("0")
         return info["total_buys"], info["total_invested"]
+
     def can_additional_buy(self, market, next_amount: Decimal, max_additional_buys: int, max_total_invest: Decimal):
+        # 타입/None 방어
+        try:
+            next_amount = Decimal(str(next_amount))
+        except Exception:
+            next_amount = Decimal("0")
+        try:
+            max_total_invest = Decimal(str(max_total_invest)) if max_total_invest is not None else Decimal("0")
+        except Exception:
+            max_total_invest = Decimal("0")
+        try:
+            max_additional_buys = int(max_additional_buys) if max_additional_buys is not None else 0
+        except Exception:
+            max_additional_buys = 0
+
         st = self.data.get(market)
         if STOP_DISABLE_NEW_BUYS and st and st.get("stop_triggered"):
             return False, f"[SKIP] {market} 손절모드(추가매수금지)"
+
         total_buys, total_inv = self.get_buy_stats(market)
+
         if total_buys == 0:
             if max_total_invest > 0 and next_amount >= max_total_invest:
                 return False, f"[SKIP] {market} 초기매수 {next_amount} >= 한도 {max_total_invest}"
             return True, "INIT_OK"
+
         add_done = total_buys - 1
         if add_done >= max_additional_buys:
             return False, f"[SKIP] {market} 추가매수 한도초과 (이미 {add_done}회)"
+
         if max_total_invest > 0 and (total_inv + next_amount) >= max_total_invest:
             return False, f"[SKIP] {market} 누적 {total_inv}+{next_amount} >= {max_total_invest}"
+
         return True, "OK"
+
+    def has_position(self, market: str) -> bool:
+        # 잔고 기반이 아니라 buy_info 기반으로 관리 중이므로 buy_info 키 존재로 판정
+        return market in self.buy_info
+
+    def get_total_invested(self, market: str) -> Decimal:
+        info = self.buy_info.get(market)
+        if not info:
+            return Decimal("0")
+        try:
+            return Decimal(str(info.get("total_invested", "0")))
+        except:
+            return Decimal("0")
+
+    def order_intersection_candidates(self, candidates: List[dict]) -> List[dict]:
+        return sorted(
+            candidates,
+            key=lambda x: (
+                Decimal(str(x.get("expected_move_pct", "0"))),  # 1순위
+                int(x.get("score", 0)),                         # 2순위
+            ),
+            reverse=True
+        )
+
+    async def fetch_intersection_candidates(self) -> List[dict]:
+        cands = await get_intersection_candidates_safe()
+        if not isinstance(cands, list):
+            return []
+        out = []
+        for c in cands:
+            # INTERSECTION_MIN_SCORE를 percent(%) 기준으로 사용
+            try:
+                pct = Decimal(str(c.get("expected_move_pct")))
+            except Exception:
+                continue
+            if pct >= INTERSECTION_MIN_SCORE:
+                out.append(c)
+        return self.order_intersection_candidates(out)
+
+
 # ============================================================
 # 16. 익절/트레일 판단
 # ============================================================
@@ -1284,17 +1299,20 @@ def get_active_markets(enriched: List[dict]) -> List[str]:
     active = []
     for it in enriched:
         m = it.get("market")
-        bal = it.get("balance")
+        bal = it.get("balance") or Decimal("0")
+        locked = it.get("locked") or Decimal("0")
         price = it.get("current_price")
-        if not m or bal is None or price is None:
+        if not m or price is None:
             continue
         try:
-            notional = bal * price
+            eff_bal = bal + locked
+            notional = eff_bal * price
             if notional >= MIN_NOTIONAL_KRW:
                 active.append(m)
         except:
             pass
     return active
+
 # ============================================================
 # 19. 원격 설정 fetch
 # ============================================================
@@ -2048,157 +2066,155 @@ async def after_market_buy_place_pre_tp(access_key, secret_key, market: str, ps:
 # ============================================================
 # 23b. 교차(추천) 매수 실행 함수
 # ============================================================
-# [PATCH] process_intersection_buys 내 가드/재배치 보강
-async def process_intersection_buys(access_key: str,
-                                    secret_key: str,
-                                    ps: "PositionState",
-                                    active_set: set,
-                                    available_krw: Decimal) -> Decimal:
+async def process_intersection_buys(
+    access_key: str,
+    secret_key: str,
+    ps: "PositionState",
+    remaining_slots: int,
+    available_krw: Decimal,
+) -> Decimal:
+    used_total = Decimal("0")
+
+    # 전역 스위치
     if not INTERSECTION_BUY_ENABLED:
         if DEBUG_INTX:
-            print("[INTX][SKIP] INTERSECTION_BUY_ENABLED=False")
-        return Decimal("0")
+            print("[INTX][SKIP] INTERSECTION_BUY_ENABLED=0")
+        return used_total
 
-    # 활성 코인수 초과 방지(엄격)
-    if len(active_set) >= MAX_ACTIVE_MARKETS:
+    if remaining_slots <= 0:
         if DEBUG_INTX:
-            print("[INTX][SKIP] MAX_ACTIVE_MARKETS 도달")
-        return Decimal("0")
+            print("[INTX][SKIP] remaining_slots=0")
+        return used_total
 
+    if available_krw < MIN_ORDER_NOTIONAL_KRW:
+        if DEBUG_INTX:
+            print(f"[INTX][SKIP] KRW 부족 {available_krw}")
+        return used_total
+
+    # 후보 가져오기
     try:
-        cands, meta = await get_intersection_candidates_safe()
+        ordered = await ps.fetch_intersection_candidates()
     except Exception as e:
-        print(f"[INTX][ERR] 후보 조회 실패: {e}")
-        return Decimal("0")
+        print(f"[INTX][CANDIDATES][ERROR] {e}")
+        return used_total
 
-    if not cands:
-        print(f"[INTX] 후보 0개 source={meta.get('source')} empty_streak={meta.get('empty_streak')}")
-        return Decimal("0")
+    if not ordered:
+        if DEBUG_INTX:
+            print("[INTX] 후보 0개")
+        return used_total
 
-    print(f"[INTX] raw 후보 {len(cands)}개 (minScore={INTERSECTION_MIN_SCORE}) source={meta.get('source')}")
-    for c in cands[:10]:
-        print(f"   - {c['market']} score={c['avg_score']}")
-
-    ordered = sorted(cands, key=lambda x: Decimal(str(x.get("avg_score", "0"))), reverse=True)
-
+    max_new_this_cycle = min(INTERSECTION_MAX_BUY_PER_CYCLE, remaining_slots)
     buys_done = 0
-    krw_used_total = Decimal("0")
-    MIN_SELL_MARGIN_PCT = Decimal(os.getenv("MIN_SELL_MARGIN_PCT", "0.15"))
+
+    # 안전 캐스팅 유틸
+    def _to_dec_safe(v, default="0"):
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return Decimal(str(default))
+
+    def _to_int_safe(v, default=0):
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    # 루프 밖(함수 초반)에서 한 번만 안전화
+    MAX_TOTAL_INVEST_PER_MARKET_SAFE = _to_dec_safe(MAX_TOTAL_INVEST_PER_MARKET, "0")
+    INTERSECTION_BUY_KRW_SAFE = _to_dec_safe(INTERSECTION_BUY_KRW, "0")
+    ADDITIONAL_BUY_KRW_SAFE = _to_dec_safe(ADDITIONAL_BUY_KRW, "0")
+    MAX_ADDITIONAL_BUYS_SAFE = _to_int_safe(MAX_ADDITIONAL_BUYS, 0)
+
+    # 함수 초반 SAFE 캐스팅 이후
+    try:
+        available_krw = Decimal(str(available_krw))
+    except Exception:
+        available_krw = Decimal("0")
 
     for item in ordered:
-        if buys_done >= INTERSECTION_MAX_BUY_PER_CYCLE:
+        if buys_done >= max_new_this_cycle:
             break
+
         market = item.get("market")
         if not market:
             continue
-        try:
-            score = Decimal(str(item.get("avg_score")))
-        except:
-            if DEBUG_INTX:
-                print(f"[INTX][SKIP] {market} score 변환 실패")
-            continue
 
-        skip_reasons = []
-        if score < INTERSECTION_MIN_SCORE:
-            skip_reasons.append(f"score<{INTERSECTION_MIN_SCORE}")
+        # 제외/화이트리스트 필터
         if market in EXCLUDED_MARKETS:
-            skip_reasons.append("excluded_market")
+            continue
+        if ENFORCE_WHITELIST and WHITELIST_MARKETS and (market not in WHITELIST_MARKETS):
+            continue
 
-        # 활성 코인수 한도: 새로운 종목 진입이면 강력 적용
-        is_new = (market not in active_set)
-        if is_new and len(active_set) >= MAX_ACTIVE_MARKETS:
-            skip_reasons.append("max_active_markets_limit")
+        already_has = ps.has_position(market)
+        requires_slot = not already_has
+        if requires_slot and buys_done >= max_new_this_cycle:
+            break
 
-        # 추가매수 관련 한도
-        total_buys, total_inv = ps.get_buy_stats(market)
-        if total_buys > 0 and ALLOW_ADDITIONAL_BUY_WHEN_FULL:
-            ok, msg = ps.can_additional_buy(market, INTERSECTION_BUY_KRW, MAX_ADDITIONAL_BUYS, MAX_TOTAL_INVEST_PER_MARKET)
-            if not ok:
-                skip_reasons.append(msg)
-        else:
-            # 신규 진입 또는 추가매수 금지 설정일 때 총 한도 점검
-            if (total_inv + INTERSECTION_BUY_KRW) > MAX_TOTAL_INVEST_PER_MARKET:
-                skip_reasons.append("max_total_invest_reached")
+        total_inv = ps.get_total_invested(market)
 
+        # per-market cap 소진 체크
+        if MAX_TOTAL_INVEST_PER_MARKET_SAFE > 0 and total_inv >= MAX_TOTAL_INVEST_PER_MARKET_SAFE:
+            if DEBUG_INTX:
+                print(f"[INTX][SKIP] {market} cap exhausted (inv={total_inv} >= {MAX_TOTAL_INVEST_PER_MARKET_SAFE})")
+            continue
+
+        already_has = ps.has_position(market)
+
+        # 교차 매수 쿨다운
         if ps.recently_bought_intersection(market, INTERSECTION_BUY_COOLDOWN_SEC):
-            skip_reasons.append("cooldown")
-
-        if available_krw < INTERSECTION_BUY_KRW:
-            skip_reasons.append("insufficient_krw")
-
-        if skip_reasons:
             if DEBUG_INTX:
-                print(f"[INTX][CAND][SKIP] {market} -> {','.join(skip_reasons)}")
+                print(f"[INTX][COOLDOWN] {market} skip ({INTERSECTION_BUY_COOLDOWN_SEC}s)")
             continue
 
-        # 다시 한 번 활성 코인수 체크(경합 상황 보호)
-        if is_new and len(active_set) >= MAX_ACTIVE_MARKETS:
-            if DEBUG_INTX:
-                print("[INTX][STOP] 한도 도달 재확인")
-            break
-
-        krw_to_use = INTERSECTION_BUY_KRW
-        if not LIVE_TRADING:
-            print(f"[DRY_BUY][INTX] {market} score={score} krw={krw_to_use}")
-            buy_ok = True; uid = None
+        if not already_has:
+            # 최초 진입: initAmt만
+            init_amt = INTERSECTION_BUY_KRW_SAFE
+            remaining_cap = (
+                        MAX_TOTAL_INVEST_PER_MARKET_SAFE - total_inv) if MAX_TOTAL_INVEST_PER_MARKET_SAFE > 0 else init_amt
+            krw_to_use = min(init_amt, remaining_cap, available_krw)
+            if krw_to_use < MIN_ORDER_NOTIONAL_KRW:
+                if DEBUG_INTX:
+                    print(f"[INTX][SKIP] {market} init_amt {krw_to_use} < min {MIN_ORDER_NOTIONAL_KRW}")
+                continue
         else:
-            try:
-                resp = await order_market_buy_price(access_key, secret_key, market, krw_to_use)
-                uid = resp.get("uuid")
-                print(f"[ORDER][INTX-BUY] {market} score={score} krw={krw_to_use} uuid={uid}")
-                buy_ok = True
-            except Exception as e:
-                print(f"[INTX][ERR] 매수 실패 {market}: {e}")
-                buy_ok = False
-
-        if not buy_ok:
+            # 추가 매수: addAmt만
+            add_amt_cfg = ADDITIONAL_BUY_KRW_SAFE
+            if add_amt_cfg <= 0:
+                if DEBUG_INTX:
+                    print(f"[INTX][SKIP] {market} 추가매수 비활성(addAmt<=0)")
+                continue
+            ok, reason = ps.can_additional_buy(market, add_amt_cfg, MAX_ADDITIONAL_BUYS_SAFE,
+                                               MAX_TOTAL_INVEST_PER_MARKET_SAFE)
+            if not ok:
+                if DEBUG_INTX:
+                    print(f"[INTX][SKIP] {market} {reason}")
+                continue
+            remaining_cap = (
+                        MAX_TOTAL_INVEST_PER_MARKET_SAFE - total_inv) if MAX_TOTAL_INVEST_PER_MARKET_SAFE > 0 else add_amt_cfg
+            krw_to_use = min(add_amt_cfg, remaining_cap, available_krw)
+            if krw_to_use < MIN_ORDER_NOTIONAL_KRW:
+                if DEBUG_INTX:
+                    print(f"[INTX][SKIP] {market} add_amt {krw_to_use} < min {MIN_ORDER_NOTIONAL_KRW}")
+                continue
+        buys_done += 1
+        # 실행
+        try:
+            resp = await order_market_buy_price(access_key, secret_key, market, krw_to_use)
+            print(f"[ORDER][INTX-BUY] {market} krw={krw_to_use} uuid={resp.get('uuid')}")
+        except Exception as e:
+            print(f"[ORDER][INTX-BUY][ERROR] {market} {e}")
             continue
 
-        # 상태 기록
         ps.record_buy(market, krw_to_use)
-        ps.mark_intersection_buy(market)
-        st = ps.data.setdefault(market, {})
-        st.setdefault("entry_source", "intersection")
-
-        # 추가매수 직후: 기존 지정가 매도 강제 취소 후, 새 평균가 기반 최소마진 지정가 재배치
-        if LIVE_TRADING:
-            try:
-                acc = await refetch_single_account(access_key, secret_key, market.split("-")[1])
-                if acc:
-                    avg = Decimal(str(acc.get("avg_buy_price","0")))
-                    bal = Decimal(str(acc.get("balance","0"))) + Decimal(str(acc.get("locked","0")))
-                    if avg > 0 and bal > 0:
-                        await force_replace_limit_tp_after_buy(
-                            access_key, secret_key, market,
-                            avg_buy_price=avg,
-                            volume=quantize_volume(bal),
-                            min_margin_pct=MIN_SELL_MARGIN_PCT,
-                            state=st
-                        )
-            except Exception as e:
-                print(f"[INTX][WARN] 재배치 실패 {market}: {e}")
-
-        # 선지정 TP는 별도 옵션대로 유지 (필요 시 위 재배치로 대체되므로 중복 주문 방지)
-        if PREPLACE_HARD_TP and LIVE_TRADING:
-            # 이미 force_replace_limit_tp_after_buy가 배치했으면 생략 가능
-            if not st.get("active_limit_uuid"):
-                asyncio.create_task(after_market_buy_place_pre_tp(access_key, secret_key, market, ps))
-
-        # 가용 KRW/카운트 업데이트
+        ps.mark_intersection_buy(market)  # 쿨다운 시작
         available_krw -= krw_to_use
-        krw_used_total += krw_to_use
-        buys_done += 1
-        active_set.add(market)  # 신규 진입시 활성 셋 반영
+        used_total += krw_to_use
 
-        if len(active_set) >= MAX_ACTIVE_MARKETS:
-            break
+        if not already_has:
+            buys_done += 1
 
-    if buys_done > 0:
-        print(f"[INTX] 이번 사이클 매수 {buys_done}건 사용KRW={krw_used_total}")
-    else:
-        if DEBUG_INTX:
-            print("[INTX] 이번 사이클 체결 없음")
-    return krw_used_total
+    return used_total
+
 
 
 # ============================================================
@@ -2392,11 +2408,14 @@ async def monitor_positions(user_no: int, server_no: int):
 
         # 7) 활성 포지션 셋 계산
         managed_set = set(ps.buy_info.keys())
-        active_by_notional = set(get_active_markets(enriched))
-        active_set = managed_set & active_by_notional  # 전략 관리 중이며 최소 체결가능 노셔널 이상만
+        active_by_notional = set(get_active_markets(enriched))  # 지갑 내 최소 노셔널 이상 보유 종목
         active_count = len(active_by_notional)
+
+        # 남은 슬롯: MAX_ACTIVE_MARKETS - 현재 활성 종목 수 (음수면 0)
+        remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
+
         if prev_active_count is None or prev_active_count != active_count:
-            print(f"[PORTFOLIO] 활성 {active_count}개 (한도 {MAX_ACTIVE_MARKETS})")
+            print(f"[PORTFOLIO] 활성 {active_count}개 (한도 {MAX_ACTIVE_MARKETS}), remaining_slots={remaining_slots}")
             prev_active_count = active_count
 
         # 매 루프 로그용 추적 컨테이너
@@ -2408,19 +2427,16 @@ async def monitor_positions(user_no: int, server_no: int):
             market = it.get("market")
             pnl = it.get("pnl_percent")
             avg = it.get("avg_buy_price")
-            bal = it.get("balance")
+            bal = it.get("balance") or Decimal("0")
+            locked = it.get("locked") or Decimal("0")
+            eff_bal = bal + locked
             cur_price = it.get("current_price")
-            if not market or pnl is None or avg is None or bal is None or cur_price is None:
-                continue
-            if pnl < WATCH_MIN_PNL:
-                # 관찰 하한 미만이면 포지션 상태 제거(깊은 손실 방지 목적의 필터)
-                ps.remove(market)
+            if not market or pnl is None or avg is None or cur_price is None:
                 continue
             if ps.recently_sold(market):
-                # 방금 매도한 종목은 다음 루프로 패스(언락/반영 대기)
                 continue
-            if bal * cur_price < MIN_NOTIONAL_KRW:
-                # 최소 주문 금액 미만의 잔량은 매도/지정가 생성을 스킵
+            # 최소 노셔널 체크는 eff_bal 기준
+            if eff_bal * cur_price < MIN_NOTIONAL_KRW:
                 continue
             # 상태 업데이트(peak/min/runup/drawdown/armed 등 갱신)
             st = ps.update_or_init(market, pnl, avg)
@@ -2656,12 +2672,39 @@ async def monitor_positions(user_no: int, server_no: int):
                     buy_amt = (total_inv * Decimal("2")).quantize(Decimal("0.0001"))
                 else:
                     buy_amt = ((last_martin_amt or total_inv) * Decimal("2")).quantize(Decimal("0.0001"))
-                # 최소 주문 금액/가용 KRW 확인
-                if buy_amt < MIN_ORDER_NOTIONAL_KRW:
-                    print(f"[MARTIN][SKIP] {market} 추가금 {buy_amt} < 최소주문 {MIN_ORDER_NOTIONAL_KRW}")
+
+                # [가드 추가] per-market 상한/가용현금 기반 절삭
+                # 남은 한도 계산
+                remaining_cap = MAX_TOTAL_INVEST_PER_MARKET - total_inv if MAX_TOTAL_INVEST_PER_MARKET > 0 else buy_amt
+
+                # 남은 한도가 0 이하면 스킵
+                if MAX_TOTAL_INVEST_PER_MARKET > 0 and remaining_cap <= 0:
+                    print(
+                        f"[MARTIN][SKIP] {market} per-market cap reached (inv={total_inv} >= cap={MAX_TOTAL_INVEST_PER_MARKET})")
                     continue
-                if available_krw < buy_amt:
-                    print(f"[MARTIN][SKIP] {market} KRW 부족 ({available_krw} < {buy_amt})")
+
+                # 실제 매수금액 산정
+                buy_amt_eff = min(buy_amt, remaining_cap, available_krw)
+
+                # 실행 직전 최종 캡 검증(이중 안전장치)
+                if MAX_TOTAL_INVEST_PER_MARKET > 0:
+                    new_total = total_inv + buy_amt_eff
+                    if new_total > MAX_TOTAL_INVEST_PER_MARKET:
+                        clip = (MAX_TOTAL_INVEST_PER_MARKET - total_inv)
+                        if clip <= 0:
+                            print(
+                                f"[MARTIN][SKIP] {market} cap reached just before order (inv={total_inv} cap={MAX_TOTAL_INVEST_PER_MARKET})")
+                            continue
+                        buy_amt_eff = min(buy_amt_eff, clip)
+                        if buy_amt_eff < MIN_ORDER_NOTIONAL_KRW:
+                            print(
+                                f"[MARTIN][SKIP] {market} clipped_amt {buy_amt_eff} < MIN_ORDER_NOTIONAL_KRW {MIN_ORDER_NOTIONAL_KRW}")
+                            continue
+
+                # 최소주문 미만이면 스킵
+                if buy_amt_eff < MIN_ORDER_NOTIONAL_KRW:
+                    print(
+                        f"[MARTIN][SKIP] {market} clipped_amt {buy_amt_eff} < MIN_ORDER_NOTIONAL_KRW {MIN_ORDER_NOTIONAL_KRW}")
                     continue
                 # 의심 포인트(최대 구매금액 미적용):
                 # 현 로직은 MAX_TOTAL_INVEST_PER_MARKET(구매 최대 금액) 체크가 없다.
@@ -2671,18 +2714,18 @@ async def monitor_positions(user_no: int, server_no: int):
                 try:
                     if not LIVE_TRADING:
                         print(
-                            f"[MARTIN][DRY-BUY] {market} m#{cur_martin + 1} pnl={pnl}% buyKRW={buy_amt} (total_inv={total_inv}, last={last_martin_amt})")
+                            f"[MARTIN][DRY-BUY] {market} m#{cur_martin + 1} pnl={pnl}% buyKRW={buy_amt_eff} (total_inv={total_inv}, last={last_martin_amt})")
                     else:
-                        resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
+                        resp = await order_market_buy_price(access_key, secret_key, market, buy_amt_eff)
                         print(
-                            f"[MARTIN][BUY] {market} m#{cur_martin + 1} pnl={pnl}% 금액={buy_amt} uuid={resp.get('uuid')}")
+                            f"[MARTIN][BUY] {market} m#{cur_martin + 1} pnl={pnl}% 금액={buy_amt_eff} uuid={resp.get('uuid')}")
                     # 성공 시 누적 투자/상태 갱신
-                    ps.record_buy(market, buy_amt)
+                    ps.record_buy(market, buy_amt_eff)
                     st["martingale_count"] = cur_martin + 1
                     st["last_martin_ts"] = time.time()
-                    st["last_martin_amount"] = buy_amt
+                    st["last_martin_amount"] = buy_amt_eff
                     st.setdefault("entry_source", "martin")
-                    martin_used_krw_total += buy_amt
+                    martin_used_krw_total += buy_amt_eff
                     # 마틴 직후 선지정 TP 보강(옵션)
                     if PREPLACE_HARD_TP and LIVE_TRADING:
                         asyncio.create_task(after_market_buy_place_pre_tp(access_key, secret_key, market, ps))
@@ -2786,12 +2829,26 @@ async def monitor_positions(user_no: int, server_no: int):
             available_krw += realized
         # 13) 교차(추천) 매수 실행 블록
         #     - 여기에는 “최대 투자금” 체크가 이미 존재함: ps.can_additional_buy 또는 직접 비교
+
         try:
-            used = await process_intersection_buys(access_key, secret_key, ps, active_set, available_krw)
+            used = await process_intersection_buys(
+                access_key=access_key,
+                secret_key=secret_key,
+                ps=ps,
+                remaining_slots=remaining_slots,
+                available_krw=available_krw,
+            )
+            try:
+                used = Decimal(str(used))
+            except Exception:
+                used = Decimal("0")
             if used > 0:
                 available_krw -= used
         except Exception as e:
-            print(f"[INTX][ERR] buy block exception: {e}")
+            import traceback
+            print(f"[INTX][ERROR] {e}")
+            traceback.print_exc()
+
         # 14) 상태 요약 출력(선택적 로그)
         if actions:
             print(f"\n[{time.strftime('%H:%M:%S')}] 상태 요약:")
@@ -3021,6 +3078,7 @@ def _bb_select_candidates(api_json: Dict[str, Any],
         liq_ok, liq_info = _bb_liquidity_pass(rows, min_notional_3m)
         if not liq_ok:
             continue
+
         close = None
         for tf in ("3m","5m","15m","30m"):
             if tf in rows:
@@ -3032,29 +3090,48 @@ def _bb_select_candidates(api_json: Dict[str, Any],
             continue
         if close < 100:
             continue  # 100원 미만 코인은 제외
-        mom = _bb_score_momentum(rows)
-        rev = _bb_estimate_mean_reversion(rows)
+
+        mom = _bb_score_momentum(rows)           # {'score': int, 'max_score': 8, 'est_pct': float, ...}
+        rev = _bb_estimate_mean_reversion(rows)  # {'est_pct': float, 'qualifies': bool, ...}
+
+        # 기대상승률(비율) 결정: 모멘텀/되돌림 중 더 큰 쪽 사용
         est_pct = max(mom["est_pct"], rev["est_pct"])  # 0.0 ~ 0.02 (이론상)
+
+        # 태깅
         tags = []
-        if mom["est_pct"] >= rev["est_pct"] and mom["est_pct"] > 0: tags.append("momentum")
-        if rev["est_pct"] > mom["est_pct"]: tags.append("mean_reversion")
-        if mom["est_pct"] > 0 and rev["est_pct"] > 0: tags.append("both")
+        if mom["est_pct"] >= rev["est_pct"] and mom["est_pct"] > 0:
+            tags.append("momentum")
+        if rev["est_pct"] > mom["est_pct"]:
+            tags.append("mean_reversion")
+        if mom["est_pct"] > 0 and rev["est_pct"] > 0:
+            tags.append("both")
+
+        # 필터: 기대상승률 하한
         if est_pct >= min_expected_pct:
             item = {
                 "market": market,
                 "close": close,
+                # 퍼센트(%) 단위로 저장
                 "expected_move_pct": est_pct * 100,
                 "target_price": round(close * (1 + est_pct), 8),
                 "scenario": tags or ["unknown"],
                 "notional_3m": liq_info.get("notional"),
-                "volume_3m": liq_info.get("volume")
+                "volume_3m": liq_info.get("volume"),
+                # 추가: 종합 점수(0~8)
+                "score": mom.get("score", 0),
+                "score_max": mom.get("max_score", 8),
             }
             if include_debug:
                 item["momentum_detail"] = mom
                 item["mean_reversion_detail"] = rev
             results.append(item)
-    results.sort(key=lambda x: x["expected_move_pct"], reverse=True)
+
+    # 정렬: 기대상승률 우선, 동률 시 점수 높은 순
+    results.sort(key=lambda x: (Decimal(str(x.get("expected_move_pct", "0"))),
+                                int(x.get("score", 0))),
+                 reverse=True)
     return results
+
 
 async def _bb_fetch_raw() -> Dict[str, Any]:
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -3062,7 +3139,7 @@ async def _bb_fetch_raw() -> Dict[str, Any]:
         r.raise_for_status()
         return r.json()
 
-async def fetch_bbtrend_candidates(force: bool = False,
+async def get_intersection_candidates_safe(force: bool = False,
                                    include_debug: bool = False) -> List[Dict[str, Any]]:
     now = time.time()
     if (not force) and _bbtrend_cache["updated"] and (now - _bbtrend_cache["fetched_ts"] < BBTREND_FETCH_INTERVAL_SEC):
