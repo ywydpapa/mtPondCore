@@ -1133,7 +1133,9 @@ class PositionState:
         except Exception:
             max_additional_buys = 0
 
-        st = self.data.get(market)
+        st = self.data.get(market) or {}
+        if st.get("over_cap_flag"):
+            return False, f"[SKIP] {market} per-market cap reached (flag)"
         if STOP_DISABLE_NEW_BUYS and st and st.get("stop_triggered"):
             return False, f"[SKIP] {market} 손절모드(추가매수금지)"
 
@@ -2323,6 +2325,7 @@ async def monitor_positions(user_no: int, server_no: int):
             st.setdefault("stop_mode_active", False)
             st.setdefault("martingale_count", 0)
             st.setdefault("last_martin_ts", None)
+            st["over_cap_flag"] = (MAX_TOTAL_INVEST_PER_MARKET > 0 and est >= MAX_TOTAL_INVEST_PER_MARKET)
 
             # 기타 stop 관련 상태 기본값
             for k, v in {
@@ -2829,7 +2832,6 @@ async def monitor_positions(user_no: int, server_no: int):
             available_krw += realized
         # 13) 교차(추천) 매수 실행 블록
         #     - 여기에는 “최대 투자금” 체크가 이미 존재함: ps.can_additional_buy 또는 직접 비교
-
         try:
             used = await process_intersection_buys(
                 access_key=access_key,
@@ -3385,6 +3387,35 @@ async def restart_reseed_after_cancellation(access_key: str,
             except Exception as e:
                 print(f"[RESTART][WARN] preplace TP 실패 {market}: {e}")
         print("[RESTART] PREPLACE_HARD_TP 재배치 완료")
+
+# 4-c) 재시작 후 per-market 누적원금 보수적 재설정
+    try:
+        acc_now = await fetch_upbit_accounts(access_key, secret_key)
+        for acc in acc_now:
+            c = acc.get("currency"); u = acc.get("unit_currency")
+            if not c or u != BASE_UNIT or c == BASE_UNIT:
+                continue
+            market = f"{BASE_UNIT}-{c}"
+            st = ps.data.setdefault(market, {})
+            avg_raw = acc.get("avg_buy_price")
+            try:
+                avg = Decimal(str(avg_raw)) if avg_raw not in (None, "", "0") else Decimal("0")
+                bal = Decimal(str(acc.get("balance","0")))
+                locked = Decimal(str(acc.get("locked","0")))
+            except:
+                avg = Decimal("0"); bal = Decimal("0"); locked = Decimal("0")
+            eff_bal = bal + locked
+            if avg > 0 and eff_bal > 0:
+                est = (eff_bal * avg).quantize(Decimal("0.0001"))
+                old_inv = ps.get_total_invested(market)
+                # 보수적으로 큰 쪽을 유지
+                new_inv = est if est > old_inv else old_inv
+                ps.buy_info[market] = {"total_buys": max(1, ps.buy_info.get(market, {}).get("total_buys", 1)),
+                                       "total_invested": new_inv}
+                # cap 플래그 업데이트
+                st["over_cap_flag"] = bool(MAX_TOTAL_INVEST_PER_MARKET > 0 and new_inv >= MAX_TOTAL_INVEST_PER_MARKET)
+    except Exception as e:
+        print(f"[RESTART][WARN] per-market invested reconcile fail: {e}")
 
 
 # ============================================================
