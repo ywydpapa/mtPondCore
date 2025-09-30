@@ -205,8 +205,6 @@ MAX_MARTIN = int(os.getenv("MAX_MARTIN", "1"))
 # 디버그 스위치
 DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
 ENABLE_MARTIN = os.getenv("ENABLE_MARTIN", "0") #작동시키려면 1
-ENABLE_STOP = os.getenv("ENABLE_STOP", "0") == "0"
-
 MIN_SELL_MARGIN_PCT= os.getenv("MIN_SELL_MARGIN_PCT","0.65")
 
 
