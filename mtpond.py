@@ -117,35 +117,15 @@ MARGIN_PERCENT_DIVISOR = Decimal(os.getenv("MARGIN_PERCENT_DIVISOR", "1"))
 ALLOW_ADDITIONAL_BUY_WHEN_FULL = os.getenv("ALLOW_ADDITIONAL_BUY_WHEN_FULL","1")=="1"
 MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS","5"))
 # Avg Down
-AVG_DOWN_ENABLED = 1
-AVG_DOWN_FACTOR = 2
-AVG_DOWN_BOLL_PERIOD = 20
-AVG_DOWN_BOLL_MULT = 2
-AVG_DOWN_LOWER_TOUCH_TOL = Decimal(os.getenv("AVG_DOWN_LOWER_TOUCH_TOL", "0.002"))
-AVG_DOWN_REBOUND_PCT = Decimal(os.getenv("AVG_DOWN_REBOUND_PCT", "1.0"))
-AVG_DOWN_MIN_PNL = -2.0
-AVG_DOWN_GLOBAL_COOLDOWN_SEC = 60
-AVG_DOWN_MARKET_COOLDOWN_SEC = 999999
-AVG_DOWN_TIMEFRAME_MIN = 1
-AVG_DOWN_CANDLE_COUNT = 120
-AVG_DOWN_REQUIRE_MIN_VOL_KRW = 10000
-AVG_DOWN_TP_ENABLED = os.getenv("AVG_DOWN_TP_ENABLED", "1") == "1"
 AVG_DOWN_TP_ARM_PNL = Decimal(os.getenv("AVG_DOWN_TP_ARM_PNL", "0.20"))
 AVG_DOWN_TP_HARD_PNL = Decimal(os.getenv("AVG_DOWN_TP_HARD_PNL", "0.40"))
 AVG_DOWN_TP_TRAIL_START = Decimal(os.getenv("AVG_DOWN_TP_TRAIL_START", "0.40"))
 AVG_DOWN_TP_TRAIL_DROP = Decimal(os.getenv("AVG_DOWN_TP_TRAIL_DROP", "0.15"))
-AVG_DOWN_TP_SELL_PORTION = Decimal(os.getenv("AVG_DOWN_TP_SELL_PORTION", "1.0"))
-AVG_DOWN_TP_RESET_PEAK = os.getenv("AVG_DOWN_TP_RESET_PEAK", "1") == "1"
 # 선지정 TP
 PREPLACE_HARD_TP = os.getenv("PREPLACE_HARD_TP", "1") == "1"
 PREPLACE_TP_PORTION = os.getenv("PREPLACE_TP_PORTION")  # 없으면 HARD_TP_SELL_PORTION 사용
 PREPLACE_TP_TIMEOUT_SEC = int(os.getenv("PREPLACE_TP_TIMEOUT_SEC", "0"))  # 0이면 무제한
-PREPLACE_ALLOW_CANCEL_FOR_TRAIL = False
-PREPLACE_CANCEL_ON_STOP = os.getenv("PREPLACE_CANCEL_ON_STOP", "1") == "1"
-PREPLACE_REPRICE_ON_AVG_DOWN = os.getenv("PREPLACE_REPRICE_ON_AVG_DOWN", "1") == "1"
-PREPLACE_MODE = os.getenv("PREPLACE_MODE", "HARD_TP1")
 PREPLACE_ON_START = os.getenv("PREPLACE_ON_START", "0") == "1"
-AVG_DOWN_ACTIVE = None  # {"market": "...", "ts": float}
 # ------------------------------------------------------------
 # 4b. FULL LIMIT SELL (전체 수량 단일 지정가 유지) 추가 설정
 # ------------------------------------------------------------
@@ -179,23 +159,14 @@ PASSIVE_LIMIT_SELL_MIN_NOTIONAL = Decimal(os.getenv("PASSIVE_LIMIT_SELL_MIN_NOTI
 PASSIVE_LIMIT_SELL_AMOUNT_TOL = Decimal(os.getenv("PASSIVE_LIMIT_SELL_AMOUNT_TOL", "0.00000001"))
 PASSIVE_LIMIT_SELL_DEBUG = os.getenv("PASSIVE_LIMIT_SELL_DEBUG", "0") == "1"
 
-FULL_LIMIT_SELL_FORCE_REPLACE_ON_INCREASE = os.getenv("FULL_LIMIT_SELL_FORCE_REPLACE_ON_INCREASE", "1") == "1"
-FULL_LIMIT_SELL_FORCE_INCREASE_TOL = Decimal(os.getenv("FULL_LIMIT_SELL_FORCE_INCREASE_TOL", "0"))  # 0이면 증가폭 > 0 즉시
-
 PASSIVE_FORCE_REPLACE_ON_INCREASE = os.getenv("PASSIVE_FORCE_REPLACE_ON_INCREASE","1") == "1"
 PASSIVE_FORCE_INCREASE_TOL = Decimal(os.getenv("PASSIVE_FORCE_INCREASE_TOL","0"))
-
-FULL_LIMIT_SELL_ADOPT = os.getenv("FULL_LIMIT_SELL_ADOPT", "1") == "1"
-FULL_LIMIT_SELL_DEBUG = os.getenv("FULL_LIMIT_SELL_DEBUG", "0") == "1"
-
 MIN_ORDER_NOTIONAL_KRW = Decimal(os.getenv("MIN_ORDER_NOTIONAL_KRW", "5500"))
 ORDER_NOTIONAL_BUFFER_PCT = Decimal(os.getenv("ORDER_NOTIONAL_BUFFER_PCT", "0.01"))
 DUST_ABS_VOLUME_THRESHOLD = Decimal(os.getenv("DUST_ABS_VOLUME_THRESHOLD", "0.000001"))
 DUST_CLEANUP_ENABLED = os.getenv("DUST_CLEANUP_ENABLED","1") == "1"
 DUST_LOG_INTERVAL_SEC = int(os.getenv("DUST_LOG_INTERVAL_SEC","600"))
-
 DUST_LAST_LOG: dict[str,float] = {}
-
 BBTREND_API_URL = os.getenv("BBTREND_API_URL", "http://ywydpapa.iptime.org:8000/api/bbtrend30")
 BBTREND_MIN_EXPECTED_PCT = float(os.getenv("BBTREND_MIN_EXPECTED_PCT", "0.005"))  # 0.005 = 0.5%
 BBTREND_MIN_NOTIONAL_3M = float(os.getenv("BBTREND_MIN_NOTIONAL_3M", "20000000"))
@@ -204,9 +175,6 @@ BBTREND_TIMEFRAMES = ("3m", "5m", "15m", "30m")
 MAX_MARTIN = int(os.getenv("MAX_MARTIN", "1"))
 # 디버그 스위치
 DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
-ENABLE_MARTIN = os.getenv("ENABLE_MARTIN", "0") #작동시키려면 1
-MIN_SELL_MARGIN_PCT= os.getenv("MIN_SELL_MARGIN_PCT","0.65")
-
 
 # ============================================================
 # 5. RUNTIME CONFIG
@@ -3335,7 +3303,6 @@ async def restart_reseed_after_cancellation(access_key: str,
     except Exception as e:
         print(f"[RESTART][ERR] accounts reload fail: {e}")
         acc2 = raw_accounts
-
     # 4) 모드별 재배치
     if FULL_LIMIT_SELL_ENABLED:
         try:
@@ -3352,7 +3319,6 @@ async def restart_reseed_after_cancellation(access_key: str,
             print("[RESTART] PASSIVE_LIMIT_SELL 재배치 완료")
         except Exception as e:
             print(f"[RESTART][ERR] PASSIVE 재배치 실패: {e}")
-
     # 4-b) PREPLACE_ON_START가 켜져 있으면 각 포지션에 선지정 TP 재배치
     if PREPLACE_HARD_TP and PREPLACE_ON_START:
         for acc in acc2:
@@ -3370,11 +3336,9 @@ async def restart_reseed_after_cancellation(access_key: str,
                 avg = Decimal(str(avg_raw)) if avg_raw not in (None, "", "0") else Decimal("0")
             except:
                 bal = Decimal("0"); locked = Decimal("0"); avg = Decimal("0")
-
             total_qty = bal + locked
             if avg <= 0 or total_qty <= 0:
                 continue
-
             st = ps.data.setdefault(market, {})
             # 선지정 TP 중복 방지 필드 제거
             for k in ("active_limit_uuid","limit_submit_ts","limit_pending_category","limit_pending_volume","pre_tp_uuid"):
@@ -3385,7 +3349,6 @@ async def restart_reseed_after_cancellation(access_key: str,
             except Exception as e:
                 print(f"[RESTART][WARN] preplace TP 실패 {market}: {e}")
         print("[RESTART] PREPLACE_HARD_TP 재배치 완료")
-
 # 4-c) 재시작 후 per-market 누적원금 보수적 재설정
     try:
         acc_now = await fetch_upbit_accounts(access_key, secret_key)
@@ -3414,8 +3377,6 @@ async def restart_reseed_after_cancellation(access_key: str,
                 st["over_cap_flag"] = bool(MAX_TOTAL_INVEST_PER_MARKET > 0 and new_inv >= MAX_TOTAL_INVEST_PER_MARKET)
     except Exception as e:
         print(f"[RESTART][WARN] per-market invested reconcile fail: {e}")
-
-
 # ============================================================
 # 26. main
 # ============================================================
