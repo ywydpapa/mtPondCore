@@ -33,7 +33,7 @@ BASE_UNIT = "KRW"
 # ============================================================
 # 3b. 주기 리셋 설정
 # ============================================================
-PERIODIC_RESET_SEC = int(os.getenv("PERIODIC_RESET_SEC", "1800"))  # 30분
+PERIODIC_RESET_SEC = int(os.getenv("PERIODIC_RESET_SEC", "600"))  # 10분
 class ResetRequested(Exception):
     pass
 # ============================================================
