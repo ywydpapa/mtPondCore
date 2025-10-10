@@ -17,6 +17,7 @@ import jwt
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text, false
+from sqlalchemy.util import await_only
 
 # ============================================================
 # 2. 환경 로드
@@ -435,18 +436,23 @@ def get_preplace_portion():
 # ============================================================
 # 6. Exclude Markets 파싱
 # ============================================================
-def parse_exclude_markets() -> set:
-    raw = os.getenv("EXCLUDE_MARKETS", "").strip()
+async def get_excoins(user_no: int) -> Optional[tuple]:
+    async with SessionLocal() as session:
+        sql = text("""SELECT DISTINCT market FROM exCoinlist WHERE userNo = :u AND attrib not like :attr""")
+        result = await session.execute(sql, {"u": user_no, "attr": "%XXX%"})
+        return result.fetchall()
+
+
+async def parse_exclude_markets() -> set:
+    userno = os.getenv("USER_NO", "0")
+    uno = int(userno)
+    rows = await get_excoins(uno)
+    raw = {r[0] for r in rows}
     if not raw:
-        return set()
-    if raw.startswith("["):
-        try:
-            arr = json.loads(raw)
-            return {str(x).strip() for x in arr if isinstance(x, str)}
-        except Exception:
-            pass
-    return {p.strip() for p in raw.split(",") if p.strip()}
-EXCLUDED_MARKETS = parse_exclude_markets()
+        raw = os.getenv("EXCLUDE_MARKETS", "").strip()
+    return raw
+
+EXCLUDED_MARKETS = asyncio.run(parse_exclude_markets())
 # ============================================================
 # 7. Upbit API Helper
 # ============================================================
@@ -633,6 +639,7 @@ async def get_keys(user_no: int, server_no: int) -> Optional[tuple]:
         sql = text("""SELECT apiKey1, apiKey2 FROM traceUser WHERE userNo = :u AND serverNo = :s LIMIT 1""")
         result = await session.execute(sql, {"u": user_no, "s": server_no})
         return result.fetchone()
+
 # ============================================================
 # 9. 시장 / 가격 유틸
 # ============================================================
