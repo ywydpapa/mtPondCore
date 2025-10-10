@@ -434,25 +434,47 @@ def get_preplace_portion():
 
 
 # ============================================================
-# 6. Exclude Markets 파싱
+# 6. Exclude Markets 파싱 (루프 안전: 지연 초기화)
 # ============================================================
-async def get_excoins(user_no: int) -> Optional[tuple]:
+async def get_excoins(user_no: int) -> list[tuple] | None:
     async with SessionLocal() as session:
-        sql = text("""SELECT DISTINCT market FROM exCoinlist WHERE userNo = :u AND attrib not like :attr""")
+        sql = text("""SELECT DISTINCT market FROM exCoinlist WHERE userNo = :u AND attrib NOT LIKE :attr""")
         result = await session.execute(sql, {"u": user_no, "attr": "%XXX%"})
         return result.fetchall()
 
+def _env_excluded_set() -> set[str]:
+    raw = os.getenv("EXCLUDE_MARKETS", "") or ""
+    parts = [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+    return set(parts)
 
-async def parse_exclude_markets() -> set:
-    userno = os.getenv("USER_NO", "0")
-    uno = int(userno)
-    rows = await get_excoins(uno)
-    raw = {r[0] for r in rows}
-    if not raw:
-        raw = os.getenv("EXCLUDE_MARKETS", "").strip()
-    return raw
+async def parse_exclude_markets() -> set[str]:
+    try:
+        uno = int(os.getenv("USER_NO", "0"))
+    except Exception:
+        uno = 0
+    try:
+        rows = await get_excoins(uno)
+    except Exception as e:
+        print(f"[EXC][WARN] DB 조회 실패 → env fallback: {e}")
+        rows = None
+    if rows:
+        try:
+            return {str(r[0]).strip() for r in rows if r and r[0]}
+        except Exception:
+            pass
+    return _env_excluded_set()
 
-EXCLUDED_MARKETS = asyncio.run(parse_exclude_markets())
+EXCLUDED_MARKETS: set[str] | None = None
+_excluded_loaded: bool = False
+
+async def get_excluded_markets(force_reload: bool = False) -> set[str]:
+    global EXCLUDED_MARKETS, _excluded_loaded
+    if (not force_reload) and _excluded_loaded and isinstance(EXCLUDED_MARKETS, set):
+        return EXCLUDED_MARKETS
+    EXCLUDED_MARKETS = await parse_exclude_markets()
+    _excluded_loaded = True
+    return EXCLUDED_MARKETS
+
 # ============================================================
 # 7. Upbit API Helper
 # ============================================================
@@ -2211,6 +2233,13 @@ async def monitor_positions(user_no: int, server_no: int):
         print("[ERR] API 키 없음 → 종료")
         return
     access_key, secret_key = keys
+
+    try:
+        excl = await get_excluded_markets()
+        if excl:
+            print(f"[INFO] 제외 목록 로드 완료: {sorted(excl)}")
+    except Exception as e:
+        print(f"[EXC][WARN] 제외 목록 로드 실패: {e}")
 
     # PositionState 확장: stop/martin 필드를 항상 주입하는 ensure_stop_fields 재정의
     class _PS(PositionState):
