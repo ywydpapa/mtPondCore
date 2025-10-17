@@ -613,9 +613,7 @@ async def on_index_drop_trigger(
         f"({ratio:.1%}) {markets} | threshold={threshold_ratio:.0%}"
     )
 
-    # 3) 임계 충족 시 TODO 실행
     if ratio >= threshold_ratio:
-        # TODO: 웹훅/메시지큐/DB 업데이트
         # await send_webhook({...})
         # await redis.publish("index_drop", json.dumps(hits))
         # await set_autostop(True)
