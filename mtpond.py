@@ -1539,6 +1539,11 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
             continue
 
         market = f"{BASE_UNIT}-{currency}"
+
+        # 제외 코인 필터링 추가
+        if EXCLUDED_MARKETS and market in EXCLUDED_MARKETS:
+            continue
+
         cur_price = price_map.get(market)
         if cur_price is None:
             continue
@@ -1689,7 +1694,13 @@ async def manage_passive_limit_sells(access_key: str, secret_key: str,
             continue
 
         market = f"{BASE_UNIT}-{currency}"
+
+        # 제외 코인 필터링 추가
+        if EXCLUDED_MARKETS and market in EXCLUDED_MARKETS:
+            continue
+
         cur_price = price_map.get(market)
+
         if cur_price is None:
             continue
         notional = total_qty * cur_price
@@ -2408,7 +2419,12 @@ async def monitor_positions(user_no: int, server_no: int):
 
         # 6) 잔고 풍부화: 각 보유 코인에 현재가/PNL 붙이기
         enriched_all = enrich_accounts_with_prices(raw_accounts, price_map, BASE_UNIT)
-        enriched = [r for r in enriched_all if r.get("current_price") is not None]
+        # 제외 목록(EXCLUDED_MARKETS)에 있는 코인은 관리 대상에서 완전히 제외
+        enriched = [
+            r for r in enriched_all
+            if r.get("current_price") is not None
+               and r.get("market") not in (EXCLUDED_MARKETS or set())
+        ]
         available_krw = get_available_krw(raw_accounts)  # 현재 가용 현금
 
         # 7) 활성 포지션 셋 계산
@@ -2875,10 +2891,13 @@ async def monitor_positions(user_no: int, server_no: int):
         # 16) 다음 그리드까지 슬립(틱레이트 설정 시 해당 간격)
         await dynamic_sleep()
 
+
 # ============================================================
 # 25. Controller
 # ============================================================
 _last_cfg_signature = None
+
+
 async def run_mtpond_controller(user_no: int, server_no: int):
     task: asyncio.Task | None = None
     global _last_cfg_signature
@@ -2900,8 +2919,22 @@ async def run_mtpond_controller(user_no: int, server_no: int):
             else:
                 active_flag = None
             now = time.strftime("%H:%M:%S")
+
+            # [수정된 부분] 태스크가 종료된 상태라면 예외를 회수(retrieve)하여 경고 방지
+            if task and task.done():
+                try:
+                    exc = task.exception()
+                    if isinstance(exc, ResetRequested):
+                        print(f"[CTRL {now}] 주기 리셋(ResetRequested) 감지 → 정상 재시작 준비")
+                    elif exc:
+                        print(f"[CTRL {now}] 모니터 태스크 예외 종료: {exc}")
+                except asyncio.CancelledError:
+                    print(f"[CTRL {now}] 모니터 태스크 취소됨")
+                # 예외를 확인했으므로 task를 None으로 초기화
+                task = None
+
             if active_flag is True:
-                if task is None or task.done():
+                if task is None:
                     print(f"[CTRL {now}] activeYN=Y → 모니터 시작")
                     task = asyncio.create_task(monitor_positions(user_no, server_no))
             elif active_flag is False:
@@ -2917,25 +2950,11 @@ async def run_mtpond_controller(user_no: int, server_no: int):
                     task = None
             else:
                 print(f"[CTRL {now}] activeYN 조회 실패(None) → 상태 유지")
-            if active_flag is True and task and task.done():
-                print(f"[CTRL {now}] 모니터 태스크 종료 감지 → 재시작")
-                task = asyncio.create_task(monitor_positions(user_no, server_no))
-        except ResetRequested:
-            # 모니터 태스크가 주기 리셋을 요청 → 즉시 재기동
-            print("[CTRL] ResetRequested caught → restarting monitor task")
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    print(f"[CTRL] cancel on ResetRequested: {e}")
-            task = asyncio.create_task(monitor_positions(user_no, server_no))
+
         except Exception as e:
             print(f"[CTRL] 루프 예외: {e}")
-        await asyncio.sleep(CONTROLLER_POLL_SEC)
 
+        await asyncio.sleep(CONTROLLER_POLL_SEC)
 
 
 # ============================================================
@@ -3322,6 +3341,7 @@ async def cancel_all_waiting_orders_for_markets(access_key: str, secret_key: str
         except Exception as e:
             print(f"[RESTART][ERR] cancel all orders fail market={m}: {e}")
 
+
 async def restart_reseed_after_cancellation(access_key: str,
                                             secret_key: str,
                                             ps: "PositionState",
@@ -3329,6 +3349,11 @@ async def restart_reseed_after_cancellation(access_key: str,
                                             price_map: Dict[str, Decimal]):
     # 잔고 기준 마켓 목록
     markets = build_market_list_from_accounts(raw_accounts, BASE_UNIT)
+
+    # 제외 코인은 기존 주문 취소 및 재배치 대상에서 제외
+    if EXCLUDED_MARKETS:
+        markets = [m for m in markets if m not in EXCLUDED_MARKETS]
+
     # 1) 대기 주문 모두 취소
     await cancel_all_waiting_orders_for_markets(access_key, secret_key, markets)
     # 2) 잠깐 대기 후 언락 보장
