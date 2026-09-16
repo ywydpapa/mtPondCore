@@ -8,7 +8,7 @@ from math import sqrt
 # ==============================
 # Config
 # ==============================
-TOP30_ENDPOINT = "http://ywydpapa.iptime.org:8000/api/top30coins"
+TOP30_ENDPOINT = "http://becog.iptime.org:8088/api/top30coins"
 UPBIT_BASE = "https://api.upbit.com/v1/candles/minutes/{unit}?market={market}&count={count}"
 TIMEFRAMES = [5, 15, 30]
 LOOKBACK_CANDLES = 120
