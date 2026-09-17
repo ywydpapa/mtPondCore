@@ -464,16 +464,30 @@ async def parse_exclude_markets() -> set[str]:
             pass
     return _env_excluded_set()
 
+
 EXCLUDED_MARKETS: set[str] | None = None
-_excluded_loaded: bool = False
+_excluded_last_update: float = 0
+EXCLUDED_CACHE_TTL_SEC = 60  # 60초마다 갱신
+
 
 async def get_excluded_markets(force_reload: bool = False) -> set[str]:
-    global EXCLUDED_MARKETS, _excluded_loaded
-    if (not force_reload) and _excluded_loaded and isinstance(EXCLUDED_MARKETS, set):
+    global EXCLUDED_MARKETS, _excluded_last_update
+    now = time.time()
+
+    # 강제 리로드가 아니고, 캐시 유효기간(60초) 이내면 기존 캐시 반환
+    if (not force_reload) and EXCLUDED_MARKETS is not None and (now - _excluded_last_update) < EXCLUDED_CACHE_TTL_SEC:
         return EXCLUDED_MARKETS
-    EXCLUDED_MARKETS = await parse_exclude_markets()
-    _excluded_loaded = True
+
+    new_excluded = await parse_exclude_markets()
+
+    # 목록이 변경되었을 경우 로그 출력
+    if EXCLUDED_MARKETS is not None and EXCLUDED_MARKETS != new_excluded:
+        print(f"[EXC] 제외 코인 목록 업데이트: {sorted(new_excluded)}")
+
+    EXCLUDED_MARKETS = new_excluded
+    _excluded_last_update = now
     return EXCLUDED_MARKETS
+
 
 # ============================================================
 # 7. Upbit API Helper
@@ -2379,8 +2393,12 @@ async def monitor_positions(user_no: int, server_no: int):
     # ===== 메인 무한 루프 시작 =====
     while True:
         try:
+            # 0) 제외 코인 목록 주기적 갱신 (TTL 적용되어 부하 없음)
+            await get_excluded_markets()
+
             # 1) 계정 잔고 조회(핵심 I/O) 실패시 다음 루프로
             raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
+
         except Exception as e:
             print(f"[ERR] 잔고 조회 실패: {e}")
             await dynamic_sleep()
