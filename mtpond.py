@@ -3,6 +3,7 @@
 # ============================================================
 import os
 import asyncio
+import redis.asyncio as aioredis
 import uuid
 import hashlib
 import urllib.parse
@@ -24,13 +25,43 @@ from sqlalchemy.util import await_only
 # ============================================================
 dotenv.load_dotenv()
 # ============================================================
-# 3. DB & 기본 상수
+# 3. DB & 기본 상수 (수정본)
 # ============================================================
 engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
 BASE_UNIT = "KRW"
+
+# ★ Redis 원격 서버 연결 설정 (개별 환경변수 우선 적용 및 URL fallback)
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "56379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+if REDIS_HOST:
+    # 개별 파라미터가 있는 경우 URL 특수문자 파싱 에러 없이 가장 안전하게 연결
+    redis_client = aioredis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        password=REDIS_PASSWORD,
+        db=REDIS_DB,
+        decode_responses=True,
+        socket_timeout=5.0,
+        socket_connect_timeout=5.0,
+        retry_on_timeout=True
+    )
+else:
+    # REDIS_URL 문자열만 있는 경우
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_client = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_timeout=5.0,
+        socket_connect_timeout=5.0,
+        retry_on_timeout=True
+    )
+
 # ============================================================
 # 3b. 주기 리셋 설정
 # ============================================================
@@ -220,8 +251,8 @@ def init_config(force: bool = False):
     RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
     INTERSECTION_BUY_KRW = Decimal(os.getenv("INTERSECTION_BUY_KRW", "200000"))
     MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "400000"))
-    BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-0.2"))
-    BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.15"))
+    BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-2.2"))
+    BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.45"))
 
     # 손절 트리거/증분/강제 손절 레이트
     STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.2"))
@@ -452,16 +483,32 @@ async def parse_exclude_markets() -> set[str]:
         uno = int(os.getenv("USER_NO", "0"))
     except Exception:
         uno = 0
+
+    # 1. Redis Set에서 조회 (네트워크 DB I/O 배제)
+    try:
+        redis_key = f"mtpond:excoins:{uno}"
+        cached_coins = await redis_client.smembers(redis_key)
+        if cached_coins:
+            return set(cached_coins)
+    except Exception as e:
+        print(f"[EXC][WARN] Redis 제외목록 조회 실패: {e}")
+
+    # 2. Redis에 없으면 기존 DB Fallback
     try:
         rows = await get_excoins(uno)
+        if rows:
+            ex_set = {str(r[0]).strip() for r in rows if r and r[0]}
+            # Redis에 캐싱 (TTL 10분)
+            try:
+                if ex_set:
+                    await redis_client.sadd(f"mtpond:excoins:{uno}", *ex_set)
+                    await redis_client.expire(f"mtpond:excoins:{uno}", 600)
+            except Exception:
+                pass
+            return ex_set
     except Exception as e:
         print(f"[EXC][WARN] DB 조회 실패 → env fallback: {e}")
-        rows = None
-    if rows:
-        try:
-            return {str(r[0]).strip() for r in rows if r and r[0]}
-        except Exception:
-            pass
+
     return _env_excluded_set()
 
 
@@ -473,17 +520,13 @@ EXCLUDED_CACHE_TTL_SEC = 60  # 60초마다 갱신
 async def get_excluded_markets(force_reload: bool = False) -> set[str]:
     global EXCLUDED_MARKETS, _excluded_last_update
     now = time.time()
-
     # 강제 리로드가 아니고, 캐시 유효기간(60초) 이내면 기존 캐시 반환
     if (not force_reload) and EXCLUDED_MARKETS is not None and (now - _excluded_last_update) < EXCLUDED_CACHE_TTL_SEC:
         return EXCLUDED_MARKETS
-
     new_excluded = await parse_exclude_markets()
-
     # 목록이 변경되었을 경우 로그 출력
     if EXCLUDED_MARKETS is not None and EXCLUDED_MARKETS != new_excluded:
         print(f"[EXC] 제외 코인 목록 업데이트: {sorted(new_excluded)}")
-
     EXCLUDED_MARKETS = new_excluded
     _excluded_last_update = now
     return EXCLUDED_MARKETS
@@ -556,9 +599,11 @@ async def upbit_request(method: str,
             print(f"[UPBIT][RETRY] attempt={attempt} err={e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 8)
+
 def build_upbit_jwt_simple(access_key: str, secret_key: str) -> str:
     payload = {"access_key": access_key, "nonce": str(uuid.uuid4())}
     return jwt.encode(payload, secret_key, algorithm="HS256")
+
 def build_upbit_jwt_with_params(access_key: str, secret_key: str, params: Dict[str, Any]) -> str:
     filtered = {k: v for k, v in params.items() if v is not None}
     query_string = urllib.parse.urlencode(filtered)
@@ -570,6 +615,7 @@ def build_upbit_jwt_with_params(access_key: str, secret_key: str, params: Dict[s
         "query_hash_alg": "SHA512",
     }
     return jwt.encode(payload, secret_key, algorithm="HS256")
+
 async def http_get_json(url: str, headers=None, params=None, timeout=10.0, max_retry=5):
     backoff = 2
     for attempt in range(1, max_retry + 1):
@@ -589,6 +635,7 @@ async def http_get_json(url: str, headers=None, params=None, timeout=10.0, max_r
                 raise
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
+
 async def http_post_json(url: str, headers=None, params=None, timeout=10.0, max_retry=3):
     backoff = 2
     for attempt in range(1, max_retry + 1):
@@ -608,11 +655,13 @@ async def http_post_json(url: str, headers=None, params=None, timeout=10.0, max_
                 raise
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
+
 async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[str, Any]]:
     url = "https://api.upbit.com/v1/accounts"
     token = build_upbit_jwt_simple(access_key, secret_key)
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     return await http_get_json(url, headers=headers)
+
 async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
     if not markets:
         return {}
@@ -806,6 +855,7 @@ async def fetch_minute_candles(market: str, unit: int = 1, count: int = 120):
         return []
     data.reverse()
     return data
+
 def compute_bollinger_from_candles(candles: list, period: int, mult: Decimal):
     if len(candles) < period:
         return None
@@ -822,12 +872,14 @@ def compute_bollinger_from_candles(candles: list, period: int, mult: Decimal):
     lower = sma - mult * std
     last_close = closes[-1]
     return (lower, sma, upper, last_close)
+
 # ============================================================
 # 11. 시세 조회 캐시
 # ============================================================
 TRADABLE_MARKETS_CACHE = set()
 TRADABLE_MARKETS_CACHE_TS = 0
 TRADABLE_CACHE_TTL_SEC = 3600
+
 async def load_tradable_markets():
     global TRADABLE_MARKETS_CACHE, TRADABLE_MARKETS_CACHE_TS
     now = time.time()
@@ -843,6 +895,7 @@ async def load_tradable_markets():
     except Exception as e:
         print(f"[WARN] 시장목록 갱신 실패: {e} (이전 캐시 사용)")
     return TRADABLE_MARKETS_CACHE
+
 async def safe_fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
     if not markets:
         return {}
@@ -885,6 +938,7 @@ def calc_pnl_percent(account: dict, current_price) -> Decimal:
 # ============================================================
 # 13. 선지정 HARD_TP 주문 함수
 # ============================================================
+
 async def place_preplaced_hard_tp(access_key: str, secret_key: str, market: str,
                                   state: dict, balance: Decimal,
                                   avg_buy_price: Decimal):
@@ -955,6 +1009,7 @@ def _is_effectively_empty(cands):
         (c.get("market") and c.get("avg_score") is not None)
         for c in cands if isinstance(c, dict)
     )
+
 def _normalize_uprises(raw):
     if raw is None:
         return []
@@ -1077,16 +1132,20 @@ class PositionState:
         st["prev_pnl"] = pnl
         st["last_update_ts"] = now
         return st
+
     def ensure_stop_fields(self, market: str):
         st = self.data.setdefault(market, {})
         st.setdefault("stop_mode_active", False)
         st.setdefault("martingale_count", 0)
+
     def remove(self, market):
         self.data.pop(market, None)
+
     def mark_sold(self, market):
         self.last_sell_time[market] = time.time()
         self.remove(market)
         self.buy_info.pop(market, None)
+
     def reduce_invested_after_sell(self, market, portion: Decimal):
         if portion <= 0:
             return
@@ -1098,18 +1157,24 @@ class PositionState:
             info["total_invested"] = (info["total_invested"] * remain).quantize(Decimal("0.0001"))
         except:
             pass
+
     def recently_sold(self, market):
         ts = self.last_sell_time.get(market)
         return bool(ts and (time.time() - ts) < 10)
+
     def record_buy_window(self, market, w):
         self.last_buy_window[market] = w
+
     def bought_this_window(self, market, w):
         return self.last_buy_window.get(market) == w
+
     def mark_intersection_buy(self, market):
         self.intersection_last_buy_time[market] = time.time()
+
     def recently_bought_intersection(self, market, cooldown):
         ts = self.intersection_last_buy_time.get(market)
         return bool(ts and (time.time() - ts) < cooldown)
+
     def record_buy(self, market, krw_amount: Decimal):
         info = self.buy_info.get(market)
         if not info:
@@ -1121,6 +1186,7 @@ class PositionState:
             st = self.data.setdefault(market, {})
             if st.get("first_buy_amount") is None:
                 st["first_buy_amount"] = krw_amount
+
     def get_buy_stats(self, market):
         info = self.buy_info.get(market)
         if not info:
@@ -1216,6 +1282,7 @@ def get_state_decimal(state: dict, key: str, default: Decimal):
     except:
         pass
     return default
+
 def decide_avg_down_tp(pnl: Decimal, state: dict):
     if not state.get("avg_down_tp_mode") or state.get("avg_down_tp_completed"):
         return False, "", None
@@ -1238,6 +1305,7 @@ def decide_avg_down_tp(pnl: Decimal, state: dict):
         if drop >= AVG_DOWN_TP_TRAIL_DROP:
             return True, f"AD_TP_TRAIL drop={drop}% >= {AVG_DOWN_TP_TRAIL_DROP}%(peakOff={prev_peak} nowOff={offset})", "AD_TP_TRAIL"
     return False, "", None
+
 def decide_sell(market, pnl: Decimal, state: dict):
     if FULL_LIMIT_SELL_ENABLED:
         return False, "", None
@@ -1285,19 +1353,23 @@ def safe_calc_volume(balance: Decimal, portion: Decimal):
     vol = balance if portion >= 1 else balance * portion
     vol = vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     return vol if vol > 0 else Decimal("0")
+
 async def align_to_half_minute():
     now = time.time()
     rem = now % INTERVAL_SECONDS
     if rem > 0.01:
         await asyncio.sleep(INTERVAL_SECONDS - rem)
+
 def is_five_minute_boundary(ts: float):
     window_start = ts - (ts % FIVE_MIN_SECONDS)
     lt = time.localtime(ts)
     return (lt.tm_min % 5 == 0 and lt.tm_sec == 0), window_start
+
 async def sleep_until_next_boundary():
     now = time.time()
     nxt = math.floor(now / INTERVAL_SECONDS) * INTERVAL_SECONDS + INTERVAL_SECONDS
     await asyncio.sleep(max(0, nxt - now))
+
 async def dynamic_sleep():
     if 'USE_TICK_RATE' in globals() and USE_TICK_RATE and TICK_RATE > 0:
         await asyncio.sleep(float(TICK_RATE))
@@ -1328,31 +1400,45 @@ def get_active_markets(enriched: List[dict]) -> List[str]:
 # 19. 원격 설정 fetch
 # ============================================================
 async def fetch_mtpond_setup(user_no: int) -> dict | None:
+    redis_key = f"mtpond:setup:{user_no}"
+
+    # 1. Redis에서 캐시된 사용자 설정 조회 (메모리 O(1) 처리, 0.001초 미만)
+    try:
+        cached_str = await redis_client.get(redis_key)
+        if cached_str:
+            data = json.loads(cached_str)
+            if isinstance(data, list) and data:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"[WARN] Redis 설정 조회 에러: {e}")
+
+    # 2. Redis에 데이터가 없는 경우(초기 상태 등) 기존 HTTP API 호출(DB fallback)
     if not API_BASE:
         print("[WARN] API_BASE 미설정")
         return None
+
     url = f"{API_BASE}/api/mtpondsetup/{user_no}"
     try:
-        to = httpx.Timeout(10.0, connect=5.0)
+        to = httpx.Timeout(5.0, connect=3.0)
         async with httpx.AsyncClient(timeout=to) as client:
             resp = await client.get(url)
         if resp.status_code != 200:
-            print(f"[WARN] mtpondsetup status={resp.status_code} body={resp.text[:200]}")
             return None
-        try:
-            data = resp.json()
-        except Exception as je:
-            print(f"[WARN] JSON 파싱 실패: {je}")
-            return None
-        if isinstance(data, list):
-            if not data or not isinstance(data[0], dict):
-                return None
-            return data[0]
-        if isinstance(data, dict):
-            return data
-        return None
+
+        data = resp.json()
+        target = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+
+        # 가져온 설정을 Redis에 캐시 (FastAPI가 변경할 때 덮어씌움)
+        if target:
+            try:
+                await redis_client.set(redis_key, json.dumps(target), ex=3600)
+            except Exception:
+                pass
+        return target
     except Exception as e:
-        print(f"[WARN] mtpondsetup 네트워크 오류: {e}")
+        print(f"[WARN] mtpondsetup HTTP 조회 실패: {e}")
         return None
 
 # ============================================================
@@ -2915,63 +3001,83 @@ async def monitor_positions(user_no: int, server_no: int):
 # ============================================================
 _last_cfg_signature = None
 
-
 async def run_mtpond_controller(user_no: int, server_no: int):
     task: asyncio.Task | None = None
     global _last_cfg_signature
-    print(f"[CTRL] Controller 시작 user={user_no} server={server_no} poll={CONTROLLER_POLL_SEC}s")
-    while True:
-        try:
-            cfg = await fetch_mtpond_setup(user_no)
-            if cfg:
-                active_flag = str(cfg.get("activeYN", "")).upper() == "Y"
-                sig_items = []
-                for k, v in cfg.items():
-                    if k == "activeYN":
-                        continue
-                    sig_items.append((k, str(v)))
-                sig = tuple(sorted(sig_items))
-                if sig != _last_cfg_signature:
-                    apply_dynamic_config(cfg)
-                    _last_cfg_signature = sig
-            else:
-                active_flag = None
-            now = time.strftime("%H:%M:%S")
+    print(f"[CTRL] Controller 시작 user={user_no} server={server_no} (Redis 연동 모드)")
 
-            # [수정된 부분] 태스크가 종료된 상태라면 예외를 회수(retrieve)하여 경고 방지
-            if task and task.done():
+    # 1. 초기 구동 시 설정 1회 강제 반영
+    async def update_config_once():
+        nonlocal task
+        global _last_cfg_signature
+        cfg = await fetch_mtpond_setup(user_no)
+        if not cfg:
+            return
+
+        active_flag = str(cfg.get("activeYN", "")).upper() == "Y"
+        sig_items = [(k, str(v)) for k, v in cfg.items() if k != "activeYN"]
+        sig = tuple(sorted(sig_items))
+
+        if sig != _last_cfg_signature:
+            apply_dynamic_config(cfg)
+            _last_cfg_signature = sig
+
+        now = time.strftime("%H:%M:%S")
+
+        if task and task.done():
+            try:
+                exc = task.exception()
+                if isinstance(exc, ResetRequested):
+                    print(f"[CTRL {now}] 주기 리셋 감지 → 정상 재시작")
+                elif exc:
+                    print(f"[CTRL {now}] 모니터 예외 종료: {exc}")
+            except asyncio.CancelledError:
+                pass
+            task = None
+
+        if active_flag is True:
+            if task is None:
+                print(f"[CTRL {now}] activeYN=Y → 모니터링 태스크 시작")
+                task = asyncio.create_task(monitor_positions(user_no, server_no))
+        elif active_flag is False:
+            if task and not task.done():
+                print(f"[CTRL {now}] activeYN=N → 모니터링 태스크 중지")
+                task.cancel()
                 try:
-                    exc = task.exception()
-                    if isinstance(exc, ResetRequested):
-                        print(f"[CTRL {now}] 주기 리셋(ResetRequested) 감지 → 정상 재시작 준비")
-                    elif exc:
-                        print(f"[CTRL {now}] 모니터 태스크 예외 종료: {exc}")
-                except asyncio.CancelledError:
-                    print(f"[CTRL {now}] 모니터 태스크 취소됨")
-                # 예외를 확인했으므로 task를 None으로 초기화
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
                 task = None
 
-            if active_flag is True:
-                if task is None:
-                    print(f"[CTRL {now}] activeYN=Y → 모니터 시작")
-                    task = asyncio.create_task(monitor_positions(user_no, server_no))
-            elif active_flag is False:
-                if task and not task.done():
-                    print(f"[CTRL {now}] activeYN=N → 모니터 중지")
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        print("[CTRL] monitorPositions 취소됨")
-                    except Exception as e:
-                        print(f"[CTRL] monitorPositions 예외 종료: {e}")
-                    task = None
-            else:
-                print(f"[CTRL {now}] activeYN 조회 실패(None) → 상태 유지")
+    # 초기 1회 실행
+    await update_config_once()
 
+    # 2. Redis Pub/Sub 채널 구독 루프 (FastAPI가 설정을 바꿨을 때 즉시 감지)
+    async def redis_listener():
+        while True:
+            try:
+                pubsub = redis_client.pubsub()
+                channel_name = f"mtpond:config_channel:{user_no}"
+                await pubsub.subscribe(channel_name)
+                print(f"[REDIS] Pub/Sub 채널 구독 성공: {channel_name}")
+
+                async for msg in pubsub.listen():
+                    if msg and msg.get("type") == "message":
+                        print(f"[REDIS] 실시간 설정 변경 알림 수신: {msg.get('data')}")
+                        await update_config_once()
+            except Exception as e:
+                print(f"[REDIS][WARN] PubSub 연결 단절: {e}, 5초 후 재연결")
+                await asyncio.sleep(5)
+
+    # 백그라운드에서 실시간 변경 리스너 실행
+    asyncio.create_task(redis_listener())
+
+    # 3. 보조 Fallback 폴링 루프 (Redis 장애 시 혹은 주기적 안정성을 위해 유지)
+    while True:
+        try:
+            await update_config_once()
         except Exception as e:
-            print(f"[CTRL] 루프 예외: {e}")
-
+            print(f"[CTRL] 주기 점검 예외: {e}")
         await asyncio.sleep(CONTROLLER_POLL_SEC)
 
 

@@ -8,7 +8,7 @@ import json
 # ==============================
 # 설정
 # ==============================
-API_URL = "http://hitoff.iptime.org/api/bbtrend30"
+API_URL = "http://becog.iptime.org/api/bbtrend30"
 REFRESH_INTERVAL_SEC = 30
 TIMEOUT_SEC = 8
 DEFAULT_TOP_N = 8
