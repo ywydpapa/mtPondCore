@@ -393,62 +393,101 @@ async def get_orderbook_top(market: str):
 # ============================================================
 # 9. [조건 2 반영] BB-Patterns 기반 신규 매수 후보 발굴 엔진
 # ============================================================
+BB_CACHE_TTL_SEC = 600  # 10분 (600초)으로 변경하여 백엔드 갱신 주기와 동기화
+
 _bb_patterns_cache: Dict[str, Any] = {
     "fetched_ts": 0.0,
+    "last_server_updated": None,
     "candidates": []
 }
 
+
 async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, Any]]:
     """
-    becog.iptime.org:8088/api/bb-patterns 호출
-    - overall_score >= 3
-    - trade_activity.trade_count_10m >= 120
-    - 거래 제외 코인 제외
+    becog.iptime.org:8088/api/bb-patterns 호출 (10분 주기 갱신)
+    - 백엔드 수집 중(status == 'processing') 대응
+    - 점수(>=3), 10분 체결 건수(>=120건), 제외코인 필터링
     """
     now = time.time()
-    if (not force) and (now - _bb_patterns_cache["fetched_ts"] < BB_CACHE_TTL_SEC):
+
+    # 10분(600초)이 지나지 않았고 강제 갱신이 아니면 기존 캐시 반환
+    if (not force) and (now - _bb_patterns_cache["fetched_ts"] < BB_CACHE_TTL_SEC) and _bb_patterns_cache["candidates"]:
         return _bb_patterns_cache["candidates"]
 
     try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
+        async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(BB_PATTERNS_API_URL)
-            if resp.status_code != 200:
-                print(f"[BB-PATTERNS][WARN] 상태코드 {resp.status_code}")
+            if resp.status_code == 202:
+                print("[BB-PATTERNS] 백엔드 서버가 캔들 지표를 수집/계산 중입니다 (202). 기존 캐시를 유지합니다.")
                 return _bb_patterns_cache["candidates"]
+            elif resp.status_code != 200:
+                print(f"[BB-PATTERNS][WARN] 상태코드 이상: {resp.status_code}")
+                return _bb_patterns_cache["candidates"]
+
             data = resp.json()
     except Exception as e:
         print(f"[BB-PATTERNS][ERR] API 호출 실패: {e}")
         return _bb_patterns_cache["candidates"]
 
-    coins = data.get("coins", [])
-    if not isinstance(coins, list):
-        return []
+    # 서버 상태가 ok가 아니거나 초기 상태인 경우 방어
+    server_status = data.get("status")
+    if server_status == "processing":
+        print("[BB-PATTERNS] 서버 계산 중. 이전 후보 유지.")
+        return _bb_patterns_cache["candidates"]
 
+    coins = data.get("coins", [])
+    if not isinstance(coins, list) or len(coins) == 0:
+        print(f"[BB-PATTERNS] 응답에 코인 목록이 비어있습니다. (server_status: {server_status})")
+        return _bb_patterns_cache["candidates"]
+
+    server_updated = data.get("updated")
     excluded = await get_excluded_markets()
     qualified = []
 
+    # 디버깅 카운터
+    cnt_total = len(coins)
+    cnt_excluded = 0
+    cnt_score_drop = 0
+    cnt_trade_drop = 0
+    cnt_price_drop = 0
+
     for c in coins:
-        market = c.get("market")
-        if not market or not market.startswith("KRW-"):
+        market = c.get("market", "")
+        if not market.startswith("KRW-"):
             continue
 
-        # 1. 거래 제외 코인 즉시 제외
+        # 1. 제외 코인 필터
         if market in excluded:
+            cnt_excluded += 1
             continue
 
-        # 2. 추천 점수(종합 점수) 조건 검증 (기본 >= 3)
-        overall_score = c.get("overall_score", 0)
+        # 2. 가격 검사 (100원 미만 동전주 제외 방어)
+        try:
+            price = float(c.get("price", 0))
+        except:
+            price = 0
+        if price < 100:
+            cnt_price_drop += 1
+            continue
+
+        # 3. 종합 점수 검증 (문자열/숫자 안전 파싱)
+        try:
+            overall_score = int(c.get("overall_score", 0))
+        except:
+            overall_score = 0
         if overall_score < BB_MIN_OVERALL_SCORE:
+            cnt_score_drop += 1
             continue
 
-        # 3. 10분 체결 건수 조건 검증 (기본 >= 120건)
-        act = c.get("trade_activity", {})
-        count_10m = act.get("trade_count_10m", 0)
+        # 4. 10분 체결 건수 검증 (문자열/숫자 안전 파싱)
+        act = c.get("trade_activity") or {}
+        try:
+            count_10m = int(act.get("trade_count_10m", 0))
+        except:
+            count_10m = 0
+
         if count_10m < BB_MIN_TRADE_COUNT_10M:
-            continue
-
-        price = c.get("price", 0)
-        if price < 100:  # 100원 미만 호가 갭 위험 코인 제외
+            cnt_trade_drop += 1
             continue
 
         qualified.append({
@@ -464,9 +503,25 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     qualified.sort(key=lambda x: (x["overall_score"], x["trade_count_10m"]), reverse=True)
 
     _bb_patterns_cache["fetched_ts"] = now
+    _bb_patterns_cache["last_server_updated"] = server_updated
     _bb_patterns_cache["candidates"] = qualified
 
-    print(f"[BB-PATTERNS] 적합 후보 {len(qualified)}개 발굴 (조건: 점수>={BB_MIN_OVERALL_SCORE}, 10분체결>={BB_MIN_TRADE_COUNT_10M}건)")
+    # 후보 선정 결과 및 탈락 원인 상세 로그 출력
+    print(
+        f"\n[BB-PATTERNS 갱신] 서버기준 시각: {server_updated}\n"
+        f"  - 전체 수신: {cnt_total}개\n"
+        f"  - 제외 코인 탈락: {cnt_excluded}개\n"
+        f"  - 100원 미만 탈락: {cnt_price_drop}개\n"
+        f"  - 점수 미달(<{BB_MIN_OVERALL_SCORE}): {cnt_score_drop}개\n"
+        f"  - 체결 미달(<{BB_MIN_TRADE_COUNT_10M}건): {cnt_trade_drop}개\n"
+        f"  ▶ 최종 적합 후보: {len(qualified)}개 선택됨"
+    )
+    if qualified:
+        for q in qualified[:5]:
+            print(
+                f"    * {q['market']} | 점수: {q['overall_score']}점 | 10분체결: {q['trade_count_10m']}건 | 현재가: {q['price']}원")
+    print()
+
     return qualified
 
 # ============================================================
