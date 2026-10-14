@@ -611,19 +611,26 @@ def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Opti
 # 13. [조건 3 & 4 반영] 추가 매수 프로세스
 # ============================================================
 async def process_additional_buys(
-    access_key: str,
-    secret_key: str,
-    enriched_positions: List[dict],
-    ps: PositionState,
-    available_krw: Decimal
+        access_key: str,
+        secret_key: str,
+        enriched_positions: List[dict],
+        ps: PositionState,
+        available_krw: Decimal
 ) -> Decimal:
     """
     [조건 3, 4] 기존 보유 종목 중 PNL이 BUY_RANGE_LOW(-2.2%) 이하로 내려간 경우
-    설정된 추가 매수 금액(ADDITIONAL_BUY_KRW)만큼 물타기 진행
+    설정된 추가 매수 금액(ADDITIONAL_BUY_KRW)만큼 물타기 진행하되,
+    종목당 누적 구매금액이 MAX_TOTAL_INVEST_PER_MARKET을 절대 넘지 않도록 제한
     """
     used_krw = Decimal("0")
     if available_krw < MIN_ORDER_NOTIONAL_KRW or ADDITIONAL_BUY_KRW <= 0:
         return used_krw
+
+    # 최대 한도 설정값 안전 변환
+    try:
+        max_cap = Decimal(str(MAX_TOTAL_INVEST_PER_MARKET))
+    except Exception:
+        max_cap = Decimal("0")
 
     excluded = await get_excluded_markets()
 
@@ -631,53 +638,70 @@ async def process_additional_buys(
         market = pos["market"]
         pnl = pos["pnl_percent"]
 
-        # 제외 코인은 추가 매수 검토 대상에서도 제외
-        if market in excluded:
+        # 1. 제외 코인 배제
+        if market in excluded or pnl is None:
             continue
 
-        if pnl is None:
-            continue
-
-        # [조건 4] 하락폭이 설정 하락 수치(BUY_RANGE_LOW, 예: -2.2%)를 넘어선 단계인지 판정
+        # 2. 하락폭 조건 검증 (BUY_RANGE_LOW 예: -2.2% 이하일 때만)
         if pnl > BUY_RANGE_LOW:
             continue
 
         total_buys, total_invested = ps.get_buy_stats(market)
-        if total_buys == 0:
+
+        # 지갑에는 잔고가 있으나 프로그램 메모리에 투자금이 없으면 (보유수량 * 평균가)로 보정
+        if total_invested <= 0:
+            bal_eff = (pos["balance"] + pos["locked"])
+            total_invested = (bal_eff * pos["avg_buy_price"]).quantize(Decimal("0.0001"))
+            ps.buy_info[market] = {"total_buys": max(1, total_buys), "total_invested": total_invested}
+
+        # ★ [핵심 가드 1] 이미 누적 투자금이 최대 한도 이상이면 즉시 스킵
+        if max_cap > 0 and total_invested >= max_cap:
+            # print(f"[BUY-ADD][SKIP] {market} 최대 구매한도 도달 (투자금: {total_invested} >= 한도: {max_cap})")
             continue
 
-        # 추가 매수 횟수 초과 방지
+        # 3. 추가 매수 횟수 초과 방지
         if total_buys - 1 >= MAX_ADDITIONAL_BUYS:
             continue
 
         st = ps.data.get(market, {})
-        # 직전 추가매수 PNL 대비 추가 하락(-1.0% 이상 추가 하락) 시에만 재진입하여 분할매수 간격 유지
+        # 직전 추가매수 PNL 대비 추가 하락(-1.0% 이상 추가 하락) 시에만 실행 (너무 잦은 물타기 방지)
         last_add_pnl = st.get("last_additional_buy_pnl")
         if last_add_pnl is not None and (pnl - last_add_pnl) > Decimal("-1.0"):
             continue
 
-        # [조건 3] 설정된 추가 매수 금액 반영 및 한도 검증
-        cap_remain = (MAX_TOTAL_INVEST_PER_MARKET - total_invested) if MAX_TOTAL_INVEST_PER_MARKET > 0 else ADDITIONAL_BUY_KRW
+        # ★ [핵심 가드 2] 잔여 한도 계산 (최대 한도 - 현재 투자금)
+        cap_remain = (max_cap - total_invested) if max_cap > 0 else ADDITIONAL_BUY_KRW
+
+        # 남은 한도가 업비트 최소 주문 금액(5,500원) 미만이면 추가 구매 원천 차단
         if cap_remain < MIN_ORDER_NOTIONAL_KRW:
+            # print(f"[BUY-ADD][SKIP] {market} 잔여 한도 부족 ({cap_remain} < {MIN_ORDER_NOTIONAL_KRW})")
             continue
 
+        # 실제 매수 발주할 금액 = min(설정된 추가매수금액, 남은 한도, 현재 가용 원화)
         buy_amt = min(ADDITIONAL_BUY_KRW, cap_remain, available_krw)
         if buy_amt < MIN_ORDER_NOTIONAL_KRW:
             continue
 
+        # ★ [핵심 가드 3] 실행 직전 최종 누적액 합산 재검증
+        if max_cap > 0 and (total_invested + buy_amt) > max_cap:
+            buy_amt = max_cap - total_invested
+            if buy_amt < MIN_ORDER_NOTIONAL_KRW:
+                continue
+
         try:
             if LIVE_TRADING:
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
-                print(f"[BUY-ADD] {market} 추가 매수 성공! pnl={pnl}% amt={buy_amt} (uuid={resp.get('uuid')})")
+                print(
+                    f"[BUY-ADD] {market} 추가 매수 완료! pnl={pnl}% amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원 (uuid={resp.get('uuid')})")
             else:
-                print(f"[BUY-ADD][DRY] {market} 추가 매수 시뮬레이션: pnl={pnl}% amt={buy_amt}")
+                print(
+                    f"[BUY-ADD][DRY] {market} 추가 매수: pnl={pnl}% amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원")
 
             ps.record_buy(market, buy_amt)
             st["last_additional_buy_pnl"] = pnl
             available_krw -= buy_amt
             used_krw += buy_amt
 
-            # 추가 매수 후 기존 TP 재배치
             if PREPLACE_HARD_TP and LIVE_TRADING:
                 asyncio.create_task(after_buy_preplace_tp(access_key, secret_key, market, ps))
 
@@ -700,7 +724,12 @@ async def process_new_candidate_buys(
     if remaining_slots <= 0 or available_krw < MIN_ORDER_NOTIONAL_KRW or RANGE_BUY_KRW <= 0:
         return used_krw
 
-    # [조건 2] bb-patterns API 후보 가져오기
+    # 최대 한도 설정값 안전 변환
+    try:
+        max_cap = Decimal(str(MAX_TOTAL_INVEST_PER_MARKET))
+    except Exception:
+        max_cap = Decimal("0")
+
     candidates = await fetch_bb_patterns_candidates()
     if not candidates:
         return used_krw
@@ -714,20 +743,24 @@ async def process_new_candidate_buys(
 
         market = item["market"]
 
-        # [조건 1] 거래 제외 코인 원천 배제
+        # 제외 코인 원천 배제
         if market in excluded:
             continue
 
-        # 이미 보유 중인 종목 제외 (신규 매수 루프)
+        # 이미 보유 중인 종목은 신규 매수 루프에서 건너뜀
         if ps.buy_info.get(market):
             continue
 
-        # [조건 5] 최근 10분 내 매도한 종목은 재매수 쿨다운으로 건너뜀
+        # 10분 매도 쿨다운 확인
         if ps.recently_sold(market):
             continue
 
-        # [조건 3] 설정된 초기 매수 금액 적용
-        buy_amt = min(RANGE_BUY_KRW, available_krw)
+        # ★ 초기 매수금액도 MAX_TOTAL_INVEST_PER_MARKET을 초과할 수 없도록 방어
+        target_amt = RANGE_BUY_KRW
+        if max_cap > 0 and target_amt > max_cap:
+            target_amt = max_cap
+
+        buy_amt = min(target_amt, available_krw)
         if buy_amt < MIN_ORDER_NOTIONAL_KRW:
             continue
 
@@ -736,7 +769,7 @@ async def process_new_candidate_buys(
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
                 print(f"[BUY-NEW] {market} 신규 진입! 점수={item['overall_score']} 10분체결={item['trade_count_10m']}건 amt={buy_amt} (uuid={resp.get('uuid')})")
             else:
-                print(f"[BUY-NEW][DRY] {market} 신규 진입 시뮬레이션: 점수={item['overall_score']} amt={buy_amt}")
+                print(f"[BUY-NEW][DRY] {market} 신규 진입: 점수={item['overall_score']} amt={buy_amt}")
 
             ps.record_buy(market, buy_amt)
             available_krw -= buy_amt
