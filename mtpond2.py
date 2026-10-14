@@ -433,6 +433,91 @@ async def get_orderbook_top(market: str):
     bids = data[0].get("orderbook_units", [])
     return Decimal(str(bids[0]["bid_price"])), Decimal(str(bids[0]["ask_price"]))
 
+# 거래 가능 마켓 캐시 (1시간 주기 갱신)
+_TRADABLE_MARKETS_SET: set[str] = set()
+_TRADABLE_MARKETS_TS: float = 0.0
+
+async def get_upbit_tradable_markets(force: bool = False) -> set[str]:
+    """업비트에서 현재 실제 거래 지원 중인 전체 마켓 코드 조회"""
+    global _TRADABLE_MARKETS_SET, _TRADABLE_MARKETS_TS
+    now = time.time()
+    if (not force) and _TRADABLE_MARKETS_SET and (now - _TRADABLE_MARKETS_TS < 3600):
+        return _TRADABLE_MARKETS_SET
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get("https://api.upbit.com/v1/market/all?isDetails=false")
+            if resp.status_code == 200:
+                data = resp.json()
+                _TRADABLE_MARKETS_SET = {m["market"] for m in data if "market" in m}
+                _TRADABLE_MARKETS_TS = now
+    except Exception as e:
+        print(f"[MARKETS][WARN] 업비트 마켓 목록 조회 실패 (기존 캐시 유지): {e}")
+
+    return _TRADABLE_MARKETS_SET
+
+async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
+    """
+    업비트 시세 조회 함수
+    - 존재하지 않는 마켓으로 인한 404 원천 차단
+    - 실패 시 개별 조회를 통해 유효한 코인 시세만 복구
+    """
+    if not markets:
+        return {}
+
+    # 1. 실제 업비트에서 거래 지원 중인 마켓만 1차 필터링
+    tradable = await get_upbit_tradable_markets()
+    if tradable:
+        valid_markets = [m for m in markets if m in tradable]
+        orphan_markets = [m for m in markets if m not in tradable]
+        if orphan_markets:
+            print(f"[TICKER][SKIP] 거래 불가/상폐 마켓 제외: {orphan_markets}")
+    else:
+        valid_markets = markets
+
+    if not valid_markets:
+        return {}
+
+    url = "https://api.upbit.com/v1/ticker"
+    params = {"markets": ",".join(valid_markets)}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, params=params)
+            if r.status_code == 200:
+                raw = r.json()
+                out = {}
+                for item in raw:
+                    m = item.get("market")
+                    p = item.get("trade_price")
+                    if m and p is not None:
+                        try:
+                            out[m] = Decimal(str(p))
+                        except Exception:
+                            pass
+                return out
+            else:
+                raise RuntimeError(f"HTTP {r.status_code}")
+    except Exception:
+        # 2. 404 등 일괄 조회 실패 시 개별 호출로 유효 코인만 건져냄 (Fallback)
+        price_map = {}
+        async with httpx.AsyncClient(timeout=3.0) as fallback_client:
+            for m in valid_markets:
+                try:
+                    res = await fallback_client.get(url, params={"markets": m})
+                    if res.status_code == 200:
+                        items = res.json()
+                        if items and items[0].get("trade_price") is not None:
+                            price_map[m] = Decimal(str(items[0]["trade_price"]))
+                    elif res.status_code == 404:
+                        print(f"[TICKER][404] 업비트에 존재하지 않는 심볼 확인 및 영구 제외: {m}")
+                        # 404 확인된 심볼은 런타임 캐시에서 제거
+                        if m in _TRADABLE_MARKETS_SET:
+                            _TRADABLE_MARKETS_SET.discard(m)
+                except Exception:
+                    pass
+        return price_map
+
 # ============================================================
 # 9. [조건 2 반영] BB-Patterns 기반 신규 매수 후보 발굴 엔진
 # ============================================================
