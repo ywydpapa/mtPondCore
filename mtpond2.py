@@ -115,6 +115,49 @@ LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-3.0"))
 
 _CONFIG_INITIALIZED = False
 
+class PositionState:
+    def __init__(self):
+        self.data: Dict[str, Dict[str, Any]] = {}
+        self.last_sell_time: Dict[str, float] = {}
+        self.buy_info: Dict[str, Dict[str, Any]] = {}
+
+    def update_or_init(self, market: str, pnl: Decimal, avg_price: Decimal):
+        now = time.time()
+        st = self.data.get(market)
+        if st is None or st.get("avg_buy_price") != avg_price:
+            self.data[market] = {
+                "peak_pnl": pnl,
+                "min_pnl": pnl,
+                "last_drawdown": Decimal("0"),
+                "max_drawdown": Decimal("0"),
+                "armed": False,
+                "avg_buy_price": avg_price,
+                "hard_tp_taken": False,
+                "hard_tp2_taken": False,
+                "last_update_ts": now,
+                "active_limit_uuid": None,
+                "limit_pending_category": None,
+                "limit_submit_ts": None,
+                # 추가 매수 제어용 필드
+                "last_additional_buy_ts": 0.0,       # 직전 추가매수 시각 (epoch)
+                "last_additional_buy_price": None,   # 직전 추가매수 당시 가격
+                "last_additional_buy_pnl": None      # 직전 추가매수 당시 PNL
+            }
+            return self.data[market]
+
+        if pnl > st["peak_pnl"]:
+            st["peak_pnl"] = pnl
+        if pnl < st.get("min_pnl", pnl):
+            st["min_pnl"] = pnl
+
+        drawdown = st["peak_pnl"] - pnl if pnl < st["peak_pnl"] else Decimal("0")
+        st["last_drawdown"] = drawdown
+        if drawdown > st.get("max_drawdown", Decimal("0")):
+            st["max_drawdown"] = drawdown
+
+        st["last_update_ts"] = now
+        return st
+
 def init_config(force: bool = False):
     global _CONFIG_INITIALIZED
     if _CONFIG_INITIALIZED and not force:
@@ -665,6 +708,9 @@ def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Opti
 # ============================================================
 # 13. [조건 3 & 4 반영] 추가 매수 프로세스
 # ============================================================
+ADDITIONAL_BUY_COOLDOWN_SEC = int(os.getenv("ADDITIONAL_BUY_COOLDOWN_SEC", "120"))  # 최소 2분(120초)
+
+
 async def process_additional_buys(
         access_key: str,
         secret_key: str,
@@ -673,15 +719,18 @@ async def process_additional_buys(
         available_krw: Decimal
 ) -> Decimal:
     """
-    [조건 3, 4] 기존 보유 종목 중 PNL이 BUY_RANGE_LOW(-2.2%) 이하로 내려간 경우
-    설정된 추가 매수 금액(ADDITIONAL_BUY_KRW)만큼 물타기 진행하되,
-    종목당 누적 구매금액이 MAX_TOTAL_INVEST_PER_MARKET을 절대 넘지 않도록 제한
+    [조건 3, 4 개선]
+    1. PNL이 BUY_RANGE_LOW(-2.2%) 이하
+    2. 직전 추가 매수 후 최소 2분(120초) 이상 경과
+    3. 직전 추가 매수 가격과 현재가가 동일하지 않고 유의미한 변동/추가하락이 있는 경우에만 실행
+    4. 최대 구매한도(MAX_TOTAL_INVEST_PER_MARKET) 초과 방지
     """
     used_krw = Decimal("0")
     if available_krw < MIN_ORDER_NOTIONAL_KRW or ADDITIONAL_BUY_KRW <= 0:
         return used_krw
 
-    # 최대 한도 설정값 안전 변환
+    now = time.time()
+
     try:
         max_cap = Decimal(str(MAX_TOTAL_INVEST_PER_MARKET))
     except Exception:
@@ -692,71 +741,95 @@ async def process_additional_buys(
     for pos in enriched_positions:
         market = pos["market"]
         pnl = pos["pnl_percent"]
+        cur_price = pos.get("current_price")
 
         # 1. 제외 코인 배제
-        if market in excluded or pnl is None:
+        if market in excluded or pnl is None or cur_price is None:
             continue
 
-        # 2. 하락폭 조건 검증 (BUY_RANGE_LOW 예: -2.2% 이하일 때만)
+        # 2. 1차 기본 하락폭 조건 (BUY_RANGE_LOW 예: -2.2% 이하일 때만)
         if pnl > BUY_RANGE_LOW:
             continue
 
         total_buys, total_invested = ps.get_buy_stats(market)
 
-        # 지갑에는 잔고가 있으나 프로그램 메모리에 투자금이 없으면 (보유수량 * 평균가)로 보정
+        # 지갑 잔고 기준 투자금 보정
         if total_invested <= 0:
             bal_eff = (pos["balance"] + pos["locked"])
             total_invested = (bal_eff * pos["avg_buy_price"]).quantize(Decimal("0.0001"))
             ps.buy_info[market] = {"total_buys": max(1, total_buys), "total_invested": total_invested}
 
-        # ★ [핵심 가드 1] 이미 누적 투자금이 최대 한도 이상이면 즉시 스킵
+        # 3. 최대 구매한도 초과 방지
         if max_cap > 0 and total_invested >= max_cap:
-            # print(f"[BUY-ADD][SKIP] {market} 최대 구매한도 도달 (투자금: {total_invested} >= 한도: {max_cap})")
             continue
 
-        # 3. 추가 매수 횟수 초과 방지
+        # 4. 최대 추가 매수 횟수 초과 방지
         if total_buys - 1 >= MAX_ADDITIONAL_BUYS:
             continue
 
         st = ps.data.get(market, {})
-        # 직전 추가매수 PNL 대비 추가 하락(-1.0% 이상 추가 하락) 시에만 실행 (너무 잦은 물타기 방지)
+        last_add_ts = st.get("last_additional_buy_ts", 0.0)
+        last_add_price = st.get("last_additional_buy_price")
         last_add_pnl = st.get("last_additional_buy_pnl")
-        if last_add_pnl is not None and (pnl - last_add_pnl) > Decimal("-1.0"):
+
+        # ★ [가드 1] 직전 추가 매수 후 최소 2분(120초) 경과 여부 확인
+        elapsed_sec = now - last_add_ts
+        if last_add_ts > 0 and elapsed_sec < ADDITIONAL_BUY_COOLDOWN_SEC:
+            # print(f"[BUY-ADD][SKIP] {market} 2분 쿨다운 미달 ({int(elapsed_sec)}초 / {ADDITIONAL_BUY_COOLDOWN_SEC}초)")
             continue
 
-        # ★ [핵심 가드 2] 잔여 한도 계산 (최대 한도 - 현재 투자금)
+        # ★ [가드 2] 가격 변동성 검증 (동일 가격 매수 차단)
+        if last_add_price is not None:
+            # 직전 추가매수가와 현재가가 완전히 같으면 매수 스킵
+            if cur_price == last_add_price:
+                # print(f"[BUY-ADD][SKIP] {market} 직전 추가매수가와 동일 가격 ({cur_price}원)")
+                continue
+
+            # 직전 매수가 대비 최소 1호가(1틱) 이상의 가격 변화가 있는지 확인
+            tick_unit = get_tick_unit(cur_price)
+            if abs(cur_price - last_add_price) < tick_unit:
+                continue
+
+        # ★ [가드 3] 추가 하락폭 검증
+        # 이미 추가 매수를 진행한 적이 있다면, 직전 추가매수 당시 PNL보다 더 하락했는지 확인
+        if last_add_pnl is not None and (pnl - last_add_pnl) > Decimal("-0.8"):
+            # 이전 추가매수 시점 대비 -0.8% 이상 추가 낙폭이 없으면 스킵
+            continue
+
+        # 5. 잔여 한도 계산 및 금액 결정
         cap_remain = (max_cap - total_invested) if max_cap > 0 else ADDITIONAL_BUY_KRW
-
-        # 남은 한도가 업비트 최소 주문 금액(5,500원) 미만이면 추가 구매 원천 차단
         if cap_remain < MIN_ORDER_NOTIONAL_KRW:
-            # print(f"[BUY-ADD][SKIP] {market} 잔여 한도 부족 ({cap_remain} < {MIN_ORDER_NOTIONAL_KRW})")
             continue
 
-        # 실제 매수 발주할 금액 = min(설정된 추가매수금액, 남은 한도, 현재 가용 원화)
         buy_amt = min(ADDITIONAL_BUY_KRW, cap_remain, available_krw)
         if buy_amt < MIN_ORDER_NOTIONAL_KRW:
             continue
 
-        # ★ [핵심 가드 3] 실행 직전 최종 누적액 합산 재검증
         if max_cap > 0 and (total_invested + buy_amt) > max_cap:
             buy_amt = max_cap - total_invested
             if buy_amt < MIN_ORDER_NOTIONAL_KRW:
                 continue
 
+        # 6. 추가 매수 실행
         try:
             if LIVE_TRADING:
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
                 print(
-                    f"[BUY-ADD] {market} 추가 매수 완료! pnl={pnl}% amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원 (uuid={resp.get('uuid')})")
+                    f"[BUY-ADD] {market} 추가 매수 완료! pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원, 경과:{int(elapsed_sec)}초) amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원 (uuid={resp.get('uuid')})")
             else:
                 print(
-                    f"[BUY-ADD][DRY] {market} 추가 매수: pnl={pnl}% amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원")
+                    f"[BUY-ADD][DRY] {market} 추가 매수: pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원) amt={buy_amt}")
 
+            # 매수 상태 업데이트 (시간, 가격, PNL 기록)
             ps.record_buy(market, buy_amt)
+            st["last_additional_buy_ts"] = now
+            st["last_additional_buy_price"] = cur_price
             st["last_additional_buy_pnl"] = pnl
+
             available_krw -= buy_amt
             used_krw += buy_amt
 
+            # TP 재배치
             if PREPLACE_HARD_TP and LIVE_TRADING:
                 asyncio.create_task(after_buy_preplace_tp(access_key, secret_key, market, ps))
 
