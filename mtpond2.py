@@ -461,12 +461,12 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             cnt_excluded += 1
             continue
 
-        # 2. 가격 검사 (100원 미만 동전주 제외 방어)
+        # 2. 가격 검사 (50원 미만 동전주 제외 방어)
         try:
             price = float(c.get("price", 0))
         except:
             price = 0
-        if price < 100:
+        if price < 50:
             cnt_price_drop += 1
             continue
 
