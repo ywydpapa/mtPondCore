@@ -718,13 +718,6 @@ async def process_additional_buys(
         ps: PositionState,
         available_krw: Decimal
 ) -> Decimal:
-    """
-    [조건 3, 4 개선]
-    1. PNL이 BUY_RANGE_LOW(-2.2%) 이하
-    2. 직전 추가 매수 후 최소 2분(120초) 이상 경과
-    3. 직전 추가 매수 가격과 현재가가 동일하지 않고 유의미한 변동/추가하락이 있는 경우에만 실행
-    4. 최대 구매한도(MAX_TOTAL_INVEST_PER_MARKET) 초과 방지
-    """
     used_krw = Decimal("0")
     if available_krw < MIN_ORDER_NOTIONAL_KRW or ADDITIONAL_BUY_KRW <= 0:
         return used_krw
@@ -736,6 +729,14 @@ async def process_additional_buys(
     except Exception:
         max_cap = Decimal("0")
 
+    # 기준 하락폭 안전 변환 (기본값 -2.2)
+    try:
+        drop_target = Decimal(str(BUY_RANGE_LOW))
+        if drop_target > 0:
+            drop_target = -abs(drop_target)  # 양수로 잘못 입력된 경우 음수로 강제 변환
+    except Exception:
+        drop_target = Decimal("-2.2")
+
     excluded = await get_excluded_markets()
 
     for pos in enriched_positions:
@@ -743,12 +744,13 @@ async def process_additional_buys(
         pnl = pos["pnl_percent"]
         cur_price = pos.get("current_price")
 
-        # 1. 제외 코인 배제
+        # 1. 제외 코인 및 유효성 검사
         if market in excluded or pnl is None or cur_price is None:
             continue
 
-        # 2. 1차 기본 하락폭 조건 (BUY_RANGE_LOW 예: -2.2% 이하일 때만)
-        if pnl > BUY_RANGE_LOW:
+        # ★ [가드 1] 하락폭 검증 강화 (양수 수익권 및 기준 미달 즉시 탈락)
+        # pnl이 drop_target(-2.2%)보다 크면 무조건 스킵
+        if pnl >= Decimal("0") or pnl > drop_target:
             continue
 
         total_buys, total_invested = ps.get_buy_stats(market)
@@ -759,44 +761,43 @@ async def process_additional_buys(
             total_invested = (bal_eff * pos["avg_buy_price"]).quantize(Decimal("0.0001"))
             ps.buy_info[market] = {"total_buys": max(1, total_buys), "total_invested": total_invested}
 
-        # 3. 최대 구매한도 초과 방지
+        # 2. 최대 구매한도 초과 방지
         if max_cap > 0 and total_invested >= max_cap:
             continue
 
-        # 4. 최대 추가 매수 횟수 초과 방지
+        # 3. 최대 추가 매수 횟수 초과 방지
         if total_buys - 1 >= MAX_ADDITIONAL_BUYS:
             continue
 
         st = ps.data.get(market, {})
-        last_add_ts = st.get("last_additional_buy_ts", 0.0)
+        last_add_ts = st.get("last_additional_buy_ts")
         last_add_price = st.get("last_additional_buy_price")
         last_add_pnl = st.get("last_additional_buy_pnl")
 
-        # ★ [가드 1] 직전 추가 매수 후 최소 2분(120초) 경과 여부 확인
-        elapsed_sec = now - last_add_ts
-        if last_add_ts > 0 and elapsed_sec < ADDITIONAL_BUY_COOLDOWN_SEC:
-            # print(f"[BUY-ADD][SKIP] {market} 2분 쿨다운 미달 ({int(elapsed_sec)}초 / {ADDITIONAL_BUY_COOLDOWN_SEC}초)")
+        # ★ [가드 2] 프로그램 시작 직후 혹은 직전 매수 후 최소 2분(120초) 쿨다운
+        if last_add_ts is None:
+            st["last_additional_buy_ts"] = now
             continue
 
-        # ★ [가드 2] 가격 변동성 검증 (동일 가격 매수 차단)
+        elapsed_sec = now - last_add_ts
+        if elapsed_sec < ADDITIONAL_BUY_COOLDOWN_SEC:
+            # 2분이 지나지 않았으면 절대 매수하지 않음
+            continue
+
+        # ★ [가드 3] 가격 변화 검증 (동일 가격 매수 차단)
         if last_add_price is not None:
-            # 직전 추가매수가와 현재가가 완전히 같으면 매수 스킵
             if cur_price == last_add_price:
-                # print(f"[BUY-ADD][SKIP] {market} 직전 추가매수가와 동일 가격 ({cur_price}원)")
                 continue
 
-            # 직전 매수가 대비 최소 1호가(1틱) 이상의 가격 변화가 있는지 확인
             tick_unit = get_tick_unit(cur_price)
             if abs(cur_price - last_add_price) < tick_unit:
                 continue
 
-        # ★ [가드 3] 추가 하락폭 검증
-        # 이미 추가 매수를 진행한 적이 있다면, 직전 추가매수 당시 PNL보다 더 하락했는지 확인
+        # ★ [가드 4] 직전 추가매수 PNL 대비 추가 낙폭(-0.8% 이상) 검증
         if last_add_pnl is not None and (pnl - last_add_pnl) > Decimal("-0.8"):
-            # 이전 추가매수 시점 대비 -0.8% 이상 추가 낙폭이 없으면 스킵
             continue
 
-        # 5. 잔여 한도 계산 및 금액 결정
+        # 4. 잔여 한도 계산
         cap_remain = (max_cap - total_invested) if max_cap > 0 else ADDITIONAL_BUY_KRW
         if cap_remain < MIN_ORDER_NOTIONAL_KRW:
             continue
@@ -810,7 +811,7 @@ async def process_additional_buys(
             if buy_amt < MIN_ORDER_NOTIONAL_KRW:
                 continue
 
-        # 6. 추가 매수 실행
+        # 5. 추가 매수 실행
         try:
             if LIVE_TRADING:
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
@@ -820,7 +821,7 @@ async def process_additional_buys(
                 print(
                     f"[BUY-ADD][DRY] {market} 추가 매수: pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원) amt={buy_amt}")
 
-            # 매수 상태 업데이트 (시간, 가격, PNL 기록)
+            # 매수 상태 갱신
             ps.record_buy(market, buy_amt)
             st["last_additional_buy_ts"] = now
             st["last_additional_buy_price"] = cur_price
@@ -829,7 +830,6 @@ async def process_additional_buys(
             available_krw -= buy_amt
             used_krw += buy_amt
 
-            # TP 재배치
             if PREPLACE_HARD_TP and LIVE_TRADING:
                 asyncio.create_task(after_buy_preplace_tp(access_key, secret_key, market, ps))
 
@@ -972,13 +972,13 @@ async def monitor_positions(user_no: int, server_no: int):
     # 2. 초기 보유 잔고 동기화 (제외 코인 원천 배제)
     try:
         init_accs = await fetch_upbit_accounts(access_key, secret_key)
+        boot_now = time.time()
         for acc in init_accs:
             cur = acc.get("currency")
             if not cur or cur == "KRW":
                 continue
             market = f"KRW-{cur}"
 
-            # [조건 1] 제외 코인은 초기 추적 상태 등록에서도 배제
             if market in excluded:
                 continue
 
@@ -991,9 +991,13 @@ async def monitor_positions(user_no: int, server_no: int):
                     "peak_pnl": Decimal("0"),
                     "min_pnl": Decimal("0"),
                     "armed": False,
-                    "avg_buy_price": avg
+                    "avg_buy_price": avg,
+                    # ★ [핵심] 시작 시점을 기준으로 쿨다운 타이머 시작 (17억초 오류 방지)
+                    "last_additional_buy_ts": boot_now,
+                    "last_additional_buy_price": avg,
+                    "last_additional_buy_pnl": Decimal("0")
                 }
-        print(f"[INIT] 기존 보유 코인 {len(ps.buy_info)}개 관리 등록 완료")
+        print(f"[INIT] 기존 보유 코인 {len(ps.buy_info)}개 관리 등록 완료 (2분 매수 쿨다운 적용)")
     except Exception as e:
         print(f"[INIT][WARN] 잔고 초기화 경고: {e}")
 
