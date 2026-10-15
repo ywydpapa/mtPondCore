@@ -936,7 +936,7 @@ async def after_buy_preplace_tp(access_key: str, secret_key: str, market: str, p
 
 
 # ============================================================
-# [보완] 재시작 시 기존 제외 코인을 철저히 배제한 매도주문 재배치
+# [보완] 잔고가 실제로 남은 코인만 선별하여 매도 주문 재배치
 # ============================================================
 async def reseed_and_replace_all_open_orders(
         access_key: str,
@@ -945,13 +945,14 @@ async def reseed_and_replace_all_open_orders(
 ):
     """
     재시작 시:
-    1. 최신 제외 코인 목록을 강제 조회하여 확인
-    2. 제외 코인은 주문 취소 및 신규 매도 대상에서 '완전 배제'
-    3. 관리 대상 정상 보유 코인만 기존 미체결 취소 후 언락 잔고 포함 매도 재배치
+    1. 제외 코인은 주문 취소 및 매도 대상에서 철저히 배제
+    2. 관리 대상 보유 코인의 기존 미체결 주문 취소
+    3. 언락 후 '실제로 유효 잔고(5,500원 이상)'가 남아있는 코인만 신규 매도 주문 등록
+    4. 잔고가 소진되었거나 자투리 먼지 수량인 경우 재등록 생략 및 포지션 정리
     """
-    print("[RESEED] 기존 등록 코인 미체결 주문 취소 및 매도 재배치 시작...")
+    print("[RESEED] 기존 등록 코인 미체결 주문 취소 및 잔여 잔고 검증 시작...")
 
-    # 1. 제외 코인 목록을 캐시 무시하고 강제로 최신 동기화
+    # 1. 제외 코인 목록 최신 동기화
     excluded = await get_excluded_markets(force_reload=True)
 
     # 2. 1차 계정 잔고 조회
@@ -961,7 +962,7 @@ async def reseed_and_replace_all_open_orders(
         print(f"[RESEED][ERR] 1차 계정 조회 실패: {e}")
         return
 
-    # 관리 대상 코인 식별 (★ 제외 코인은 여기서 즉시 원천 배제)
+    # 미체결 취소 대상 코인 선별 (제외 코인 배제, locked 포함 잔고가 있는 종목만)
     target_markets = []
     for acc in raw_accounts:
         cur = acc.get("currency")
@@ -969,7 +970,6 @@ async def reseed_and_replace_all_open_orders(
             continue
         mkt = f"KRW-{cur}"
 
-        # [필터] 제외 코인 배제
         if mkt in excluded:
             continue
 
@@ -979,40 +979,65 @@ async def reseed_and_replace_all_open_orders(
             target_markets.append(mkt)
 
     if not target_markets:
-        print("[RESEED] 재배치할 관리 대상 보유 코인이 없습니다 (제외 코인 생략).")
+        print("[RESEED] 관리 대상 보유 코인이 없습니다 (취소/재주문 생략).")
         return
 
-    # 3. 제외 코인이 아닌 '정상 관리 대상 코인'에 대해서만 기존 미체결 취소
+    # 3. 기존 대기 주문 일괄 취소 (제외 코인은 건드리지 않음)
     for mkt in target_markets:
         await cancel_all_open_orders_for_market(access_key, secret_key, mkt)
 
     # 4. 언락 대기
     await asyncio.sleep(0.5)
 
-    # 5. 2차 계정 잔고 조회 (언락 반영된 잔고 확보)
+    # 5. 2차 계정 잔고 조회 (주문 취소 후 실제 가용 balance 확인)
     try:
         updated_accounts = await fetch_upbit_accounts(access_key, secret_key)
     except Exception as e:
         print(f"[RESEED][ERR] 2차 계정 조회 실패: {e}")
         updated_accounts = raw_accounts
 
-    # 6. 관리 대상 코인만 매도 주문 재배치
+    # 6. 현재가 일괄 조회 (주문 최소 금액 5,500원 검증용)
+    price_map = await fetch_current_prices(target_markets)
+
+    # 7. 실제 잔고가 유의미하게 남은 코인만 매도 주문 재등록
     for acc in updated_accounts:
         cur = acc.get("currency")
         if not cur or cur == "KRW":
             continue
         mkt = f"KRW-{cur}"
 
-        # ★ [이중 가드] 제외 코인이거나 target_markets에 없는 종목은 건드리지 않고 스킵
+        # 제외 코인이거나 대상이 아니면 스킵
         if mkt in excluded or mkt not in target_markets:
             continue
 
+        # 주문 취소 후 실제 주문 가능한 잔고(balance) 확인
         bal = Decimal(str(acc.get("balance", "0")))
-        locked = Decimal(str(acc.get("locked", "0")))
         avg = Decimal(str(acc.get("avg_buy_price", "0")))
+        cur_price = price_map.get(mkt)
 
-        total_vol = bal + locked
-        if total_vol <= 0 or avg <= 0:
+        # ★ [핵심 가드 1] 잔고가 0 이하이거나 평균매수가가 없는 경우 재등록 불필요
+        if bal <= 0 or avg <= 0:
+            ps.data.pop(mkt, None)
+            ps.buy_info.pop(mkt, None)
+            continue
+
+        vol_q = quantize_volume(bal)
+        if vol_q <= 0:
+            ps.data.pop(mkt, None)
+            ps.buy_info.pop(mkt, None)
+            continue
+
+        # 평가 금액 검증 (현재가 또는 평균가 기준)
+        ref_price = cur_price if (cur_price and cur_price > 0) else avg
+        est_notional = vol_q * ref_price
+
+        # ★ [핵심 가드 2] 남아 있는 잔고가 최소 주문 금액(5,500원) 미만인 경우
+        # 반복 재등록하지 않고 포지션 관리 목록에서 정리 후 건너뜁니다.
+        if est_notional < MIN_ORDER_NOTIONAL_KRW:
+            print(
+                f"[RESEED][SKIP] {mkt} 잔여 잔고 없음 또는 최소 주문 미달 ({est_notional:.0f}원 < {MIN_ORDER_NOTIONAL_KRW}원) → 재등록 생략")
+            ps.data.pop(mkt, None)
+            ps.buy_info.pop(mkt, None)
             continue
 
         try:
@@ -1021,30 +1046,26 @@ async def reseed_and_replace_all_open_orders(
             best_bid, best_ask = await get_orderbook_top(mkt)
             limit_price = adjust_price_to_tick(max(target_price_raw, best_ask), side="ask")
 
-            vol_q = quantize_volume(total_vol)
-            notional = vol_q * limit_price
-
-            if notional < MIN_ORDER_NOTIONAL_KRW:
-                print(f"[RESEED][SKIP] {mkt} 주문 금액 미달 ({notional:.0f}원 < {MIN_ORDER_NOTIONAL_KRW}원)")
+            final_notional = vol_q * limit_price
+            if final_notional < MIN_ORDER_NOTIONAL_KRW:
                 continue
 
             if LIVE_TRADING:
                 resp = await order_limit_sell(access_key, secret_key, mkt, vol_q, limit_price)
                 uid = resp.get("uuid")
 
-                # 상태 등록
                 st = ps.data.setdefault(mkt, {})
                 st["active_limit_uuid"] = uid
                 st["limit_pending_category"] = "PRE_HARD_TP1"
                 st["limit_submit_ts"] = time.time()
-                print(f"[RESEED][OK] {mkt} 매도 주문 재배치 완료: {vol_q}개 @ {limit_price}원 (uuid={uid})")
+                print(f"[RESEED][OK] {mkt} 잔여 잔고 매도 재등록: {vol_q}개 @ {limit_price}원 (uuid={uid})")
             else:
-                print(f"[RESEED][DRY] {mkt} 매도 주문 시뮬레이션: {vol_q}개 @ {limit_price}원")
+                print(f"[RESEED][DRY] {mkt} 잔여 잔고 매도 시뮬레이션: {vol_q}개 @ {limit_price}원")
 
         except Exception as e:
             print(f"[RESEED][ERR] {mkt} 매도 주문 재배치 실패: {e}")
 
-    print("[RESEED] 정상 등록 코인 매도 주문 재배치 완료 (제외 코인 보호됨)\n")
+    print("[RESEED] 유효 잔고 코인 매도 재등록 작업 완료\n")
 
 # ============================================================
 # 15. 메인 모니터링 루프
