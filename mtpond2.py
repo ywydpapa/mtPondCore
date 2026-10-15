@@ -74,7 +74,7 @@ COOLDOWN_AFTER_SELL_SEC = int(os.getenv("COOLDOWN_AFTER_SELL_SEC", "600"))   # �
 
 # 동적 조정 가능한 추천 필터 파라미터 기본값
 BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))           # 기본 추천 점수 3점 이상
-BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "120"))    # 기본 10분당 120건 (분당 12건 상당)
+BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))    # 기본 10분당 120건 (분당 12건 상당)
 
 # 익절 및 트레일링 설정
 ARM_PNL = Decimal("0.25")
@@ -601,7 +601,7 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             price = float(c.get("price", 0))
         except:
             price = 0
-        if price < 50:
+        if price < 30:
             cnt_price_drop += 1
             continue
 
