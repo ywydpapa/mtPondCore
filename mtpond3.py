@@ -94,10 +94,18 @@ LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
 UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
 # ============================================================
-# 5. RUNTIME CONFIG (동적 설정 관리)
+# 5. RUNTIME CONFIG (Redis 연동 동적 설정 관리)
 # ============================================================
 ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1", "Y", "TRUE"))
 _CONFIG_INITIALIZED = False
+
+# 전역 설정 변수 선언 (Redis 및 .env 폴백 연동)
+MAX_ACTIVE_MARKETS = 10
+RANGE_BUY_KRW = Decimal("40000")
+ADDITIONAL_BUY_KRW = Decimal("40000")
+MAX_TOTAL_INVEST_PER_MARKET = Decimal("120000")
+BB_MIN_OVERALL_SCORE = 3
+BB_MIN_TRADE_COUNT_10M = 60
 
 class PositionState:
     def __init__(self):
@@ -182,14 +190,15 @@ def init_config(force: bool = False):
     RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
     ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))
     MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "120000"))
-    BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "1"))
+    BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
     BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
     _CONFIG_INITIALIZED = True
-    print(f"[INIT] 설정 초기화 완료 (force={force}) | 활성최대:{MAX_ACTIVE_MARKETS}개, 목표비율:{PROFIT_RANGE_RATIO*100}%")
+    print(f"[INIT] 기본 설정 초기화 완료 (force={force}) | 활성최대:{MAX_ACTIVE_MARKETS}개, 최초금액:{RANGE_BUY_KRW}원")
 
 def apply_dynamic_config(cfg: dict):
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, ADDITIONAL_BUY_KRW, MAX_TOTAL_INVEST_PER_MARKET
+    global BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
 
     def to_dec(v):
         try:
@@ -197,20 +206,43 @@ def apply_dynamic_config(cfg: dict):
         except:
             return None
 
-    if "maxCoincnt" in cfg:
-        try:
-            nv = int(cfg["maxCoincnt"])
-            if nv > 0: MAX_ACTIVE_MARKETS = nv
-        except: pass
-    if "initAmt" in cfg:
-        v = to_dec(cfg.get("initAmt"))
-        if v and v > 0: RANGE_BUY_KRW = v
-    if "addAmt" in cfg:
-        v = to_dec(cfg.get("addAmt"))
-        if v and v > 0: ADDITIONAL_BUY_KRW = v
-    if "limitAmt" in cfg:
-        v = to_dec(cfg.get("limitAmt"))
-        if v and v > 0: MAX_TOTAL_INVEST_PER_MARKET = v
+    # maxCoincnt (최대 활성 코인 수)
+    for key in ("maxCoincnt", "max_active_markets", "MAX_ACTIVE_MARKETS"):
+        if key in cfg:
+            try:
+                nv = int(cfg[key])
+                if nv > 0: MAX_ACTIVE_MARKETS = nv
+            except: pass
+
+    # initAmt (최초 매수 금액)
+    for key in ("initAmt", "range_buy_krw", "RANGE_BUY_KRW"):
+        if key in cfg:
+            v = to_dec(cfg.get(key))
+            if v and v > 0: RANGE_BUY_KRW = v
+
+    # addAmt (추가 물타기 금액)
+    for key in ("addAmt", "additional_buy_krw", "ADDITIONAL_BUY_KRW"):
+        if key in cfg:
+            v = to_dec(cfg.get(key))
+            if v and v > 0: ADDITIONAL_BUY_KRW = v
+
+    # limitAmt (종목당 최대 투자 한도)
+    for key in ("limitAmt", "max_total_invest_per_market", "MAX_TOTAL_INVEST_PER_MARKET"):
+        if key in cfg:
+            v = to_dec(cfg.get(key))
+            if v and v > 0: MAX_TOTAL_INVEST_PER_MARKET = v
+
+async def sync_redis_config(user_no: int):
+    """Redis 서버에서 실시간 설정을 불러와 전역 변수에 동기화"""
+    try:
+        c = await redis_client.get(f"mtpond:setup:{user_no}")
+        if c:
+            data = json.loads(c)
+            cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
+            if isinstance(cfg, dict):
+                apply_dynamic_config(cfg)
+    except Exception as e:
+        print(f"[CONFIG][WARN] Redis 설정 동기화 실패: {e}")
 
 # ============================================================
 # 6. Exclude Markets (거래 제외 코인 관리)
@@ -585,10 +617,6 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
 # 12. 수동/추가 매수 감지 및 동기화 처리 함수
 # ============================================================
 async def sync_or_register_held_positions(access_key: str, secret_key: str, ps: PositionState, raw_accounts: List[dict], excluded: set):
-    """
-    사용자가 수동으로 추가 매수했거나 외부에서 코인 잔고/평단가가 변동된 경우를 감지하여
-    엔진 내부 상태(buy_info, avg_buy_price)를 자동으로 갱신하고 TP 주문을 재배치합니다.
-    """
     for acc in raw_accounts:
         cur = acc.get("currency")
         if not cur or cur == "KRW": continue
@@ -605,14 +633,12 @@ async def sync_or_register_held_positions(access_key: str, secret_key: str, ps: 
 
         info = ps.buy_info.get(mkt)
         if not info:
-            # 엔진이 인지하지 못한 신규 보유 코인 발견 (수동 매수 등)
             invested_amt = (total_vol * avg_price).quantize(Decimal("0.0001"))
             ps.buy_info[mkt] = {"total_buys": 1, "total_invested": invested_amt}
             ps.update_or_init(mkt, Decimal("0"), avg_price)
             print(f"📥 [MANUAL-BUY-DETECTED] {mkt} 수동/신규 보유 코인 감지! (수량: {total_vol}, 평단: {avg_price}) → 익절 배치 등록")
             asyncio.create_task(after_buy_preplace_dynamic_tp(access_key, secret_key, mkt, ps))
         else:
-            # 기존 보유 코인이지만 평단가나 수량이 변경된 경우 (수동 추가 매수 등)
             st = ps.data.get(mkt, {})
             old_avg = st.get("avg_buy_price", Decimal("0"))
             if old_avg > 0 and old_avg != avg_price:
@@ -623,7 +649,7 @@ async def sync_or_register_held_positions(access_key: str, secret_key: str, ps: 
                 asyncio.create_task(after_buy_preplace_dynamic_tp(access_key, secret_key, mkt, ps))
 
 # ============================================================
-# 13. [개선] 1시간/15분봉 반등 지지 확인형 물타기 프로세스
+# 13. 1시간/15분봉 반등 지지 확인형 물타기 프로세스
 # ============================================================
 async def process_strategic_additional_buys(
         access_key: str,
@@ -701,7 +727,7 @@ async def process_strategic_additional_buys(
     return used_krw
 
 # ============================================================
-# 14. [개선] 신규 종목 매수 프로세스
+# 14. 신규 종목 매수 프로세스 (Redis 연동 설정 금액 반영)
 # ============================================================
 async def process_new_candidate_buys(
     access_key: str,
@@ -733,6 +759,7 @@ async def process_new_candidate_buys(
         if not analysis or not analysis["is_rebounding"]:
             continue
 
+        # ★ Redis에서 실시간 동기화된 RANGE_BUY_KRW 적용
         buy_amt = min(RANGE_BUY_KRW, available_krw)
         if buy_amt < MIN_ORDER_NOTIONAL_KRW:
             continue
@@ -741,13 +768,13 @@ async def process_new_candidate_buys(
             if LIVE_TRADING:
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
                 print(
-                    f"🚀 [BUY-NEW] {market} 1h+15m 추세 진입! "
+                    f"🚀 [BUY-NEW] {market} 1h+15m 추세 진입! 금액={buy_amt}원 | "
                     f"1h진폭={analysis['range_1h_pct']}% | 상단여유={analysis['room_to_1h_high']}% | "
                     f"목표익절=+{analysis['target_tp']}% (uuid={resp.get('uuid')})"
                 )
             else:
                 print(
-                    f"🚀 [BUY-NEW][DRY] {market} 진입: "
+                    f"🚀 [BUY-NEW][DRY] {market} 진입: 금액={buy_amt}원 "
                     f"1h진폭={analysis['range_1h_pct']}% 목표=+{analysis['target_tp']}%"
                 )
 
@@ -764,7 +791,7 @@ async def process_new_candidate_buys(
     return used_krw
 
 # ============================================================
-# 15. [개선] 지정가 TP 발주
+# 15. 지정가 TP 발주
 # ============================================================
 async def after_buy_preplace_dynamic_tp(access_key: str, secret_key: str, market: str, ps: PositionState, target_tp_override: Decimal = None):
     await asyncio.sleep(0.5)
@@ -817,7 +844,7 @@ async def monitor_positions(user_no: int, server_no: int):
         access_key, secret_key = row[0], row[1]
 
     ps = PositionState()
-    print("=== [MTF 1h+15m + 수동매수동기화] 트레이딩 엔진 가동 ===")
+    print("=== [MTF 1h+15m + Redis 설정 연동] 트레이딩 엔진 가동 ===")
     excluded = await get_excluded_markets(force_reload=True)
 
     # 초기 보유 코인 관리 등록
@@ -841,20 +868,15 @@ async def monitor_positions(user_no: int, server_no: int):
         try:
             loop_now = time.time()
 
-            # 15초 주기 설정 동기화
+            # 15초 주기 Redis 설정 동기화
             if loop_now - last_cfg_sync >= CONTROLLER_POLL_SEC:
                 last_cfg_sync = loop_now
-                try:
-                    c = await redis_client.get(f"mtpond:setup:{user_no}")
-                    if c:
-                        d = json.loads(c)
-                        apply_dynamic_config(d[0] if isinstance(d, list) else d)
-                except Exception: pass
+                await sync_redis_config(user_no)
 
             excluded = await get_excluded_markets()
             raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
 
-            # ★ [추가된 핵심 로직] 수동 매수/잔고 변동 실시간 동기화 호출
+            # 수동 매수/잔고 변동 실시간 동기화
             await sync_or_register_held_positions(access_key, secret_key, ps, raw_accounts, excluded)
 
             available_krw = Decimal("0")
@@ -901,6 +923,7 @@ async def monitor_positions(user_no: int, server_no: int):
                     enriched = [p for p in enriched if p["market"] != mkt]
 
             active_count = len(enriched)
+            # ★ Redis에서 동기화된 MAX_ACTIVE_MARKETS 적용
             remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
 
             # [A] 매도 판단: 최종 방어 손절 및 고점 대비 이익 보존 트레일링
@@ -980,6 +1003,9 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
     while True:
         try:
+            # Redis 설정 동기화
+            await sync_redis_config(user_no)
+
             cfg = {}
             c = await redis_client.get(f"mtpond:setup:{user_no}")
             if c:
