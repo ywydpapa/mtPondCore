@@ -163,9 +163,13 @@ async def check_avoidance_patterns(market: str) -> Tuple[bool, str]:
 
         # 볼린저 밴드(20, 2) 계산용 최근 종가들
         closes = [Decimal(str(c["trade_price"])) for c in candles]
-        sma20 = sum(closes) / Decimal(str(len(closes)))
-        variance = sum((c - sma20) ** 2 for c in closes) / Decimal(str(len(closes)))
-        std_dev = Decimal(str(math.sqrt(float(variance))))
+        cnt_dec = Decimal(str(len(closes)))
+        sma20 = sum(closes) / cnt_dec
+        variance = sum((c - sma20) * (c - sma20) for c in closes) / cnt_dec
+        try:
+            std_dev = variance.sqrt()
+        except Exception:
+            std_dev = Decimal(str(math.sqrt(float(variance))))
         bb_upper = sma20 + (std_dev * Decimal("2"))
         bb_lower = sma20 - (std_dev * Decimal("2"))
 
@@ -721,6 +725,36 @@ def build_upbit_jwt_with_params(access_key: str, secret_key: str, params: Dict[s
         "query_hash_alg": "SHA512",
     }
     return jwt.encode(payload, secret_key, algorithm="HS256")
+
+
+async def wait_unlock_and_get_balance(access_key: str, secret_key: str, currency: str, timeout: float = 2.0) -> Decimal:
+    """주문 취소 후 locked 수량이 balance로 완전히 돌아올 때까지 대기"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            accs = await fetch_upbit_accounts(access_key, secret_key)
+            for a in accs:
+                if a.get("currency") == currency:
+                    bal = Decimal(str(a.get("balance", "0")))
+                    locked = Decimal(str(a.get("locked", "0")))
+                    if locked <= 0 and bal > 0:
+                        return bal
+                    if bal > 0 and locked > 0:
+                        # 아직 일부가 묶여있으면 잠깐 대기
+                        pass
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+
+    # 타임아웃 시 최종 잔고 반환
+    try:
+        accs = await fetch_upbit_accounts(access_key, secret_key)
+        for a in accs:
+            if a.get("currency") == currency:
+                return Decimal(str(a.get("balance", "0")))
+    except Exception:
+        pass
+    return Decimal("0")
 
 async def upbit_request(method: str, url: str, access_key: str, secret_key: str, params: dict = None, max_retry: int = 3) -> dict:
     params = params or {}
@@ -1717,21 +1751,22 @@ async def monitor_positions(user_no: int, server_no: int):
                     reason_tag = "PANIC_EXIT" if is_panic_cut else "LOSS_CUT"
                     print(f"\n🚨 [{reason_tag}] {market} 3m & 10m 동시 하락 확정! PNL: {pnl}% (손절임계치: {panic_threshold}%)")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
-                    await asyncio.sleep(0.4)
 
-                    accs = await fetch_upbit_accounts(access_key, secret_key)
-                    for a in accs:
-                        if a.get("currency") == market.split("-")[1]:
-                            actual_bal = Decimal(str(a.get("balance", "0")))
-                            sell_vol = quantize_volume(actual_bal)
-                            if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
-                                if LIVE_TRADING:
-                                    resp = await order_market_sell(access_key, secret_key, market, sell_vol)
-                                    print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
-                                else:
-                                    print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
-                                ps.mark_sold(market, reason=reason_tag)
-                            break
+                    # 언락 대기 후 실제 매도 가능 잔고 확보
+                    currency = market.split("-")[1]
+                    actual_bal = await wait_unlock_and_get_balance(access_key, secret_key, currency, timeout=2.0)
+                    sell_vol = quantize_volume(actual_bal)
+
+                    if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
+                        if LIVE_TRADING:
+                            resp = await order_market_sell(access_key, secret_key, market, sell_vol)
+                            print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
+                        else:
+                            print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
+                        ps.mark_sold(market, reason=reason_tag)
+                    else:
+                        print(f"   ▶ [LOSS-CUT][SKIP] {market} 주문 취소 후 가용 잔고 미달로 매도 스킵 (수량={sell_vol})")
+
                     print("──────────────────────────────────────────────\n")
                     continue
 
