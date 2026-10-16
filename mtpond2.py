@@ -61,7 +61,7 @@ else:
     )
 
 # 주기 리셋 설정 (5분)
-PERIODIC_RESET_SEC = int(os.getenv("PERIODIC_RESET_SEC", "300"))
+PERIODIC_RESET_SEC = int(os.getenv("PERIODIC_RESET_SEC", "86400"))
 class ResetRequested(Exception):
     pass
 
@@ -69,12 +69,12 @@ class ResetRequested(Exception):
 # 4. STATIC CONFIG (설정 및 신규 조건)
 # ============================================================
 BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
-BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "600"))                 # 10분 주기 갱신
-COOLDOWN_AFTER_SELL_SEC = int(os.getenv("COOLDOWN_AFTER_SELL_SEC", "600"))   # 매도 후 10분 쿨다운
+BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))                 # 3분 주기 갱신
+COOLDOWN_AFTER_SELL_SEC = int(os.getenv("COOLDOWN_AFTER_SELL_SEC", "180"))   # 매도 후 3분 쿨다운
 
 # 동적 조정 가능한 추천 필터 파라미터 기본값
 BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))           # 기본 추천 점수 3점 이상
-BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))    # 기본 10분당 120건 (분당 12건 상당)
+BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))     # 기본 10분당 60건 (분당 6건 상당)
 
 # 익절 및 트레일링 설정
 ARM_PNL = Decimal("0.25")
@@ -105,6 +105,58 @@ PREPLACE_ON_START = os.getenv("PREPLACE_ON_START", "0") == "1"
 # 동시 최대 추가 매수 횟수
 MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS", "5"))
 
+# [쿨다운 사유별 분리 설정]
+COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "60"))        # 정상 목표달성 익절 후 재매수 쿨다운 (1분)
+COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300")) # 약익절/손절/급락 후 재매수 쿨다운 (5분)
+
+# ============================================================
+# [신규 진입 필터] 3분봉 상승 추세 판별 엔진
+# ============================================================
+_candle_3m_cache: Dict[str, Tuple[float, bool]] = {}
+CANDLE_3M_CACHE_TTL = 30  # 30초 캐시
+
+async def check_3m_candle_trend(market: str) -> bool:
+    """
+    해당 종목의 3분봉 상태를 확인하여 상승 추세(양봉/반등) 여부 반환
+    - 직전 3분봉 2개를 조회하여 현재 캔들이 양봉(종가 >= 시가)이거나,
+      직전 캔들 종가 대비 상승 중일 때 True 반환
+    """
+    now = time.time()
+    cached = _candle_3m_cache.get(market)
+    if cached and (now - cached[0]) < CANDLE_3M_CACHE_TTL:
+        return cached[1]
+
+    url = "https://api.upbit.com/v1/candles/minutes/3"
+    params = {"market": market, "count": 2}
+
+    try:
+        async with httpx.AsyncClient(timeout=3.5) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                candles = resp.json()
+                if isinstance(candles, list) and len(candles) >= 1:
+                    c0 = candles[0]  # 현재(최신) 3분봉
+                    o0 = Decimal(str(c0["opening_price"]))
+                    c_price = Decimal(str(c0["trade_price"]))
+
+                    # 기본 조건: 현재 3분봉이 양봉(현재가 >= 시가)
+                    is_bullish = c_price >= o0
+
+                    # 캔들이 2개 이상이면 직전 캔들과도 비교 (저점 확인)
+                    if len(candles) >= 2:
+                        c1 = candles[1]  # 직전 3분봉
+                        c1_close = Decimal(str(c1["trade_price"]))
+                        # 직전 캔들 종가보다 위에 있거나 현재 캔들이 확실한 양봉일 때
+                        is_bullish = is_bullish and (c_price >= c1_close or (c_price - o0) / o0 >= Decimal("0.001"))
+
+                    _candle_3m_cache[market] = (now, is_bullish)
+                    return is_bullish
+    except Exception as e:
+        print(f"[CANDLE-3M][WARN] {market} 3분봉 조회 실패: {e}")
+
+    # 조회 실패 시에는 안전을 위해 보수적으로 False(진입 보류) 처리
+    return False
+
 # ============================================================
 # 5. RUNTIME CONFIG (동적 설정 관리)
 # ============================================================
@@ -114,11 +166,11 @@ LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-3.0"))
 
 _CONFIG_INITIALIZED = False
 
-# 포지션 상태 추적 단일 클래스 정의
 class PositionState:
     def __init__(self):
         self.data: Dict[str, Dict[str, Any]] = {}
-        self.last_sell_time: Dict[str, float] = {}   # 매도 후 쿨다운용
+        # market -> {"ts": float, "expire_ts": float, "reason": str}
+        self.sell_history: Dict[str, Dict[str, Any]] = {}
         self.buy_info: Dict[str, Dict[str, Any]] = {}
 
     def update_or_init(self, market: str, pnl: Decimal, avg_price: Decimal):
@@ -138,8 +190,7 @@ class PositionState:
                 "active_limit_uuid": None,
                 "limit_pending_category": None,
                 "limit_submit_ts": None,
-                # 추가 매수 방어 제어용 필드
-                "last_additional_buy_ts": now,       # 시작 시점 기준으로 초기화
+                "last_additional_buy_ts": now,
                 "last_additional_buy_price": avg_price,
                 "last_additional_buy_pnl": Decimal("0")
             }
@@ -158,17 +209,46 @@ class PositionState:
         st["last_update_ts"] = now
         return st
 
-    def mark_sold(self, market: str):
-        self.last_sell_time[market] = time.time()
+    def mark_sold(self, market: str, reason: str = "DEFENSE"):
+        """
+        매도 사유에 따른 차등 쿨다운 등록
+        - reason: "TP" (정상 목표달성 익절), "DEFENSE" (약익절/손절/패닉셀)
+        """
+        now = time.time()
+
+        if reason.upper() in ("TP", "HARD_TP", "TP_DONE", "DYNAMIC_TP"):
+            cooldown_sec = COOLDOWN_TP_SEC
+            tag = "정상익절"
+        else:
+            cooldown_sec = COOLDOWN_DEFENSE_SEC
+            tag = "방어/손절"
+
+        expire_ts = now + cooldown_sec
+        self.sell_history[market] = {
+            "ts": now,
+            "expire_ts": expire_ts,
+            "reason": reason,
+            "tag": tag
+        }
+
+        # 기존 관리 상태 정리
         self.data.pop(market, None)
         self.buy_info.pop(market, None)
-        print(f"[COOLDOWN] {market} 매도 완료 → 재매수 금지 쿨다운 시작 ({COOLDOWN_AFTER_SELL_SEC}초)")
 
-    def recently_sold(self, market: str, cooldown_sec: int = COOLDOWN_AFTER_SELL_SEC) -> bool:
-        ts = self.last_sell_time.get(market)
-        if not ts:
+        print(f"[COOLDOWN] {market} 매도 완료 [{tag}: {reason}] → 재매수 금지 {cooldown_sec}초 적용 (만료: {int(cooldown_sec)}초 후)")
+
+    def recently_sold(self, market: str) -> bool:
+        """해당 코인의 쿨다운 만료 여부 확인"""
+        hist = self.sell_history.get(market)
+        if not hist:
             return False
-        return (time.time() - ts) < cooldown_sec
+
+        now = time.time()
+        if now < hist["expire_ts"]:
+            rem = int(hist["expire_ts"] - now)
+            # print(f"[COOLDOWN-CHECK] {market} 재매수 불가 ({hist['tag']} 쿨다운 잔여: {rem}초)")
+            return True
+        return False
 
     def record_buy(self, market: str, krw_amount: Decimal):
         info = self.buy_info.setdefault(market, {"total_buys": 0, "total_invested": Decimal("0")})
@@ -198,16 +278,16 @@ def init_config(force: bool = False):
     global BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
 
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "10"))
-    RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))              # 초기 매수 금액
-    ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))    # 추가 매수 금액
+    RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
+    ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))
     MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "400000"))
-    BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-2.2"))              # 추가 매수 하락 기준선
+    BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-2.2"))
     BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.45"))
     STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.2"))
     LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-3.0"))
     ENABLE_STOP = (str(os.getenv("ENABLE_STOP", "1")).upper() in ("1", "Y", "TRUE"))
     BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
-    BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "120"))
+    BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
     _CONFIG_INITIALIZED = True
     print(f"[INIT] 설정 초기화 완료 (force={force}) | 추천점수>={BB_MIN_OVERALL_SCORE}, 10분체결>={BB_MIN_TRADE_COUNT_10M}건")
@@ -279,7 +359,6 @@ def apply_dynamic_config(cfg: dict):
             changes.append(f"ENABLE_STOP {ENABLE_STOP} -> {flag}")
             ENABLE_STOP = flag
 
-    # 추천 점수 동적 설정 (minScore)
     if "minScore" in cfg:
         try:
             ms = int(cfg["minScore"])
@@ -289,7 +368,6 @@ def apply_dynamic_config(cfg: dict):
         except:
             pass
 
-    # 10분당 체결 건수 동적 설정 (minTrades10m) 또는 분당 체결 건수 (minTradesPerMin)
     if "minTrades10m" in cfg:
         try:
             mt = int(cfg["minTrades10m"])
@@ -300,7 +378,6 @@ def apply_dynamic_config(cfg: dict):
             pass
     elif "minTradesPerMin" in cfg:
         try:
-            # 분당 체결수 입력 시 10분 단위로 환산
             mt = int(cfg["minTradesPerMin"]) * 10
             if mt != BB_MIN_TRADE_COUNT_10M:
                 changes.append(f"BB_MIN_TRADE_COUNT_10M(10분기준) {BB_MIN_TRADE_COUNT_10M} -> {mt}")
@@ -526,7 +603,6 @@ async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
             else:
                 raise RuntimeError(f"HTTP {r.status_code}")
     except Exception:
-        # Fallback 처리
         price_map = {}
         async with httpx.AsyncClient(timeout=3.0) as fallback_client:
             for m in valid_markets:
@@ -640,7 +716,7 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
 
     print(
         f"\n[BB-PATTERNS 갱신] 서버시각: {server_updated}\n"
-        f"  - 전체: {cnt_total}개 | 제외코인: {cnt_excluded}개 | 50원미만: {cnt_price_drop}개\n"
+        f"  - 전체: {cnt_total}개 | 제외코인: {cnt_excluded}개 | 30원미만: {cnt_price_drop}개\n"
         f"  - 점수미달(<{BB_MIN_OVERALL_SCORE}): {cnt_score_drop}개 | 체결미달(<{BB_MIN_TRADE_COUNT_10M}건/10m): {cnt_trade_drop}개\n"
         f"  ▶ 최종 추천 진입 후보: {len(qualified)}개"
     )
@@ -666,6 +742,13 @@ async def order_limit_sell(access_key: str, secret_key: str, market: str, volume
     params = {"market": market, "side": "ask", "volume": str(volume), "price": str(price), "ord_type": "limit"}
     return await upbit_request("POST", UPBIT_ORDER_URL, access_key, secret_key, params=params, max_retry=2)
 
+async def fetch_upbit_order_state(access_key: str, secret_key: str, uuid_: str) -> Optional[dict]:
+    try:
+        params = {"uuid": uuid_}
+        return await upbit_request("GET", "https://api.upbit.com/v1/order", access_key, secret_key, params=params, max_retry=2)
+    except Exception:
+        return None
+
 async def cancel_order(access_key: str, secret_key: str, uuid_: str):
     params = {"uuid": uuid_}
     try:
@@ -685,35 +768,108 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
         print(f"[CANCEL-ALL][ERR] {market} 주문 전체 취소 실패: {e}")
 
 # ============================================================
-# 11. 익절 및 손절 판단 엔진
+# [급락 대응] 캔들 평균 진폭(변동성) 산출 및 캐시
+# ============================================================
+VOLATILITY_CACHE_TTL_SEC = 180  # 3분 캐시
+_volatility_cache: Dict[str, Tuple[float, Decimal]] = {}
+PANIC_DROP_MULTIPLIER = Decimal(os.getenv("PANIC_DROP_MULTIPLIER", "1.8"))
+
+async def get_candle_volatility(market: str, unit: int = 10, count: int = 10) -> Decimal:
+    now = time.time()
+    cached = _volatility_cache.get(market)
+    if cached and (now - cached[0]) < VOLATILITY_CACHE_TTL_SEC:
+        return cached[1]
+
+    url = f"https://api.upbit.com/v1/candles/minutes/{unit}"
+    params = {"market": market, "count": count}
+
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                candles = resp.json()
+                if isinstance(candles, list) and len(candles) > 0:
+                    amp_sum = Decimal("0")
+                    for c in candles:
+                        h = Decimal(str(c["high_price"]))
+                        l = Decimal(str(c["low_price"]))
+                        o = Decimal(str(c["opening_price"]))
+                        if o > 0:
+                            amp_sum += ((h - l) / o) * Decimal("100")
+
+                    avg_amp = (amp_sum / Decimal(str(len(candles)))).quantize(Decimal("0.01"))
+                    _volatility_cache[market] = (now, avg_amp)
+                    return avg_amp
+    except Exception as e:
+        print(f"[VOLATILITY][WARN] {market} 캔들 진폭 조회 실패: {e}")
+
+    return Decimal("2.0")
+
+
+# ============================================================
+# [종목별 개별 적용] 코인별 동적 익절 목표치 계산
+# ============================================================
+async def get_dynamic_target_pnl(market: str, avg_price: Decimal) -> Decimal:
+
+    # 1. 해당 코인만의 최근 10분봉 평균 진폭(%) 계산
+    avg_vol = await get_candle_volatility(market, unit=10, count=10)
+    target_pnl = (avg_vol / Decimal("2")).quantize(Decimal("0.01"))
+
+    # 2. 최소 0.5% 하한선 보장
+    if target_pnl < Decimal("0.5"):
+        target_pnl = Decimal("0.5")
+
+    # 3. 해당 코인의 현재 가격대에 따른 1틱 퍼센트 계산 및 1틱 미만 방어
+    if avg_price > 0:
+        tick = get_tick_unit(avg_price)
+        one_tick_pct = (tick / avg_price) * Decimal("100")
+
+        # 목표치가 1틱 크기보다 작거나 같으면 최소 1.5틱 이상의 이격 확보
+        min_tick_target = (one_tick_pct * Decimal("1.5")).quantize(Decimal("0.01"))
+        if target_pnl < min_tick_target:
+            target_pnl = min_tick_target
+
+    # 4. 개별 상한선 (+2.5% 초과 방지)
+    if target_pnl > Decimal("2.5"):
+        target_pnl = Decimal("2.5")
+
+    return target_pnl
+
+# ============================================================
+# 11. 익절 및 손절 판단 엔진 (약익절 방어 & 목표가 대기 로직)
 # ============================================================
 def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Optional[str]]:
     peak = state["peak_pnl"]
-    armed = state["armed"]
     hard_tp_taken = state.get("hard_tp_taken", False)
-    hard_tp2_taken = state.get("hard_tp2_taken", False)
 
-    if hard_tp_taken and (not hard_tp2_taken) and pnl >= HARD_TP2_BASE:
-        return True, f"HARD_TP2 {pnl}% >= {HARD_TP2_BASE}%", "HARD_TP2"
+    # 해당 코인의 개별 목표가 로드 (기본 0.6%)
+    target_tp = state.get("dynamic_tp", Decimal("0.6"))
 
-    if (not hard_tp_taken) and pnl >= HARD_TP:
-        return True, f"HARD_TP1 {pnl}% >= {HARD_TP}%", "HARD_TP1"
+    # 1. 목표가 도달 시 정상 익절
+    if (not hard_tp_taken) and pnl >= target_tp:
+        return True, f"DYNAMIC_TP {pnl}% >= {target_tp}%", "HARD_TP1"
 
-    if (not armed) and pnl >= ARM_PNL:
-        state["armed"] = True
-        return False, f"ARMED {pnl}% (>= {ARM_PNL}%)", None
+    # 2. 목표가의 75% 수준까지 상승했던 이력이 있는 경우
+    check_arm = (target_tp * Decimal("0.75")).quantize(Decimal("0.01"))
+    wait_gate = (target_tp * Decimal("0.85")).quantize(Decimal("0.01"))
 
-    if state["armed"] and peak >= TRAIL_START_PNL:
-        drop = peak - pnl
-        if drop >= TRAIL_DROP:
-            return True, f"TRAIL_DROP {drop}% >= {TRAIL_DROP}% (peak={peak}% now={pnl}%)", "TRAIL"
+    if peak >= check_arm:
+        # 목표가 턱밑에서 상승 탄력 유지 중이면 대기
+        if pnl >= wait_gate:
+            return False, f"WAIT_TP (pnl={pnl}% >= {wait_gate}% | 목표={target_tp}%)", None
+
+        # ★ [개선] 약익절 조건:
+        # 수수료(0.1%)를 고려하여 +0.25% 이하로 내려오려 할 때 작동하되,
+        # 이미 0% 밑으로 떨어진 손실 구간(음수)에서는 작동하지 않도록 하한선(+0.10%) 방어!
+        if Decimal("0.10") <= pnl <= Decimal("0.25"):
+            return True, f"WEAK_TP_EXIT (peak={peak}% -> now={pnl}% | 이익보존)", "WEAK_TP"
 
     return False, "", None
 
 # ============================================================
-# 12. 추가 매수 프로세스
+# 12. 추가 매수 프로세스 (캔들 진폭 초과 급락 방어 적용)
 # ============================================================
-ADDITIONAL_BUY_COOLDOWN_SEC = int(os.getenv("ADDITIONAL_BUY_COOLDOWN_SEC", "120"))  # 최소 2분
+ADDITIONAL_BUY_COOLDOWN_SEC = int(os.getenv("ADDITIONAL_BUY_COOLDOWN_SEC", "120"))
 
 async def process_additional_buys(
         access_key: str,
@@ -750,8 +906,19 @@ async def process_additional_buys(
         if market in excluded or pnl is None or cur_price is None:
             continue
 
-        # 하락폭 검증
         if pnl >= Decimal("0") or pnl > drop_target:
+            continue
+
+        # 캔들 진폭 초과 급락 구간은 추가 매수 즉시 동결
+        avg_vol = await get_candle_volatility(market, unit=10, count=10)
+        panic_threshold = -(avg_vol * PANIC_DROP_MULTIPLIER)
+        if pnl <= panic_threshold:
+            # ... 취소 및 시장가 매도 실행 ...
+            if LIVE_TRADING:
+                resp = await order_market_sell(access_key, secret_key, market, sell_vol)
+                print(f"   ▶ 시장가 긴급 탈출 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
+            # 방어적 손절 쿨다운(180초) 적용
+            ps.mark_sold(market, reason="PANIC_EXIT")
             continue
 
         total_buys, total_invested = ps.get_buy_stats(market)
@@ -772,7 +939,6 @@ async def process_additional_buys(
         last_add_price = st.get("last_additional_buy_price")
         last_add_pnl = st.get("last_additional_buy_pnl")
 
-        # 2분 쿨다운 검증
         if last_add_ts is None:
             st["last_additional_buy_ts"] = now
             continue
@@ -781,7 +947,6 @@ async def process_additional_buys(
         if elapsed_sec < ADDITIONAL_BUY_COOLDOWN_SEC:
             continue
 
-        # 가격 변화 확인
         if last_add_price is not None:
             if cur_price == last_add_price:
                 continue
@@ -790,7 +955,6 @@ async def process_additional_buys(
             if abs(cur_price - last_add_price) < tick_unit:
                 continue
 
-        # 직전 PNL 대비 추가 하락 확인
         if last_add_pnl is not None and (pnl - last_add_pnl) > Decimal("-0.8"):
             continue
 
@@ -833,7 +997,7 @@ async def process_additional_buys(
     return used_krw
 
 # ============================================================
-# 13. 신규 종목 매수 프로세스
+# 13. 신규 종목 매수 프로세스 (3분봉 상승 확인 필터 탑재)
 # ============================================================
 async def process_new_candidate_buys(
     access_key: str,
@@ -864,13 +1028,22 @@ async def process_new_candidate_buys(
 
         market = item["market"]
 
+        # 1. 제외 코인 배제
         if market in excluded:
             continue
 
+        # 2. 이미 보유 중인 종목 배제
         if ps.buy_info.get(market):
             continue
 
+        # 3. 매도 후 쿨다운 확인
         if ps.recently_sold(market):
+            continue
+
+        # ★ [핵심 추가] 3분봉 상승 여부 검증 (음봉/하락 중이면 진입 보류)
+        is_uptrend_3m = await check_3m_candle_trend(market)
+        if not is_uptrend_3m:
+            # print(f"[BUY-NEW][SKIP] {market} 점수 도달했으나 3분봉 음봉(하락세) 진행 중 → 진입 보류")
             continue
 
         target_amt = RANGE_BUY_KRW
@@ -884,7 +1057,7 @@ async def process_new_candidate_buys(
         try:
             if LIVE_TRADING:
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
-                print(f"[BUY-NEW] {market} 신규 진입! 점수={item['overall_score']} 10분체결={item['trade_count_10m']}건 amt={buy_amt} (uuid={resp.get('uuid')})")
+                print(f"[BUY-NEW] {market} 신규 진입 (3분봉 상승 확인)! 점수={item['overall_score']} 10분체결={item['trade_count_10m']}건 amt={buy_amt} (uuid={resp.get('uuid')})")
             else:
                 print(f"[BUY-NEW][DRY] {market} 신규 진입: 점수={item['overall_score']} amt={buy_amt}")
 
@@ -918,51 +1091,46 @@ async def after_buy_preplace_tp(access_key: str, secret_key: str, market: str, p
 
                 await cancel_all_open_orders_for_market(access_key, secret_key, market)
 
-                target_price = avg * (Decimal("1") + (HARD_TP / Decimal("100")))
+                # ★ [해당 코인 전용] 개별 동적 익절 목표 산출
+                dynamic_tp = await get_dynamic_target_pnl(market, avg)
+
+                target_price = avg * (Decimal("1") + (dynamic_tp / Decimal("100")))
                 best_bid, best_ask = await get_orderbook_top(market)
                 limit_price = adjust_price_to_tick(max(target_price, best_ask), side="ask")
 
                 vol = quantize_volume(bal)
                 if vol * limit_price >= MIN_ORDER_NOTIONAL_KRW:
                     resp = await order_limit_sell(access_key, secret_key, market, vol, limit_price)
+
+                    # ★ 해당 코인의 개별 상태 객체(ps.data[market])에만 독립 저장
                     st = ps.data.setdefault(market, {})
                     st["active_limit_uuid"] = resp.get("uuid")
-                    st["limit_pending_category"] = "PRE_HARD_TP1"
+                    st["dynamic_tp"] = dynamic_tp  # 예: KRW-CHIP은 0.55%, KRW-BTC는 1.1% 개별 보관
+                    st["limit_pending_category"] = "PRE_DYNAMIC_TP"
                     st["limit_submit_ts"] = time.time()
-                    print(f"[PRE_TP] {market} 선지정 익절 주문 완료: vol={vol} price={limit_price}")
+                    print(f"[PRE_TP] {market} 개별 익절 발주 완료: vol={vol} price={limit_price} (개별목표: +{dynamic_tp}%)")
                 break
     except Exception as e:
-        print(f"[PRE_TP][ERR] {market} 선지정 주문 실패: {e}")
-
+        print(f"[PRE_TP][ERR] {market} 개별 선지정 주문 실패: {e}")
 
 # ============================================================
-# [보완] 잔고가 실제로 남은 코인만 선별하여 매도 주문 재배치
+# [보완 4 반영] reseed_and_replace_all_open_orders
 # ============================================================
 async def reseed_and_replace_all_open_orders(
         access_key: str,
         secret_key: str,
         ps: PositionState
 ):
-    """
-    재시작 시:
-    1. 제외 코인은 주문 취소 및 매도 대상에서 철저히 배제
-    2. 관리 대상 보유 코인의 기존 미체결 주문 취소
-    3. 언락 후 '실제로 유효 잔고(5,500원 이상)'가 남아있는 코인만 신규 매도 주문 등록
-    4. 잔고가 소진되었거나 자투리 먼지 수량인 경우 재등록 생략 및 포지션 정리
-    """
     print("[RESEED] 기존 등록 코인 미체결 주문 취소 및 잔여 잔고 검증 시작...")
 
-    # 1. 제외 코인 목록 최신 동기화
     excluded = await get_excluded_markets(force_reload=True)
 
-    # 2. 1차 계정 잔고 조회
     try:
         raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
     except Exception as e:
         print(f"[RESEED][ERR] 1차 계정 조회 실패: {e}")
         return
 
-    # 미체결 취소 대상 코인 선별 (제외 코인 배제, locked 포함 잔고가 있는 종목만)
     target_markets = []
     for acc in raw_accounts:
         cur = acc.get("currency")
@@ -982,41 +1150,42 @@ async def reseed_and_replace_all_open_orders(
         print("[RESEED] 관리 대상 보유 코인이 없습니다 (취소/재주문 생략).")
         return
 
-    # 3. 기존 대기 주문 일괄 취소 (제외 코인은 건드리지 않음)
     for mkt in target_markets:
         await cancel_all_open_orders_for_market(access_key, secret_key, mkt)
 
-    # 4. 언락 대기
     await asyncio.sleep(0.5)
 
-    # 5. 2차 계정 잔고 조회 (주문 취소 후 실제 가용 balance 확인)
     try:
         updated_accounts = await fetch_upbit_accounts(access_key, secret_key)
     except Exception as e:
         print(f"[RESEED][ERR] 2차 계정 조회 실패: {e}")
         updated_accounts = raw_accounts
 
-    # 6. 현재가 일괄 조회 (주문 최소 금액 5,500원 검증용)
     price_map = await fetch_current_prices(target_markets)
 
-    # 7. 실제 잔고가 유의미하게 남은 코인만 매도 주문 재등록
     for acc in updated_accounts:
         cur = acc.get("currency")
         if not cur or cur == "KRW":
             continue
         mkt = f"KRW-{cur}"
 
-        # 제외 코인이거나 대상이 아니면 스킵
         if mkt in excluded or mkt not in target_markets:
             continue
 
-        # 주문 취소 후 실제 주문 가능한 잔고(balance) 확인
         bal = Decimal(str(acc.get("balance", "0")))
-        avg = Decimal(str(acc.get("avg_buy_price", "0")))
+        raw_avg = Decimal(str(acc.get("avg_buy_price", "0")))
         cur_price = price_map.get(mkt)
 
-        # ★ [핵심 가드 1] 잔고가 0 이하이거나 평균매수가가 없는 경우 재등록 불필요
-        if bal <= 0 or avg <= 0:
+        if raw_avg <= 0:
+            if cur_price and cur_price > 0:
+                avg = cur_price
+                print(f"[RESEED][WARN] {mkt} 평균매수가 0원 감지 → 현재가({cur_price}원)로 기준가 대체")
+            else:
+                continue
+        else:
+            avg = raw_avg
+
+        if bal <= 0:
             ps.data.pop(mkt, None)
             ps.buy_info.pop(mkt, None)
             continue
@@ -1027,22 +1196,20 @@ async def reseed_and_replace_all_open_orders(
             ps.buy_info.pop(mkt, None)
             continue
 
-        # 평가 금액 검증 (현재가 또는 평균가 기준)
         ref_price = cur_price if (cur_price and cur_price > 0) else avg
         est_notional = vol_q * ref_price
 
-        # ★ [핵심 가드 2] 남아 있는 잔고가 최소 주문 금액(5,500원) 미만인 경우
-        # 반복 재등록하지 않고 포지션 관리 목록에서 정리 후 건너뜁니다.
         if est_notional < MIN_ORDER_NOTIONAL_KRW:
-            print(
-                f"[RESEED][SKIP] {mkt} 잔여 잔고 없음 또는 최소 주문 미달 ({est_notional:.0f}원 < {MIN_ORDER_NOTIONAL_KRW}원) → 재등록 생략")
+            print(f"[RESEED][SKIP] {mkt} 잔여 잔고 없음 또는 최소 주문 미달 ({est_notional:.0f}원 < {MIN_ORDER_NOTIONAL_KRW}원) → 재등록 생략")
             ps.data.pop(mkt, None)
             ps.buy_info.pop(mkt, None)
             continue
 
         try:
-            # 목표가 계산 (+0.6% 및 최우선 매도호가 보정)
-            target_price_raw = avg * (Decimal("1") + (HARD_TP / Decimal("100")))
+            # ★ 해당 코인(mkt)의 개별 동적 TP 산출
+            dynamic_tp = await get_dynamic_target_pnl(mkt, avg)
+
+            target_price_raw = avg * (Decimal("1") + (dynamic_tp / Decimal("100")))
             best_bid, best_ask = await get_orderbook_top(mkt)
             limit_price = adjust_price_to_tick(max(target_price_raw, best_ask), side="ask")
 
@@ -1056,11 +1223,12 @@ async def reseed_and_replace_all_open_orders(
 
                 st = ps.data.setdefault(mkt, {})
                 st["active_limit_uuid"] = uid
-                st["limit_pending_category"] = "PRE_HARD_TP1"
+                st["dynamic_tp"] = dynamic_tp  # 종목별 개별 저장
+                st["limit_pending_category"] = "PRE_DYNAMIC_TP"
                 st["limit_submit_ts"] = time.time()
-                print(f"[RESEED][OK] {mkt} 잔여 잔고 매도 재등록: {vol_q}개 @ {limit_price}원 (uuid={uid})")
+                print(f"[RESEED][OK] {mkt} 개별 매도 재등록: {vol_q}개 @ {limit_price}원 (개별목표: +{dynamic_tp}%, uuid={uid})")
             else:
-                print(f"[RESEED][DRY] {mkt} 잔여 잔고 매도 시뮬레이션: {vol_q}개 @ {limit_price}원")
+                print(f"[RESEED][DRY] {mkt} 개별 매도 시뮬레이션: {vol_q}개 @ {limit_price}원 (개별목표: +{dynamic_tp}%)")
 
         except Exception as e:
             print(f"[RESEED][ERR] {mkt} 매도 주문 재배치 실패: {e}")
@@ -1068,10 +1236,11 @@ async def reseed_and_replace_all_open_orders(
     print("[RESEED] 유효 잔고 코인 매도 재등록 작업 완료\n")
 
 # ============================================================
-# 15. 메인 모니터링 루프
+# 15. 메인 모니터링 루프 (수정 완료)
 # ============================================================
 async def monitor_positions(user_no: int, server_no: int):
     start_ts = time.time()
+    last_cfg_sync_ts = time.time()  # 설정값 경량 동기화 타이머
 
     async with SessionLocal() as session:
         sql = text("""SELECT apiKey1, apiKey2 FROM traceUser WHERE userNo = :u AND serverNo = :s LIMIT 1""")
@@ -1087,7 +1256,7 @@ async def monitor_positions(user_no: int, server_no: int):
 
     excluded = await get_excluded_markets(force_reload=True)
 
-    # 1. 초기 보유 잔고 동기화
+    # 1. 초기 보유 잔고 동기화 (기동 시 1회만)
     try:
         init_accs = await fetch_upbit_accounts(access_key, secret_key)
         boot_now = time.time()
@@ -1114,27 +1283,44 @@ async def monitor_positions(user_no: int, server_no: int):
                     "last_additional_buy_price": avg,
                     "last_additional_buy_pnl": Decimal("0")
                 }
-        print(f"[INIT] 기존 보유 코인 {len(ps.buy_info)}개 관리 등록 완료 (2분 매수 쿨다운 적용)")
+        print(f"[INIT] 기존 보유 코인 {len(ps.buy_info)}개 관리 등록 완료")
     except Exception as e:
         print(f"[INIT][WARN] 잔고 초기화 경고: {e}")
 
-    # ★ [핵심 추가] 재시작 시 기존 대기 주문 취소 및 잔여 코인 전량 매도 재배치 실행
     try:
         await reseed_and_replace_all_open_orders(access_key, secret_key, ps)
     except Exception as e:
-        print(f"[RESEED][WARN] 재시작 주문 재배치 중 오류 발생: {e}")
+        print(f"[RESEED][WARN] 재시작 주문 재배치 중 오류: {e}")
 
+    # ================= 루프 진입 =================
     while True:
         try:
-            excluded = await get_excluded_markets()
-            raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
+            loop_now = time.time()
 
+            # ★ [개선 1] 데몬 재시작 없이 15초마다 Redis 설정값만 실시간 동기화
+            if loop_now - last_cfg_sync_ts >= CONTROLLER_POLL_SEC:
+                last_cfg_sync_ts = loop_now
+                try:
+                    cached_str = await redis_client.get(f"mtpond:setup:{user_no}")
+                    if cached_str:
+                        data = json.loads(cached_str)
+                        cfg = data[0] if isinstance(data, list) and data else data
+                        apply_dynamic_config(cfg)
+                except Exception:
+                    pass
+
+            # 1) 제외 코인 목록 갱신 (60초 캐시 내부 처리)
+            excluded = await get_excluded_markets()
+
+            # 2) 계좌 잔고 확인
+            raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
             available_krw = Decimal("0")
             for a in raw_accounts:
                 if a.get("currency") == "KRW":
                     available_krw = Decimal(str(a.get("balance", "0")))
                     break
 
+            # 3) 현재 보유 중인 정상 마켓 선별
             held_markets = []
             for a in raw_accounts:
                 cur = a.get("currency")
@@ -1147,6 +1333,7 @@ async def monitor_positions(user_no: int, server_no: int):
 
             price_map = await fetch_current_prices(held_markets)
 
+            # 4) 포지션 정보 풍부화
             enriched = []
             for a in raw_accounts:
                 cur = a.get("currency")
@@ -1173,59 +1360,141 @@ async def monitor_positions(user_no: int, server_no: int):
                         "pnl_percent": pnl
                     })
 
+            # 선지정 지정가(TP) 체결 완료 여부 점검
+            active_uuids = [
+                (m, st.get("active_limit_uuid"))
+                for m, st in list(ps.data.items())
+                if st.get("active_limit_uuid")
+            ]
+
+            for mkt, uid in active_uuids:
+                ord_info = await fetch_upbit_order_state(access_key, secret_key, uid)
+                if not ord_info:
+                    continue
+
+                state = ord_info.get("state")
+                if state == "done":
+                    exec_vol = ord_info.get("executed_volume", "0")
+                    price = ord_info.get("price", "0")
+                    print(f"[TP-DONE] {mkt} 선지정 지정가 익절 체결 완료! 수량={exec_vol} 가격={price}원 (uuid={uid})")
+                    # 정상 익절 쿨다운(60초) 적용
+                    ps.mark_sold(mkt, reason="TP_DONE")
+                    enriched = [p for p in enriched if p["market"] != mkt]
+                elif state == "cancel":
+                    if mkt in ps.data:
+                        ps.data[mkt]["active_limit_uuid"] = None
+
             active_count = len(enriched)
             remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
 
-            # [A] 매도 판단 및 실행
+            # ================= [A] 매도 판단 및 실행 =================
             for pos in enriched:
                 market = pos["market"]
                 pnl = pos["pnl_percent"]
                 bal = pos["balance"]
+                cur_p = pos["current_price"]
                 st = ps.update_or_init(market, pnl, pos["avg_buy_price"])
 
-                if ENABLE_STOP and pnl <= LOSS_CUT_RATE:
-                    print(f"[LOSS-CUT] {market} 손절 조건 도달 (PNL: {pnl}% <= {LOSS_CUT_RATE}%)")
+                # -------------------------------------------------------------
+                # 1. 캔들 진폭 초과 급락 긴급 손절 (Panic Exit)
+                # -------------------------------------------------------------
+                avg_vol = await get_candle_volatility(market, unit=10, count=10)
+                panic_threshold = -(avg_vol * PANIC_DROP_MULTIPLIER)
+
+                if pnl <= panic_threshold:
+                    print(f"\n🚨 [PANIC-EXIT] {market} 캔들 진폭 초과 급락 감지! PNL: {pnl}% (임계치: {panic_threshold}%)")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.4)
 
                     accs = await fetch_upbit_accounts(access_key, secret_key)
                     for a in accs:
                         if a.get("currency") == market.split("-")[1]:
-                            cur_bal = Decimal(str(a.get("balance", "0")))
-                            if cur_bal * pos["current_price"] >= MIN_ORDER_NOTIONAL_KRW:
-                                await order_market_sell(access_key, secret_key, market, quantize_volume(cur_bal))
-                                ps.mark_sold(market)
+                            actual_bal = Decimal(str(a.get("balance", "0")))
+                            sell_vol = quantize_volume(actual_bal)
+                            if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
+                                if LIVE_TRADING:
+                                    resp = await order_market_sell(access_key, secret_key, market, sell_vol)
+                                    print(f"   ▶ 시장가 긴급 탈출 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
+                                else:
+                                    print(f"   ▶ [DRY] 시장가 긴급 탈출 시뮬레이션: 수량={sell_vol}")
+                                ps.mark_sold(market, reason="PANIC_EXIT")
+                            break
+                    print("──────────────────────────────────────────────\n")
+                    continue
+
+                # -------------------------------------------------------------
+                # 2. 정적 손절 조건 검증 (LOSS_CUT_RATE)
+                # -------------------------------------------------------------
+                if ENABLE_STOP and pnl <= LOSS_CUT_RATE:
+                    print(f"[LOSS-CUT] {market} 고정 손절 도달 (PNL: {pnl}% <= {LOSS_CUT_RATE}%)")
+                    await cancel_all_open_orders_for_market(access_key, secret_key, market)
+                    await asyncio.sleep(0.4)
+
+                    accs = await fetch_upbit_accounts(access_key, secret_key)
+                    for a in accs:
+                        if a.get("currency") == market.split("-")[1]:
+                            actual_bal = Decimal(str(a.get("balance", "0")))
+                            sell_vol = quantize_volume(actual_bal)  # ★ 명확히 선언
+                            if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
+                                if LIVE_TRADING:
+                                    resp = await order_market_sell(access_key, secret_key, market, sell_vol)
+                                    print(f"   ▶ 시장가 손절 체결: 수량={sell_vol} (uuid={resp.get('uuid')})")
+                                ps.mark_sold(market, reason="LOSS_CUT")
                             break
                     continue
 
+                # -------------------------------------------------------------
+                # 3. 익절 및 약익절/대기 판단
+                # -------------------------------------------------------------
+                    # monitor_positions 루프 내부 [A] 매도 판단 중 3번 익절/약익절 블록
                 should_sell, reason, cat = decide_sell(market, pnl, st)
                 if should_sell:
+                        # 약익절 발동 시점에 한 번 더 현재 PNL이 양수인지 안전 검증
+                    if cat == "WEAK_TP" and pnl < Decimal("0.10"):
+                        # 이미 음수로 밀린 경우 약익절 취소하고 홀딩 (추가매수/손절 라인으로 넘김)
+                        continue
+
                     print(f"[SELL-SIGNAL] {market} {cat} 매도 조건 달성: {reason}")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.3)
+
+                    accs = await fetch_upbit_accounts(access_key, secret_key)
+                    actual_bal = bal
+                    for a in accs:
+                        if a.get("currency") == market.split("-")[1]:
+                            actual_bal = Decimal(str(a.get("balance", "0")))
+                            break
 
                     portion = HARD_TP_SELL_PORTION if cat == "HARD_TP1" else SELL_PORTION
-                    sell_vol = quantize_volume(bal * portion)
+                    sell_vol = quantize_volume(actual_bal * portion)
 
-                    if sell_vol * pos["current_price"] >= MIN_ORDER_NOTIONAL_KRW:
+                    if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
                         if LIVE_TRADING:
+                            # 시장가 매도 실행
                             await order_market_sell(access_key, secret_key, market, sell_vol)
+                            print(f"[SELL-EXEC] {market} {cat} 매도 체결: {sell_vol}개 (PNL: {pnl}%)")
+                        else:
+                            print(f"[SELL-DRY] {market} {cat} 매도 시뮬레이션: {sell_vol}개")
+
                         if portion >= Decimal("1.0"):
-                            ps.mark_sold(market)
+                            sell_reason = "TP" if cat in ("HARD_TP1", "HARD_TP2", "DYNAMIC_TP") else "WEAK_TP"
+                            ps.mark_sold(market, reason=sell_reason)
                         else:
                             ps.reduce_invested_after_sell(market, portion)
+                    else:
+                        print(f"[SELL-SKIP] {market} 매도 금액 미달로 스킵 (수량={sell_vol})")
 
-            # [B] 추가 매수 실행
+            # ================= [B] 추가 매수 실행 =================
             used_krw_add = await process_additional_buys(access_key, secret_key, enriched, ps, available_krw)
             available_krw -= used_krw_add
 
-            # [C] 신규 종목 매수 실행
+            # ================= [C] 신규 종목 매수 실행 =================
             used_krw_new = await process_new_candidate_buys(access_key, secret_key, ps, remaining_slots, available_krw)
             available_krw -= used_krw_new
 
-            # 주기 리셋 점검
-            if PERIODIC_RESET_SEC > 0 and (time.time() - start_ts) >= PERIODIC_RESET_SEC:
-                print(f"[RESET] {PERIODIC_RESET_SEC}초 경과로 안전 주기 재시작 요청")
+            # ★ [개선 2] 하루 1회(86400초) 정기 재시작만 허용
+            if PERIODIC_RESET_SEC > 0 and (loop_now - start_ts) >= PERIODIC_RESET_SEC:
+                print(f"[RESET] {PERIODIC_RESET_SEC}초(1일) 경과: 데몬 일일 정기 재기동")
                 raise ResetRequested()
 
         except ResetRequested:
@@ -1278,21 +1547,21 @@ async def run_mtpond_controller(user_no: int, server_no: int):
             apply_dynamic_config(cfg)
             _last_cfg_signature = sig
 
-        # 리셋 예외 감지 시 처리
         if task and task.done():
             exc = task.exception()
             if isinstance(exc, ResetRequested):
-                print("[CTRL] 주기 리셋 요청 감지 → 최신 설정 강제 재초기화 후 재시작")
-                init_config(force=True)  # ★ 재시작 시 설정 강제 리로드
+                print("[CTRL] 일일 정기 리셋 완료 → 모니터링 재기동")
+                init_config(force=True)
                 apply_dynamic_config(cfg)
             elif exc:
-                print(f"[CTRL] 모니터링 비정상 종료 감지: {exc}")
+                print(f"[CTRL] 🚨 모니터링 비정상 예외 종료 감지: {exc} → 즉시 복구 재기동")
                 init_config(force=True)
+                apply_dynamic_config(cfg)
             task = None
 
         if active_flag and task is None:
             print("[CTRL] activeYN=Y → 설정 최신화 확인 후 모니터링 태스크 시작")
-            init_config(force=True)  # ★ 태스크 시작 직전 설정 최신화
+            init_config(force=True)
             apply_dynamic_config(cfg)
             task = asyncio.create_task(monitor_positions(user_no, server_no))
         elif not active_flag and task:
