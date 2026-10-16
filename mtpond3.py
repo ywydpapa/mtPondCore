@@ -84,6 +84,7 @@ MAX_ADDITIONAL_BUYS = 2                                                     # �
 ADD_BUY_1_DROP = Decimal(os.getenv("ADD_BUY_1_DROP", "-2.2"))              # 1차 물타기 기준 (-2.2%)
 ADD_BUY_2_DROP = Decimal(os.getenv("ADD_BUY_2_DROP", "-4.5"))              # 2차 물타기 기준 (-4.5%)
 FINAL_LOSS_CUT_RATE = Decimal(os.getenv("FINAL_LOSS_CUT_RATE", "-6.5"))     # 최종 방어 손절선 (-6.5%)
+MAX_LOSS_LIMIT_PCT = Decimal("-25.0")                                       # 손실이 -25% 초과(미만)일 경우 손절 차단
 
 INTERVAL_SECONDS = 5
 MIN_NOTIONAL_KRW = Decimal("5000")
@@ -206,7 +207,6 @@ def apply_dynamic_config(cfg: dict):
         except:
             return None
 
-    # maxCoincnt (최대 활성 코인 수)
     for key in ("maxCoincnt", "max_active_markets", "MAX_ACTIVE_MARKETS"):
         if key in cfg:
             try:
@@ -214,26 +214,22 @@ def apply_dynamic_config(cfg: dict):
                 if nv > 0: MAX_ACTIVE_MARKETS = nv
             except: pass
 
-    # initAmt (최초 매수 금액)
     for key in ("initAmt", "range_buy_krw", "RANGE_BUY_KRW"):
         if key in cfg:
             v = to_dec(cfg.get(key))
             if v and v > 0: RANGE_BUY_KRW = v
 
-    # addAmt (추가 물타기 금액)
     for key in ("addAmt", "additional_buy_krw", "ADDITIONAL_BUY_KRW"):
         if key in cfg:
             v = to_dec(cfg.get(key))
             if v and v > 0: ADDITIONAL_BUY_KRW = v
 
-    # limitAmt (종목당 최대 투자 한도)
     for key in ("limitAmt", "max_total_invest_per_market", "MAX_TOTAL_INVEST_PER_MARKET"):
         if key in cfg:
             v = to_dec(cfg.get(key))
             if v and v > 0: MAX_TOTAL_INVEST_PER_MARKET = v
 
 async def sync_redis_config(user_no: int):
-    """Redis 서버에서 실시간 설정을 불러와 전역 변수에 동기화"""
     try:
         c = await redis_client.get(f"mtpond:setup:{user_no}")
         if c:
@@ -759,7 +755,6 @@ async def process_new_candidate_buys(
         if not analysis or not analysis["is_rebounding"]:
             continue
 
-        # ★ Redis에서 실시간 동기화된 RANGE_BUY_KRW 적용
         buy_amt = min(RANGE_BUY_KRW, available_krw)
         if buy_amt < MIN_ORDER_NOTIONAL_KRW:
             continue
@@ -844,7 +839,7 @@ async def monitor_positions(user_no: int, server_no: int):
         access_key, secret_key = row[0], row[1]
 
     ps = PositionState()
-    print("=== [MTF 1h+15m + Redis 설정 연동] 트레이딩 엔진 가동 ===")
+    print("=== [MTF 1h+15m + 손절 25% 초과 보호] 트레이딩 엔진 가동 ===")
     excluded = await get_excluded_markets(force_reload=True)
 
     # 초기 보유 코인 관리 등록
@@ -868,7 +863,6 @@ async def monitor_positions(user_no: int, server_no: int):
         try:
             loop_now = time.time()
 
-            # 15초 주기 Redis 설정 동기화
             if loop_now - last_cfg_sync >= CONTROLLER_POLL_SEC:
                 last_cfg_sync = loop_now
                 await sync_redis_config(user_no)
@@ -876,7 +870,6 @@ async def monitor_positions(user_no: int, server_no: int):
             excluded = await get_excluded_markets()
             raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
 
-            # 수동 매수/잔고 변동 실시간 동기화
             await sync_or_register_held_positions(access_key, secret_key, ps, raw_accounts, excluded)
 
             available_krw = Decimal("0")
@@ -923,7 +916,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     enriched = [p for p in enriched if p["market"] != mkt]
 
             active_count = len(enriched)
-            # ★ Redis에서 동기화된 MAX_ACTIVE_MARKETS 적용
             remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
 
             # [A] 매도 판단: 최종 방어 손절 및 고점 대비 이익 보존 트레일링
@@ -939,20 +931,25 @@ async def monitor_positions(user_no: int, server_no: int):
                 total_buys, _ = ps.get_buy_stats(market)
                 st = ps.update_or_init(market, pnl, avg_p)
 
+                # 1. 2회 물타기 소진 상태에서 최종 손절선(-6.5%) 도달 시 손절
+                # ★ [핵심 추가] 단, 손실률이 -25%보다 더 악화된 경우(-25% ~ -100%)에는 손절을 실행하지 않고 보호
                 if total_buys - 1 >= MAX_ADDITIONAL_BUYS and pnl <= FINAL_LOSS_CUT_RATE:
-                    print(f"🚨 [FINAL-DEFENSE] {market} 분할 매수 후 지지선 붕괴 최종 손절 실행 (PNL: {pnl}%)")
-                    await cancel_all_open_orders_for_market(access_key, secret_key, market)
-                    await asyncio.sleep(0.4)
-                    accs = await fetch_upbit_accounts(access_key, secret_key)
-                    for a in accs:
-                        if a.get("currency") == market.split("-")[1]:
-                            bal_dec = Decimal(str(a.get("balance", "0")))
-                            s_vol = quantize_volume(bal_dec)
-                            if s_vol and (s_vol * cur_p) >= MIN_ORDER_NOTIONAL_KRW:
-                                if LIVE_TRADING:
-                                    await order_market_sell(access_key, secret_key, market, s_vol)
-                                ps.mark_sold(market, reason="LOSS_CUT")
-                            break
+                    if pnl < MAX_LOSS_LIMIT_PCT:
+                        print(f"🛡️ [LOSS-PROTECT] {market} 손실률이 {pnl}%로 -25%를 초과하여 비정상 폭락/오류로 간주하고 손절을 보류합니다.")
+                    else:
+                        print(f"🚨 [FINAL-DEFENSE] {market} 분할 매수 후 지지선 붕괴 최종 손절 실행 (PNL: {pnl}%)")
+                        await cancel_all_open_orders_for_market(access_key, secret_key, market)
+                        await asyncio.sleep(0.4)
+                        accs = await fetch_upbit_accounts(access_key, secret_key)
+                        for a in accs:
+                            if a.get("currency") == market.split("-")[1]:
+                                bal_dec = Decimal(str(a.get("balance", "0")))
+                                s_vol = quantize_volume(bal_dec)
+                                if s_vol and (s_vol * cur_p) >= MIN_ORDER_NOTIONAL_KRW:
+                                    if LIVE_TRADING:
+                                        await order_market_sell(access_key, secret_key, market, s_vol)
+                                    ps.mark_sold(market, reason="LOSS_CUT")
+                                break
                     continue
 
                 raw_tp = st.get("dynamic_tp")
@@ -1003,7 +1000,6 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
     while True:
         try:
-            # Redis 설정 동기화
             await sync_redis_config(user_no)
 
             cfg = {}
