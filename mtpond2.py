@@ -956,27 +956,43 @@ async def get_dynamic_target_pnl(market: str, avg_price: Decimal) -> Decimal:
 
     return target_pnl
 
+
 # ============================================================
-# 11. 익절 및 손절 판단 엔진
+# 11. 익절 및 손절 판단 엔진 (대시세 분출 시 약익절 털림 방지 패치)
 # ============================================================
 def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Optional[str]]:
     peak = state["peak_pnl"]
     hard_tp_taken = state.get("hard_tp_taken", False)
     target_tp = state.get("dynamic_tp", Decimal("0.6"))
 
+    # 1. 목표가 도달 시 정상 익절
     if (not hard_tp_taken) and pnl >= target_tp:
         return True, f"DYNAMIC_TP {pnl}% >= {target_tp}%", "HARD_TP1"
 
+    # 2. 목표가의 75% 수준까지 도달했던 이력이 있는 경우
     check_arm = (target_tp * Decimal("0.75")).quantize(Decimal("0.01"))
     wait_gate = (target_tp * Decimal("0.85")).quantize(Decimal("0.01"))
 
     if peak >= check_arm:
+        # 목표가 바로 아래에서 지지 중이면 무조건 대기
         if pnl >= wait_gate:
             return False, f"WAIT_TP (pnl={pnl}% >= {wait_gate}% | 목표={target_tp}%)", None
 
-        # 약익절: +0.10% ~ +0.25% 구간 이익 보존
-        if Decimal("0.10") <= pnl <= Decimal("0.25"):
-            return True, f"WEAK_TP_EXIT (peak={peak}% -> now={pnl}% | 이익보존)", "WEAK_TP"
+        # ★ [개선] 약익절(WEAK_TP) 방어 조건:
+        # 피크가 목표가 부근(0.5% 이상)까지 갔다가 내려오는 상황이더라도,
+        # 단순히 0.18%로 밀렸다고 바로 던지지 않고 피크 대비 낙폭(Trailing Drop)을 확인!
+        # peak가 0.53%인데 0.18%까지 밀린 건 드롭이 0.35%p로 너무 큼 -> 단순 횡보/호가 흔들림에 털림 방지
+
+        # 1) 현재 수익률이 여전히 수수료(약 0.1%) 위이고,
+        # 2) 피크 대비 -0.20%p 이상 밀렸을 때만 '진짜 꺾임'으로 판단하여 청산
+        trail_drop = peak - pnl
+
+        # 피크 대비 0.25%p 이상 꺾이고, 현재 PNL이 0.12% ~ 0.25% 구간일 때만 작동
+        if trail_drop >= Decimal("0.25") and (Decimal("0.12") <= pnl <= Decimal("0.25")):
+            # ★ 만약 3분봉이 여전히 강한 양봉이거나 거래량이 터진 상태면 약익절 유보!
+            is_surging = state.get("momentum_surging", False)
+            if not is_surging:
+                return True, f"WEAK_TP_EXIT (peak={peak}% -> now={pnl}% | 드롭={trail_drop}%)", "WEAK_TP"
 
     return False, "", None
 
