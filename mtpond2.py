@@ -121,32 +121,58 @@ _candle_3m_cache: Dict[str, Tuple[float, bool]] = {}
 CANDLE_3M_CACHE_TTL = 30
 
 async def check_3m_candle_trend(market: str) -> bool:
+    """
+    3분봉 기준 하락 추세(밴드 하향 이탈 및 연속 음봉) 차단 및 확실한 반등 확인
+    """
     now = time.time()
     cached = _candle_3m_cache.get(market)
     if cached and (now - cached[0]) < CANDLE_3M_CACHE_TTL:
         return cached[1]
 
+    # 최근 5개의 3분봉을 조회하여 거시적 추세 확인
     url = "https://api.upbit.com/v1/candles/minutes/3"
-    params = {"market": market, "count": 2}
+    params = {"market": market, "count": 5}
 
     try:
         client = get_http_client()
         resp = await client.get(url, params=params)
         if resp.status_code == 200:
             candles = resp.json()
-            if isinstance(candles, list) and len(candles) >= 1:
-                c0 = candles[0]
-                o0 = Decimal(str(c0["opening_price"]))
-                c_price = Decimal(str(c0["trade_price"]))
+            if isinstance(candles, list) and len(candles) >= 4:
+                c0 = candles[0]  # 현재 봉
+                c1 = candles[1]  # 직전 봉
+                c2 = candles[2]  # 전전 봉
 
-                is_bullish = c_price >= o0
-                if len(candles) >= 2:
-                    c1 = candles[1]
-                    c1_close = Decimal(str(c1["trade_price"]))
-                    is_bullish = is_bullish and (c_price >= c1_close or (c_price - o0) / o0 >= Decimal("0.001"))
+                c0_close = Decimal(str(c0["trade_price"]))
+                c0_open = Decimal(str(c0["opening_price"]))
+                c1_close = Decimal(str(c1["trade_price"]))
+                c1_open = Decimal(str(c1["opening_price"]))
 
-                _candle_3m_cache[market] = (now, is_bullish)
-                return is_bullish
+                # 1) 현재 봉이 명확한 양봉이어야 함 (종가 > 시가)
+                if c0_close <= c0_open:
+                    _candle_3m_cache[market] = (now, False)
+                    return False
+
+                # 2) [계단식 하락 차단] 직전 2개 봉이 모두 음봉이고 고점이 계속 낮아지는 중이면 차단
+                if c1_close < c1_open and Decimal(str(c2["trade_price"])) < Decimal(str(c2["opening_price"])):
+                    # 현재 양봉의 종가가 직전 음봉의 시가(절반 이상)를 회복하지 못했다면 가짜 반등
+                    c1_mid = (c1_open + c1_close) / Decimal("2")
+                    if c0_close < c1_mid:
+                        _candle_3m_cache[market] = (now, False)
+                        return False
+
+                # 3) 최근 4개 봉의 단순 평균(단기 이평)보다 현재가가 위에 있어야 함
+                closes = [Decimal(str(c["trade_price"])) for c in candles[:4]]
+                sma_short = sum(closes) / Decimal(str(len(closes)))
+                if c0_close < sma_short:
+                    _candle_3m_cache[market] = (now, False)
+                    return False
+
+                # 4) 직전 음봉의 종가보다 현재가가 확실히 위에 형성되어야 함
+                is_uptrend = c0_close > c1_close
+
+                _candle_3m_cache[market] = (now, is_uptrend)
+                return is_uptrend
     except Exception as e:
         print(f"[CANDLE-3M][WARN] {market} 3분봉 조회 실패: {e}")
 
