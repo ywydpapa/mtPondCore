@@ -126,82 +126,205 @@ COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "60"))            # 정상 �
 COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "1800")) # 손절/급락방어 후 30분
 
 # ============================================================
+# [신규] 기피 패턴(피뢰침, 밴드하락, 과이격, 거래절벽) 탐지 엔진
+# ============================================================
+_avoidance_cache: Dict[str, Tuple[float, bool, str]] = {}
+AVOIDANCE_CACHE_TTL = 20  # 20초 캐시
+
+async def check_avoidance_patterns(market: str) -> Tuple[bool, str]:
+    """
+    특정 기피 패턴 발견 시 진입 차단 (is_bad_pattern, reason)
+    - True 반환 시: 기피 패턴 감지 -> 진입 금지
+    - False 반환 시: 정상 차트 -> 통과
+    """
+    now = time.time()
+    cached = _avoidance_cache.get(market)
+    if cached and (now - cached[0]) < AVOIDANCE_CACHE_TTL:
+        return cached[1], cached[2]
+
+    # 최근 10개 3분봉(30분 흐름) 조회
+    url = "https://api.upbit.com/v1/candles/minutes/3"
+    params = {"market": market, "count": 10}
+
+    try:
+        client = get_http_client()
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            return True, "API_ERROR_SAFE_SKIP"
+
+        candles = resp.json()
+        if not isinstance(candles, list) or len(candles) < 8:
+            return True, "INSUFFICIENT_CANDLES"
+
+        c0 = candles[0]
+        c0_price = Decimal(str(c0["trade_price"]))
+        c0_open = Decimal(str(c0["opening_price"]))
+        c0_vol = Decimal(str(c0.get("candle_acc_trade_volume", c0.get("trade_volume", "0"))))
+
+        # 볼린저 밴드(20, 2) 계산용 최근 종가들
+        closes = [Decimal(str(c["trade_price"])) for c in candles]
+        sma20 = sum(closes) / Decimal(str(len(closes)))
+        variance = sum((c - sma20) ** 2 for c in closes) / Decimal(str(len(closes)))
+        std_dev = Decimal(str(math.sqrt(float(variance))))
+        bb_upper = sma20 + (std_dev * Decimal("2"))
+        bb_lower = sma20 - (std_dev * Decimal("2"))
+
+        # -------------------------------------------------------------
+        # 1. [기피 패턴 1] 피뢰침 덤핑 캔들 검출 (Spike & Dump)
+        # -------------------------------------------------------------
+        for past_c in candles[1:5]:  # 최근 4봉 이내
+            p_open = Decimal(str(past_c["opening_price"]))
+            p_close = Decimal(str(past_c["trade_price"]))
+            p_high = Decimal(str(past_c["high_price"]))
+
+            # 시가 대비 -2.0% 이상 장대 음봉
+            if p_open > 0:
+                drop_rate = (p_close - p_open) / p_open * Decimal("100")
+                if drop_rate <= Decimal("-2.0"):
+                    _avoidance_cache[market] = (now, True, f"DUMP_CANDLE({drop_rate:.1f}%)")
+                    return True, f"DUMP_CANDLE({drop_rate:.1f}%)"
+
+            # 고점 대비 -3.0% 이상 급락한 피뢰침 윗꼬리 캔들
+            if p_high > 0:
+                spike_drop = (p_close - p_high) / p_high * Decimal("100")
+                if spike_drop <= Decimal("-3.0"):
+                    _avoidance_cache[market] = (now, True, f"SPIKE_DUMP({spike_drop:.1f}%)")
+                    return True, f"SPIKE_DUMP({spike_drop:.1f}%)"
+
+        # -------------------------------------------------------------
+        # 2. [기피 패턴 2] 볼린저 밴드 하단 계단식 하락 (Band-Walk Down)
+        # -------------------------------------------------------------
+        # 주가가 중심선 아래이면서, 하단 밴드 1.0% 이내에 붙어 내려가는 구간
+        if c0_price < sma20:
+            dist_from_lower = (c0_price - bb_lower) / bb_lower * Decimal("100")
+            # 직전 3개 봉 중 2개 이상이 음봉이고 하단 밴드와 맞닿아 있을 때
+            down_candles = sum(1 for c in candles[:3] if Decimal(str(c["trade_price"])) < Decimal(str(c["opening_price"])))
+            if down_candles >= 2 and dist_from_lower < Decimal("0.8"):
+                _avoidance_cache[market] = (now, True, "BAND_WALK_DOWN")
+                return True, "BAND_WALK_DOWN"
+
+        # -------------------------------------------------------------
+        # 3. [기피 패턴 3] 상단 밴드 과이격 과열 (Upper Band Over-Extension)
+        # -------------------------------------------------------------
+        # 상단 밴드보다 1.5% 이상 높게 떠 있는 상태 (꼭대기 추격 매수 방지)
+        if bb_upper > 0 and c0_price > bb_upper:
+            over_pct = (c0_price - bb_upper) / bb_upper * Decimal("100")
+            if over_pct >= Decimal("1.5"):
+                _avoidance_cache[market] = (now, True, f"UPPER_OVER_EXTENDED(+{over_pct:.1f}%)")
+                return True, f"UPPER_OVER_EXTENDED(+{over_pct:.1f}%)"
+
+        # -------------------------------------------------------------
+        # 4. [기피 패턴 4] 거래량 절벽 횡보 (Volume Cliff)
+        # -------------------------------------------------------------
+        # 과거 5개 봉 중 최대 거래량 대비 현재 봉 거래량이 15% 미만으로 급감한 상태에서 중심선 아래일 때
+        past_vols = [Decimal(str(c.get("candle_acc_trade_volume", c.get("trade_volume", "0")))) for c in candles[1:6]]
+        max_vol = max(past_vols) if past_vols else Decimal("0")
+        if max_vol > 0 and (c0_vol < max_vol * Decimal("0.15")) and (c0_price < sma20):
+            _avoidance_cache[market] = (now, True, "VOLUME_CLIFF")
+            return True, "VOLUME_CLIFF"
+
+        _avoidance_cache[market] = (now, False, "CLEAN")
+        return False, "CLEAN"
+
+    except Exception as e:
+        print(f"[AVOIDANCE][WARN] {market} 기피 패턴 분석 예외: {e}")
+        return False, "ERROR_BYPASS"
+
+# ============================================================
 # [신규 진입 필터 강화] 3분봉 수급 및 이평선 돌파 확인 엔진
 # ============================================================
 _candle_3m_cache: Dict[str, Tuple[float, bool]] = {}
 CANDLE_3M_CACHE_TTL = 30
 
+
 async def check_3m_candle_trend(market: str) -> bool:
     """
     3분봉 기준 강화된 진입 조건:
-    1. 현재 3분봉이 확실한 양봉 (몸통 크기 >= 0.15%)
-    2. 현재가가 최근 4개 봉 평균(단기 이평) 위
-    3. 직전 봉이 음봉이었을 경우, 직전 음봉의 중심값(50%) 이상을 뚫고 올라왔는지 확인
-    4. 거래량이 실린 반등인지 확인 (현재 봉 거래량 > 직전 봉 거래량의 70%)
+    1. 현재 3분봉이 확실한 양봉 (몸통 >= 0.15%)
+    2. 최근 3개 캔들 중 피뢰침 덤핑(장대 음봉 / 긴 윗꼬리 투매) 이력 검출 시 진입 금지
+    3. 현재가가 단기 이평선(4개 봉 평균) 위
+    4. 거래량이 동반된 안정적 우상향인지 확인
     """
     now = time.time()
     cached = _candle_3m_cache.get(market)
     if cached and (now - cached[0]) < CANDLE_3M_CACHE_TTL:
         return cached[1]
 
+    # 최근 6개 봉을 확인하여 설거지 피뢰침 패턴 감지
     url = "https://api.upbit.com/v1/candles/minutes/3"
-    params = {"market": market, "count": 5}
+    params = {"market": market, "count": 6}
 
     try:
         client = get_http_client()
         resp = await client.get(url, params=params)
         if resp.status_code == 200:
             candles = resp.json()
-            if isinstance(candles, list) and len(candles) >= 4:
+            if isinstance(candles, list) and len(candles) >= 5:
                 c0 = candles[0]  # 현재 3분봉
-                c1 = candles[1]  # 직전 3분봉
-                c2 = candles[2]  # 전전 3분봉
-
                 c0_close = Decimal(str(c0["trade_price"]))
                 c0_open = Decimal(str(c0["opening_price"]))
+                c0_high = Decimal(str(c0["high_price"]))
+                c0_low = Decimal(str(c0["low_price"]))
                 c0_vol = Decimal(str(c0.get("candle_acc_trade_volume", c0.get("trade_volume", "0"))))
 
+                # ---------------------------------------------------------
+                # [방어막 1] 피뢰침 / 장대 음봉(설거지 덤핑) 최근 이력 검사
+                # ---------------------------------------------------------
+                # 최근 4개 봉(직전 봉들) 중 -2.0% 이상의 대형 장대음봉이나
+                # 윗꼬리가 비정상적으로 긴 캔들이 있었다면 진입 즉시 차단
+                for past_c in candles[1:4]:
+                    p_open = Decimal(str(past_c["opening_price"]))
+                    p_close = Decimal(str(past_c["trade_price"]))
+                    p_high = Decimal(str(past_c["high_price"]))
+                    p_low = Decimal(str(past_c["low_price"]))
 
-                c1_close = Decimal(str(c1["trade_price"]))
-                c1_open = Decimal(str(c1["opening_price"]))
-                c1_vol = Decimal(str(c1.get("candle_acc_trade_volume", c1.get("trade_volume", "0"))))
+                    # 1) 시가 대비 종가가 -2.0% 이상 폭락한 장대 음봉 발견 시
+                    if p_open > 0:
+                        drop_pct = (p_close - p_open) / p_open * Decimal("100")
+                        if drop_pct <= Decimal("-2.0"):
+                            # print(f"[GUARD][DUMP] {market} 최근 3분봉 내 장대 음봉({drop_pct:.2f}%) 감지 -> 진입 차단")
+                            _candle_3m_cache[market] = (now, False)
+                            return False
 
-                # 1) 현재 봉 몸통 크기 검증 (현재 봉 0.15% 이상 양봉이거나, 직전 봉이 0.25% 이상 강한 양봉이면서 현재 봉 양봉 유지)
-                body_pct = (c0_close - c0_open) / c0_open * Decimal("100")
-                c1_body_pct = (c1_close - c1_open) / c1_open * Decimal("100")
+                    # 2) 고점 대비 종가가 -3.0% 이상 무너진 윗꼬리 피뢰침 캔들 발견 시
+                    if p_high > 0:
+                        spike_dump = (p_close - p_high) / p_high * Decimal("100")
+                        if spike_dump <= Decimal("-3.0"):
+                            # print(f"[GUARD][SPIKE] {market} 피뢰침 덤핑({spike_dump:.2f}%) 감지 -> 진입 차단")
+                            _candle_3m_cache[market] = (now, False)
+                            return False
 
-                is_c0_strong = body_pct >= Decimal("0.15")
-                is_c1_continuation = (c1_body_pct >= Decimal("0.25")) and (c0_close >= c0_open) and (
-                            c0_close >= c1_close)
+                # ---------------------------------------------------------
+                # [방어막 2] 현재 캔들 양봉 강도 검증
+                # ---------------------------------------------------------
+                body_pct = (c0_close - c0_open) / c0_open * Decimal("100") if c0_open > 0 else Decimal("0")
 
-                if not (is_c0_strong or is_c1_continuation):
+                # 현재 봉이 음봉이거나 몸통이 0.15% 미만인 미세 도지형 캔들이면 탈락
+                if body_pct < Decimal("0.15"):
                     _candle_3m_cache[market] = (now, False)
                     return False
 
-                # 2) 최근 4개 봉 평균(단기 이평선) 위인지 검증
+                # 윗꼬리가 너무 긴 경우(고점 대비 밀린 상태) 진입 금지
+                # 윗꼬리 길이 > 몸통 길이의 1.2배 이상이면 매도세 우위로 판정
+                upper_tail = c0_high - c0_close
+                body_size = c0_close - c0_open
+                if upper_tail > body_size * Decimal("1.2"):
+                    _candle_3m_cache[market] = (now, False)
+                    return False
+
+                # ---------------------------------------------------------
+                # [방어막 3] 단기 이동평균선 지지 확인
+                # ---------------------------------------------------------
                 closes = [Decimal(str(c["trade_price"])) for c in candles[:4]]
                 sma_short = sum(closes) / Decimal("4")
                 if c0_close <= sma_short:
                     _candle_3m_cache[market] = (now, False)
                     return False
 
-                # 3) 직전 캔들이 음봉이었다면, 음봉 몸통 중심값 이상 회복했는지 검증
-                if c1_close < c1_open:
-                    c1_mid = (c1_open + c1_close) / Decimal("2")
-                    if c0_close < c1_mid:
-                        _candle_3m_cache[market] = (now, False)
-                        return False
-
-                # 4) 직전 2개 연속 음봉으로 흘러내리던 밴드워크 하락장 직후인지 검증
-                c2_close = Decimal(str(c2["trade_price"]))
-                c2_open = Decimal(str(c2["opening_price"]))
-                if (c1_close < c1_open) and (c2_close < c2_open):
-                    # 연속 음봉 후 첫 양봉일 땐 직전 음봉의 시가(완전 장악)를 넘어서야 인정
-                    if c0_close < c1_open:
-                        _candle_3m_cache[market] = (now, False)
-                        return False
-
-                # 5) 거래량 동반 여부 (완전 꼬리없는 거래량 절벽 양봉 배제)
+                # ---------------------------------------------------------
+                # [방어막 4] 거래량 동반 검증
+                # ---------------------------------------------------------
+                c1_vol = Decimal(str(candles[1].get("candle_acc_trade_volume", candles[1].get("trade_volume", "0"))))
                 if c1_vol > 0 and (c0_vol < c1_vol * Decimal("0.7")):
                     _candle_3m_cache[market] = (now, False)
                     return False
@@ -1208,16 +1331,21 @@ async def process_new_candidate_buys(
 
         market = item["market"]
 
-        if market in excluded:
-            continue
-
-        if ps.buy_info.get(market):
-            continue
-
+        # 1. 30분 손절 쿨다운 확인
         if await ps.recently_sold(market):
             continue
 
-        # 3분봉 상승세 검증 (음봉 시 진입 차단)
+        # 2. 거래 제외 코인 배제
+        if market in excluded or ps.buy_info.get(market):
+            continue
+
+        # ★ [추가] 기피 패턴 검출 (피뢰침, 밴드 하향, 과이격, 거래절벽)
+        is_avoid, avoid_reason = await check_avoidance_patterns(market)
+        if is_avoid:
+            # print(f"[BUY-NEW][SKIP] {market} 기피 패턴 감지: {avoid_reason}")
+            continue
+
+        # 3. 3분봉 상승 전환 검증
         is_uptrend_3m = await check_3m_candle_trend(market)
         if not is_uptrend_3m:
             continue
