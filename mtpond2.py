@@ -1561,6 +1561,10 @@ async def monitor_positions(user_no: int, server_no: int):
                 cur_p = pos["current_price"]
                 st = ps.update_or_init(market, pnl, pos["avg_buy_price"])
 
+                # 현재 3분봉이 여전히 뻗어나가는 양봉인지 확인
+                is_uptrend = await check_3m_candle_trend(market)
+                st["momentum_surging"] = is_uptrend  # 상승 탄력이 살아있으면 True
+
                 # -------------------------------------------------------------
                 # 1. 캔들 진폭 기반 동적 손절선 계산 (최소 -1.0% 바닥 보장)
                 # -------------------------------------------------------------
