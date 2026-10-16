@@ -115,21 +115,24 @@ COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "60"))            # 정상 �
 COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "1800")) # 손절/급락방어 후 30분
 
 # ============================================================
-# [신규 진입 필터] 3분봉 상승 추세 판별 엔진
+# [신규 진입 필터 강화] 3분봉 수급 및 이평선 돌파 확인 엔진
 # ============================================================
 _candle_3m_cache: Dict[str, Tuple[float, bool]] = {}
 CANDLE_3M_CACHE_TTL = 30
 
 async def check_3m_candle_trend(market: str) -> bool:
     """
-    3분봉 기준 하락 추세(밴드 하향 이탈 및 연속 음봉) 차단 및 확실한 반등 확인
+    3분봉 기준 강화된 진입 조건:
+    1. 현재 3분봉이 확실한 양봉 (몸통 크기 >= 0.15%)
+    2. 현재가가 최근 4개 봉 평균(단기 이평) 위
+    3. 직전 봉이 음봉이었을 경우, 직전 음봉의 중심값(50%) 이상을 뚫고 올라왔는지 확인
+    4. 거래량이 실린 반등인지 확인 (현재 봉 거래량 > 직전 봉 거래량의 70%)
     """
     now = time.time()
     cached = _candle_3m_cache.get(market)
     if cached and (now - cached[0]) < CANDLE_3M_CACHE_TTL:
         return cached[1]
 
-    # 최근 5개의 3분봉을 조회하여 거시적 추세 확인
     url = "https://api.upbit.com/v1/candles/minutes/3"
     params = {"market": market, "count": 5}
 
@@ -139,42 +142,56 @@ async def check_3m_candle_trend(market: str) -> bool:
         if resp.status_code == 200:
             candles = resp.json()
             if isinstance(candles, list) and len(candles) >= 4:
-                c0 = candles[0]  # 현재 봉
-                c1 = candles[1]  # 직전 봉
-                c2 = candles[2]  # 전전 봉
+                c0 = candles[0]  # 현재 3분봉
+                c1 = candles[1]  # 직전 3분봉
+                c2 = candles[2]  # 전전 3분봉
 
                 c0_close = Decimal(str(c0["trade_price"]))
                 c0_open = Decimal(str(c0["opening_price"]))
+                c0_vol = Decimal(str(c0["candle_acc_trade_volume"]))
+
                 c1_close = Decimal(str(c1["trade_price"]))
                 c1_open = Decimal(str(c1["opening_price"]))
+                c1_vol = Decimal(str(c1["candle_acc_trade_volume"]))
 
-                # 1) 현재 봉이 명확한 양봉이어야 함 (종가 > 시가)
-                if c0_close <= c0_open:
+                # 1) 현재 봉이 명확한 양봉인지 (몸통 0.15% 이상)
+                body_pct = (c0_close - c0_open) / c0_open * Decimal("100")
+                if body_pct < Decimal("0.15"):
                     _candle_3m_cache[market] = (now, False)
                     return False
 
-                # 2) [계단식 하락 차단] 직전 2개 봉이 모두 음봉이고 고점이 계속 낮아지는 중이면 차단
-                if c1_close < c1_open and Decimal(str(c2["trade_price"])) < Decimal(str(c2["opening_price"])):
-                    # 현재 양봉의 종가가 직전 음봉의 시가(절반 이상)를 회복하지 못했다면 가짜 반등
+                # 2) 최근 4개 봉 평균(단기 이평선) 위인지 검증
+                closes = [Decimal(str(c["trade_price"])) for c in candles[:4]]
+                sma_short = sum(closes) / Decimal("4")
+                if c0_close <= sma_short:
+                    _candle_3m_cache[market] = (now, False)
+                    return False
+
+                # 3) 직전 캔들이 음봉이었다면, 음봉 몸통 중심값 이상 회복했는지 검증
+                if c1_close < c1_open:
                     c1_mid = (c1_open + c1_close) / Decimal("2")
                     if c0_close < c1_mid:
                         _candle_3m_cache[market] = (now, False)
                         return False
 
-                # 3) 최근 4개 봉의 단순 평균(단기 이평)보다 현재가가 위에 있어야 함
-                closes = [Decimal(str(c["trade_price"])) for c in candles[:4]]
-                sma_short = sum(closes) / Decimal(str(len(closes)))
-                if c0_close < sma_short:
+                # 4) 직전 2개 연속 음봉으로 흘러내리던 밴드워크 하락장 직후인지 검증
+                c2_close = Decimal(str(c2["trade_price"]))
+                c2_open = Decimal(str(c2["opening_price"]))
+                if (c1_close < c1_open) and (c2_close < c2_open):
+                    # 연속 음봉 후 첫 양봉일 땐 직전 음봉의 시가(완전 장악)를 넘어서야 인정
+                    if c0_close < c1_open:
+                        _candle_3m_cache[market] = (now, False)
+                        return False
+
+                # 5) 거래량 동반 여부 (완전 꼬리없는 거래량 절벽 양봉 배제)
+                if c1_vol > 0 and (c0_vol < c1_vol * Decimal("0.7")):
                     _candle_3m_cache[market] = (now, False)
                     return False
 
-                # 4) 직전 음봉의 종가보다 현재가가 확실히 위에 형성되어야 함
-                is_uptrend = c0_close > c1_close
-
-                _candle_3m_cache[market] = (now, is_uptrend)
-                return is_uptrend
+                _candle_3m_cache[market] = (now, True)
+                return True
     except Exception as e:
-        print(f"[CANDLE-3M][WARN] {market} 3분봉 조회 실패: {e}")
+        print(f"[CANDLE-3M][WARN] {market} 3분봉 진입 검증 실패: {e}")
 
     return False
 
@@ -431,6 +448,67 @@ def apply_dynamic_config(cfg: dict):
 
     if changes:
         print("[CFG] 동적 설정 업데이트 반영:\n  " + "\n  ".join(changes))
+
+
+# ============================================================
+# [듀얼 타임프레임] 3분봉 & 10분봉 동시 하락 국면 판정 엔진
+# ============================================================
+_dual_trend_cache: Dict[str, Tuple[float, bool]] = {}
+
+
+async def check_dual_timeframe_downtrend(market: str) -> bool:
+    """
+    3분봉과 10분봉이 둘 다 하락 추세(Downtrend)인지 동시 판별
+    True 반환 시: 두 타임프레임 모두 하락 국면 -> 확실한 손절 타이밍
+    False 반환 시: 한쪽이라도 반등/지지가 남아있음 -> 섣부른 손절 방지
+    """
+    now = time.time()
+    cached = _dual_trend_cache.get(market)
+    if cached and (now - cached[0]) < 15:  # 15초 캐시
+        return cached[1]
+
+    client = get_http_client()
+    down_3m = False
+    down_10m = False
+
+    try:
+        # 1. 3분봉 확인 (최근 3개)
+        r3 = await client.get("https://api.upbit.com/v1/candles/minutes/3", params={"market": market, "count": 3})
+        if r3.status_code == 200:
+            c3 = r3.json()
+            if len(c3) >= 2:
+                c0_price = Decimal(str(c3[0]["trade_price"]))
+                c0_open = Decimal(str(c3[0]["opening_price"]))
+                c1_close = Decimal(str(c3[1]["trade_price"]))
+                # 3분봉이 음봉이거나 직전 종가보다 아래
+                if (c0_price < c0_open) or (c0_price < c1_close):
+                    down_3m = True
+
+        # 2. 10분봉 확인 (최근 3개)
+        r10 = await client.get("https://api.upbit.com/v1/candles/minutes/10", params={"market": market, "count": 3})
+        if r10.status_code == 200:
+            c10 = r10.json()
+            if len(c10) >= 2:
+                c10_0 = c10[0]
+                c10_1 = c10[1]
+                p10_0 = Decimal(str(c10_0["trade_price"]))
+                o10_0 = Decimal(str(c10_0["opening_price"]))
+                l10_1 = Decimal(str(c10_1["low_price"]))  # 직전 10분봉 저점
+
+                # 10분봉이 음봉이면서 직전 10분봉 저점을 깨고 내려가는 국면
+                if (p10_0 < o10_0) and (p10_0 <= l10_1):
+                    down_10m = True
+
+        # 3분봉과 10분봉이 둘 다 하락 추세일 때만 True
+        is_both_falling = down_3m and down_10m
+        _dual_trend_cache[market] = (now, is_both_falling)
+        return is_both_falling
+
+    except Exception as e:
+        print(f"[DUAL-TF][WARN] {market} 듀얼 하락 추세 조회 실패: {e}")
+
+    # 조회 실패 시에는 안전하게 손절 보류
+    return False
 
 # ============================================================
 # 6. Exclude Markets (거래 제외 코인 관리)
@@ -1447,12 +1525,34 @@ async def monitor_positions(user_no: int, server_no: int):
                 cur_p = pos["current_price"]
                 st = ps.update_or_init(market, pnl, pos["avg_buy_price"])
 
-                # 1. 캔들 진폭 초과 급락 긴급 손절 (Panic Exit)
+                # =============================================================
+                # 1. 캔들 진폭 기반 동적 손절선 계산 (최소 -1.0% 보장)
+                # =============================================================
                 avg_vol = await get_candle_volatility(market, unit=10, count=10)
-                panic_threshold = -(avg_vol * PANIC_DROP_MULTIPLIER)
 
-                if pnl <= panic_threshold:
-                    print(f"\n🚨 [PANIC-EXIT] {market} 캔들 진폭 초과 급락 감지! PNL: {pnl}% (임계치: {panic_threshold}%)")
+                # 진폭 기반 임계치 계산 (단, 너무 얕은 손절 방지를 위해 최소 -1.0% 바닥 강제)
+                calculated_cut = -(avg_vol * Decimal("1.5"))
+                panic_threshold = min(calculated_cut, Decimal("-1.0"))  # 최소 -1.0% 이하에서만 작동
+
+                # =============================================================
+                # 2. 듀얼 타임프레임(3m & 10m) 하락 국면 검증 손절
+                # =============================================================
+                is_panic_cut = (pnl <= panic_threshold)
+                is_fixed_cut = (ENABLE_STOP and pnl <= LOSS_CUT_RATE)
+
+                # 손절 라인에 걸렸을 때 바로 자르지 않고 10분봉/3분봉 동시 하락인지 확인
+                if is_panic_cut or is_fixed_cut:
+                    # 두 타임프레임 모두 하락 국면인지 확인
+                    is_dual_downtrend = await check_dual_timeframe_downtrend(market)
+
+                    # -3.5%를 초과하는 절대 마지노선이 아니라면, 10분봉이 지지하고 있을 경우 손절 유보!
+                    if not is_dual_downtrend and pnl > Decimal("-3.5"):
+                        # print(f"[LOSS-HOLD] {market} PNL: {pnl}% (임계치 도달했으나 10분봉 지지 확인 -> 손절 유보)")
+                        continue
+
+                    # 둘 다 하락 국면 확정 시 손절 집행
+                    reason_tag = "PANIC_EXIT" if is_panic_cut else "LOSS_CUT"
+                    print(f"\n🚨 [{reason_tag}] {market} 3m & 10m 동시 하락 국면 확정! PNL: {pnl}% (손절 임계치: {panic_threshold}%)")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
                     await asyncio.sleep(0.4)
 
@@ -1464,10 +1564,11 @@ async def monitor_positions(user_no: int, server_no: int):
                             if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
                                 if LIVE_TRADING:
                                     resp = await order_market_sell(access_key, secret_key, market, sell_vol)
-                                    print(f"   ▶ 시장가 긴급 탈출 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
+                                    print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
                                 else:
-                                    print(f"   ▶ [DRY] 시장가 긴급 탈출 시뮬레이션: 수량={sell_vol}")
-                                ps.mark_sold(market, reason="PANIC_EXIT")
+                                    print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
+                                # 30분 재매수 금지 쿨다운 적용
+                                ps.mark_sold(market, reason=reason_tag)
                             break
                     print("──────────────────────────────────────────────\n")
                     continue
