@@ -892,10 +892,12 @@ def decide_sell(market: str, pnl: Decimal, state: dict) -> Tuple[bool, str, Opti
 
     return False, "", None
 
+
 # ============================================================
-# 12. 추가 매수 프로세스
+# 12. 추가 매수 프로세스 (반등 확인형 물타기 & 손절 우선 적용)
 # ============================================================
 ADDITIONAL_BUY_COOLDOWN_SEC = int(os.getenv("ADDITIONAL_BUY_COOLDOWN_SEC", "120"))
+
 
 async def process_additional_buys(
         access_key: str,
@@ -932,18 +934,21 @@ async def process_additional_buys(
         if market in excluded or pnl is None or cur_price is None:
             continue
 
-        # 손절/방어 쿨다운 중인 코인은 추가 매수 즉시 건너뜀
+        # 쿨다운 중인 코인은 추가 매수 제외
         if await ps.recently_sold(market):
             continue
 
-        if pnl >= Decimal("0") or pnl > drop_target:
-            continue
-
-        # 캔들 진폭 초과 급락 구간 긴급 시장가 탈출
+        # -------------------------------------------------------------
+        # [최우선] 손절 라인 및 캔들 진폭 초과 급락 시 추가 매수 금지 및 즉시 탈출
+        # -------------------------------------------------------------
         avg_vol = await get_candle_volatility(market, unit=10, count=10)
         panic_threshold = -(avg_vol * PANIC_DROP_MULTIPLIER)
-        if pnl <= panic_threshold:
-            print(f"\n🚨 [ADD-BUY-CHECK][PANIC] {market} 급락 임계치 초과 (PNL: {pnl}% <= {panic_threshold}%) → 긴급 탈출 실행")
+
+        # 1) 진폭 초과 급락 또는 2) 설정된 손절 라인(LOSS_CUT_RATE) 이하 도달 시
+        if pnl <= panic_threshold or (ENABLE_STOP and pnl <= LOSS_CUT_RATE):
+            reason_tag = "PANIC_EXIT" if pnl <= panic_threshold else "LOSS_CUT"
+            print(f"\n🚨 [ADD-BUY-ABORT][{reason_tag}] {market} 손절선 도달로 추가 매수 중단 및 긴급 청산 (PNL: {pnl}%)")
+
             await cancel_all_open_orders_for_market(access_key, secret_key, market)
             await asyncio.sleep(0.3)
 
@@ -956,13 +961,28 @@ async def process_additional_buys(
                     if sell_vol * cur_price >= MIN_ORDER_NOTIONAL_KRW:
                         if LIVE_TRADING:
                             resp = await order_market_sell(access_key, secret_key, market, sell_vol)
-                            print(f"   ▶ 시장가 긴급 탈출 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
+                            print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
                         else:
-                            print(f"   ▶ [DRY] 시장가 긴급 탈출 시뮬레이션: 수량={sell_vol}")
-                        ps.mark_sold(market, reason="PANIC_EXIT")
+                            print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
+                        ps.mark_sold(market, reason=reason_tag)
                     break
             continue
 
+        # 아직 하락 폭 기준선(-2.2% 등)에 도달하지 않은 경우 스킵
+        if pnl >= Decimal("0") or pnl > drop_target:
+            continue
+
+        # -------------------------------------------------------------
+        # [핵심] 하락 목표치에 도달했어도 "상승/반등 신호(3분봉)" 확인 전까지 대기
+        # -------------------------------------------------------------
+        is_rebounding = await check_3m_candle_trend(market)
+        if not is_rebounding:
+            # print(f"[BUY-ADD][WAIT] {market} pnl={pnl}% 도달했으나 3분봉 음봉/하락 진행 중 → 반등 확인 전까지 추가 매수 보류")
+            continue
+
+        # -------------------------------------------------------------
+        # 누적 투자 한도 및 횟수 검증
+        # -------------------------------------------------------------
         total_buys, total_invested = ps.get_buy_stats(market)
 
         if total_invested <= 0:
@@ -997,6 +1017,7 @@ async def process_additional_buys(
             if abs(cur_price - last_add_price) < tick_unit:
                 continue
 
+        # 직전 추가 매수 시점보다 최소 -0.8% 이상 더 하락한 상태에서 반등할 때만 유효
         if last_add_pnl is not None and (pnl - last_add_pnl) > Decimal("-0.8"):
             continue
 
@@ -1013,14 +1034,17 @@ async def process_additional_buys(
             if buy_amt < MIN_ORDER_NOTIONAL_KRW:
                 continue
 
+        # -------------------------------------------------------------
+        # 반등 확인형 추가 매수 실행
+        # -------------------------------------------------------------
         try:
             if LIVE_TRADING:
                 resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
                 print(
-                    f"[BUY-ADD] {market} 추가 매수 완료! pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원, 경과:{int(elapsed_sec)}초) amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원 (uuid={resp.get('uuid')})")
+                    f"[BUY-ADD] {market} 반등 확인 추가 매수 완료! pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원, 경과:{int(elapsed_sec)}초) amt={buy_amt} | 누적: {total_invested + buy_amt}/{max_cap}원 (uuid={resp.get('uuid')})")
             else:
                 print(
-                    f"[BUY-ADD][DRY] {market} 추가 매수: pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원) amt={buy_amt}")
+                    f"[BUY-ADD][DRY] {market} 반등 확인 추가 매수: pnl={pnl}% (이전가:{last_add_price} -> 현재가:{cur_price}원) amt={buy_amt}")
 
             ps.record_buy(market, buy_amt)
             st["last_additional_buy_ts"] = now
