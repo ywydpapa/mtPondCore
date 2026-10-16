@@ -70,9 +70,20 @@ _http_client: Optional[httpx.AsyncClient] = None
 
 def get_http_client() -> httpx.AsyncClient:
     global _http_client
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0))
     return _http_client
+
+async def close_http_client():
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
 
 # ============================================================
 # 4. STATIC CONFIG (설정 및 신규 조건)
@@ -148,15 +159,22 @@ async def check_3m_candle_trend(market: str) -> bool:
 
                 c0_close = Decimal(str(c0["trade_price"]))
                 c0_open = Decimal(str(c0["opening_price"]))
-                c0_vol = Decimal(str(c0["candle_acc_trade_volume"]))
+                c0_vol = Decimal(str(c0.get("candle_acc_trade_volume", c0.get("trade_volume", "0"))))
+
 
                 c1_close = Decimal(str(c1["trade_price"]))
                 c1_open = Decimal(str(c1["opening_price"]))
-                c1_vol = Decimal(str(c1["candle_acc_trade_volume"]))
+                c1_vol = Decimal(str(c1.get("candle_acc_trade_volume", c1.get("trade_volume", "0"))))
 
-                # 1) 현재 봉이 명확한 양봉인지 (몸통 0.15% 이상)
+                # 1) 현재 봉 몸통 크기 검증 (현재 봉 0.15% 이상 양봉이거나, 직전 봉이 0.25% 이상 강한 양봉이면서 현재 봉 양봉 유지)
                 body_pct = (c0_close - c0_open) / c0_open * Decimal("100")
-                if body_pct < Decimal("0.15"):
+                c1_body_pct = (c1_close - c1_open) / c1_open * Decimal("100")
+
+                is_c0_strong = body_pct >= Decimal("0.15")
+                is_c1_continuation = (c1_body_pct >= Decimal("0.25")) and (c0_close >= c0_open) and (
+                            c0_close >= c1_close)
+
+                if not (is_c0_strong or is_c1_continuation):
                     _candle_3m_cache[market] = (now, False)
                     return False
 
@@ -458,48 +476,41 @@ _dual_trend_cache: Dict[str, Tuple[float, bool]] = {}
 
 async def check_dual_timeframe_downtrend(market: str) -> bool:
     """
-    3분봉과 10분봉이 둘 다 하락 추세(Downtrend)인지 동시 판별
-    True 반환 시: 두 타임프레임 모두 하락 국면 -> 확실한 손절 타이밍
-    False 반환 시: 한쪽이라도 반등/지지가 남아있음 -> 섣부른 손절 방지
+    3분봉과 10분봉을 병렬 조회하여 둘 다 하락 추세(Downtrend)인지 신속 판별
     """
     now = time.time()
     cached = _dual_trend_cache.get(market)
-    if cached and (now - cached[0]) < 15:  # 15초 캐시
+    if cached and (now - cached[0]) < 15:
         return cached[1]
 
     client = get_http_client()
-    down_3m = False
-    down_10m = False
-
     try:
-        # 1. 3분봉 확인 (최근 3개)
-        r3 = await client.get("https://api.upbit.com/v1/candles/minutes/3", params={"market": market, "count": 3})
-        if r3.status_code == 200:
+        # 3분봉, 10분봉을 동시에 병렬 요청하여 지연시간 최소화
+        t_3m = client.get("https://api.upbit.com/v1/candles/minutes/3", params={"market": market, "count": 3})
+        t_10m = client.get("https://api.upbit.com/v1/candles/minutes/10", params={"market": market, "count": 3})
+        r3, r10 = await asyncio.gather(t_3m, t_10m, return_exceptions=True)
+
+        down_3m = False
+        down_10m = False
+
+        if not isinstance(r3, Exception) and r3.status_code == 200:
             c3 = r3.json()
             if len(c3) >= 2:
                 c0_price = Decimal(str(c3[0]["trade_price"]))
                 c0_open = Decimal(str(c3[0]["opening_price"]))
                 c1_close = Decimal(str(c3[1]["trade_price"]))
-                # 3분봉이 음봉이거나 직전 종가보다 아래
                 if (c0_price < c0_open) or (c0_price < c1_close):
                     down_3m = True
 
-        # 2. 10분봉 확인 (최근 3개)
-        r10 = await client.get("https://api.upbit.com/v1/candles/minutes/10", params={"market": market, "count": 3})
-        if r10.status_code == 200:
+        if not isinstance(r10, Exception) and r10.status_code == 200:
             c10 = r10.json()
             if len(c10) >= 2:
-                c10_0 = c10[0]
-                c10_1 = c10[1]
-                p10_0 = Decimal(str(c10_0["trade_price"]))
-                o10_0 = Decimal(str(c10_0["opening_price"]))
-                l10_1 = Decimal(str(c10_1["low_price"]))  # 직전 10분봉 저점
-
-                # 10분봉이 음봉이면서 직전 10분봉 저점을 깨고 내려가는 국면
+                p10_0 = Decimal(str(c10[0]["trade_price"]))
+                o10_0 = Decimal(str(c10[0]["opening_price"]))
+                l10_1 = Decimal(str(c10[1]["low_price"]))
                 if (p10_0 < o10_0) and (p10_0 <= l10_1):
                     down_10m = True
 
-        # 3분봉과 10분봉이 둘 다 하락 추세일 때만 True
         is_both_falling = down_3m and down_10m
         _dual_trend_cache[market] = (now, is_both_falling)
         return is_both_falling
@@ -507,7 +518,6 @@ async def check_dual_timeframe_downtrend(market: str) -> bool:
     except Exception as e:
         print(f"[DUAL-TF][WARN] {market} 듀얼 하락 추세 조회 실패: {e}")
 
-    # 조회 실패 시에는 안전하게 손절 보류
     return False
 
 # ============================================================
@@ -1017,15 +1027,25 @@ async def process_additional_buys(
             continue
 
         # -------------------------------------------------------------
-        # [최우선] 손절 라인 및 캔들 진폭 초과 급락 시 추가 매수 금지 및 즉시 탈출
+        # [최우선] 손절 라인 및 캔들 진폭 초과 급락 시 추가 매수 금지 및 긴급 탈출
+        # (10분봉 지지 확인 및 최소 -1.0% 바닥 보장 적용)
         # -------------------------------------------------------------
         avg_vol = await get_candle_volatility(market, unit=10, count=10)
-        panic_threshold = -(avg_vol * PANIC_DROP_MULTIPLIER)
+        calculated_cut = -(avg_vol * Decimal("1.5"))
+        panic_threshold = min(calculated_cut, Decimal("-1.0"))  # 최소 -1.0% 이하에서만 작동
 
-        # 1) 진폭 초과 급락 또는 2) 설정된 손절 라인(LOSS_CUT_RATE) 이하 도달 시
-        if pnl <= panic_threshold or (ENABLE_STOP and pnl <= LOSS_CUT_RATE):
-            reason_tag = "PANIC_EXIT" if pnl <= panic_threshold else "LOSS_CUT"
-            print(f"\n🚨 [ADD-BUY-ABORT][{reason_tag}] {market} 손절선 도달로 추가 매수 중단 및 긴급 청산 (PNL: {pnl}%)")
+        is_panic_cut = (pnl <= panic_threshold)
+        is_fixed_cut = (ENABLE_STOP and pnl <= LOSS_CUT_RATE)
+
+        if is_panic_cut or is_fixed_cut:
+            # 10분봉/3분봉 동시 하락 검증
+            is_dual_downtrend = await check_dual_timeframe_downtrend(market)
+            if not is_dual_downtrend and pnl > Decimal("-3.5"):
+                # 10분봉이 지탱하고 있으면 추가 매수만 건너뛰고 손절은 유보
+                continue
+
+            reason_tag = "PANIC_EXIT" if is_panic_cut else "LOSS_CUT"
+            print(f"\n🚨 [ADD-BUY-ABORT][{reason_tag}] {market} 3m & 10m 동시 하락 확정! 추가 매수 중단 및 긴급 청산 (PNL: {pnl}%)")
 
             await cancel_all_open_orders_for_market(access_key, secret_key, market)
             await asyncio.sleep(0.3)
@@ -1525,34 +1545,29 @@ async def monitor_positions(user_no: int, server_no: int):
                 cur_p = pos["current_price"]
                 st = ps.update_or_init(market, pnl, pos["avg_buy_price"])
 
-                # =============================================================
-                # 1. 캔들 진폭 기반 동적 손절선 계산 (최소 -1.0% 보장)
-                # =============================================================
+                # -------------------------------------------------------------
+                # 1. 캔들 진폭 기반 동적 손절선 계산 (최소 -1.0% 바닥 보장)
+                # -------------------------------------------------------------
                 avg_vol = await get_candle_volatility(market, unit=10, count=10)
-
-                # 진폭 기반 임계치 계산 (단, 너무 얕은 손절 방지를 위해 최소 -1.0% 바닥 강제)
                 calculated_cut = -(avg_vol * Decimal("1.5"))
                 panic_threshold = min(calculated_cut, Decimal("-1.0"))  # 최소 -1.0% 이하에서만 작동
 
-                # =============================================================
+                # -------------------------------------------------------------
                 # 2. 듀얼 타임프레임(3m & 10m) 하락 국면 검증 손절
-                # =============================================================
+                # -------------------------------------------------------------
                 is_panic_cut = (pnl <= panic_threshold)
                 is_fixed_cut = (ENABLE_STOP and pnl <= LOSS_CUT_RATE)
 
-                # 손절 라인에 걸렸을 때 바로 자르지 않고 10분봉/3분봉 동시 하락인지 확인
                 if is_panic_cut or is_fixed_cut:
-                    # 두 타임프레임 모두 하락 국면인지 확인
                     is_dual_downtrend = await check_dual_timeframe_downtrend(market)
 
-                    # -3.5%를 초과하는 절대 마지노선이 아니라면, 10분봉이 지지하고 있을 경우 손절 유보!
+                    # -3.5%를 초과하는 절대 마지노선이 아니라면, 10분봉이 지탱할 경우 손절 유보
                     if not is_dual_downtrend and pnl > Decimal("-3.5"):
-                        # print(f"[LOSS-HOLD] {market} PNL: {pnl}% (임계치 도달했으나 10분봉 지지 확인 -> 손절 유보)")
                         continue
 
-                    # 둘 다 하락 국면 확정 시 손절 집행
+                    # 3분봉과 10분봉 모두 하락 국면 확정 시 손절 집행
                     reason_tag = "PANIC_EXIT" if is_panic_cut else "LOSS_CUT"
-                    print(f"\n🚨 [{reason_tag}] {market} 3m & 10m 동시 하락 국면 확정! PNL: {pnl}% (손절 임계치: {panic_threshold}%)")
+                    print(f"\n🚨 [{reason_tag}] {market} 3m & 10m 동시 하락 확정! PNL: {pnl}% (손절임계치: {panic_threshold}%)")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
                     await asyncio.sleep(0.4)
 
@@ -1567,32 +1582,14 @@ async def monitor_positions(user_no: int, server_no: int):
                                     print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
                                 else:
                                     print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
-                                # 30분 재매수 금지 쿨다운 적용
                                 ps.mark_sold(market, reason=reason_tag)
                             break
                     print("──────────────────────────────────────────────\n")
                     continue
 
-                # 2. 고정 손절 (LOSS_CUT_RATE)
-                if ENABLE_STOP and pnl <= LOSS_CUT_RATE:
-                    print(f"[LOSS-CUT] {market} 고정 손절 도달 (PNL: {pnl}% <= {LOSS_CUT_RATE}%)")
-                    await cancel_all_open_orders_for_market(access_key, secret_key, market)
-                    await asyncio.sleep(0.4)
-
-                    accs = await fetch_upbit_accounts(access_key, secret_key)
-                    for a in accs:
-                        if a.get("currency") == market.split("-")[1]:
-                            actual_bal = Decimal(str(a.get("balance", "0")))
-                            sell_vol = quantize_volume(actual_bal)
-                            if sell_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
-                                if LIVE_TRADING:
-                                    resp = await order_market_sell(access_key, secret_key, market, sell_vol)
-                                    print(f"   ▶ 시장가 손절 체결: 수량={sell_vol} (uuid={resp.get('uuid')})")
-                                ps.mark_sold(market, reason="LOSS_CUT")
-                            break
-                    continue
-
+                # -------------------------------------------------------------
                 # 3. 익절 및 약익절/대기 판단
+                # -------------------------------------------------------------
                 should_sell, reason, cat = decide_sell(market, pnl, st)
                 if should_sell:
                     if cat == "WEAK_TP" and pnl < Decimal("0.10"):
@@ -1691,6 +1688,7 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
         if task and task.done():
             exc = task.exception()
+            await close_http_client()  # ★ 이전 세션 소켓 클린업
             if isinstance(exc, ResetRequested):
                 print("[CTRL] 일일 정기 리셋 완료 → 모니터링 재기동")
                 init_config(force=True)
@@ -1703,6 +1701,7 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
         if active_flag and task is None:
             print("[CTRL] activeYN=Y → 설정 최신화 확인 후 모니터링 태스크 시작")
+            await close_http_client()  # ★ 기동 전 깨끗한 클라이언트 보장
             init_config(force=True)
             apply_dynamic_config(cfg)
             task = asyncio.create_task(monitor_positions(user_no, server_no))
@@ -1713,6 +1712,7 @@ async def run_mtpond_controller(user_no: int, server_no: int):
                 await task
             except Exception:
                 pass
+            await close_http_client()  # ★ 중단 시 세션 종료
             task = None
 
     await update_config_once()
