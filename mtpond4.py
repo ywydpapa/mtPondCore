@@ -695,7 +695,7 @@ async def place_defense_ladder_orders(access_key: str, secret_key: str, market: 
 
 
 # ============================================================
-# 14. [수정] 수익 담보형 피라미딩(불타기) 연장 함수
+# 14. [수정] 초기 투자금 50% 반영 피라미딩(불타기) 연장 함수
 # ============================================================
 async def process_pyramiding_extension(
         access_key: str,
@@ -703,11 +703,13 @@ async def process_pyramiding_extension(
         market: str,
         ps: PositionState,
         available_krw: Decimal,
-        available_invest_krw: Decimal
+        available_invest_krw: Decimal,
+        initial_budget: Decimal = RANGE_BUY_KRW
 ):
     """
     앞선 1~3차 익절로 원금과 수익을 확보한 상태에서,
-    마지막 1슬롯만 남았고 15분봉 상승 추세가 견고할 때 추가 매수하여 사다리를 상방으로 연장
+    마지막 1슬롯만 남았고 15분봉 상승 추세가 견고할 때
+    '초기 투입 금액의 50%'를 추가 매수하여 사다리를 상방으로 연장
     """
     st = ps.data.setdefault(market, {})
     if st.get("is_processing_order") or st.get("defense_mode"):
@@ -715,13 +717,21 @@ async def process_pyramiding_extension(
     if st.get("pyramid_count", 0) >= MAX_PYRAMID_COUNT:
         return
 
-    buy_amt = min(PYRAMID_BUY_KRW, available_krw, available_invest_krw)
+    # ★ [핵심] 초기 투입 금액의 50% 계산 (예: 4만원 -> 2만원, 10만원 -> 5만원)
+    pyramid_target_krw = (initial_budget * Decimal("0.50")).quantize(Decimal("100"))
+
+    # 가용 원화 및 60% 총 자산 운용 한도 내로 보정
+    buy_amt = min(pyramid_target_krw, available_krw, available_invest_krw)
     if buy_amt < MIN_ORDER_NOTIONAL_KRW:
+        print(f"[PYRAMIDING][SKIP] {market} 불타기 예산 부족 (계산액: {buy_amt:,.0f}원 < 최소주문 {MIN_ORDER_NOTIONAL_KRW}원)")
         return
 
     st["is_processing_order"] = True
     try:
-        print(f"🔥 [PYRAMIDING] {market} 마지막 슬롯 잔여 & 상승 모멘텀 유지! 피라미딩 불타기 매수 집행 (금액: {buy_amt:,.0f}원)")
+        print(
+            f"🔥 [PYRAMIDING] {market} 마지막 슬롯 잔여 & 상승 모멘텀 유지! "
+            f"초기금액의 50% 불타기 매수 집행 (금액: {buy_amt:,.0f}원 / 초기기준: {initial_budget:,.0f}원)"
+        )
 
         # 1. 기존 마지막 슬롯 미체결 주문 취소
         await cancel_all_open_orders_for_market(access_key, secret_key, market)
@@ -735,12 +745,12 @@ async def process_pyramiding_extension(
         st["last_order_ts"] = time.time()
         print(f"✅ [PYRAMIDING-SUCCESS] {market} 불타기 완료! (누적 {st['pyramid_count']}회) → 사다리 상방 연장 재배치")
 
-        # 3. 평단가 참조 버그 수정 (st에 기록된 avg_buy_price 활용)
+        # 3. 새로운 평단가 기준 동적 시작선(1.5배 탄력 상향) 계산
         current_avg_price = Decimal(str(st.get("avg_buy_price", "0")))
         dyn_start, _ = get_dynamic_ladder_config(current_avg_price)
         pyramid_start_pct = (dyn_start * Decimal("1.5")).quantize(Decimal("0.01"))
 
-        # 4. 상방 확장 사다리 재배치 트리거
+        # 4. 상방 확장 사다리 재배치 트리거 (금액이 커진 만큼 calculate_ladder_slots에 의해 슬롯 자동 재분할)
         asyncio.create_task(
             place_ladder_tp_orders(
                 access_key,
@@ -868,17 +878,20 @@ async def monitor_positions(user_no: int, server_no: int):
                     asyncio.create_task(place_defense_ladder_orders(access_key, secret_key, market, ps))
                     continue
 
-                # [C] ★ [핵심 추가] 피라미딩(불타기) 조건 검증 및 연장
-                # 조건: 방어 모드가 아니고, 불타기 미실행 상태이며, 총 잔여 평가액이 1구좌(약 14,000원 이하)로 압축된 경우
+                # [C] 피라미딩(불타기) 조건 검증 및 연장
                 is_last_slot_remaining = (total_pos_eval <= PYRAMID_TRIGGER_MAX_EVAL) and (
                             total_pos_eval >= MIN_ORDER_NOTIONAL_KRW)
-                if not st.get("defense_mode") and st.get("pyramid_count",
-                                                         0) < MAX_PYRAMID_COUNT and is_last_slot_remaining:
-                    # 15분봉 정배열 및 양봉 상승 추세 지속 확인
+                if not st.get("defense_mode") and st.get("pyramid_count",0) < MAX_PYRAMID_COUNT and is_last_slot_remaining:
                     if await check_bullish_momentum(market):
                         if available_krw >= MIN_ORDER_NOTIONAL_KRW and available_invest_krw >= MIN_ORDER_NOTIONAL_KRW:
                             asyncio.create_task(process_pyramiding_extension(
-                                access_key, secret_key, market, ps, available_krw, available_invest_krw
+                                access_key,
+                                secret_key,
+                                market,
+                                ps,
+                                available_krw,
+                                available_invest_krw,
+                                initial_budget=RANGE_BUY_KRW  # 초기 설정 금액 전달
                             ))
                             continue
 
