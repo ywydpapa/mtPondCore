@@ -68,29 +68,29 @@ class ResetRequested(Exception):
 
 
 # ============================================================
-# 4. STATIC CONFIG (스캘핑 & 피라미딩 파라미터)
+# 4. STATIC CONFIG (손익비 개선 & 방어 쿨다운 강화)
 # ============================================================
 BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))
-COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "60"))  # 익절 쿨다운 1분
-COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300"))  # 방어/손절 쿨다운 5분
+
+# [쿨다운 대폭 강화] 연타 매수 방지: 익절 후 180초(3분), 손절 후 300초(5분)
+COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "180"))
+COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300"))
 
 # 자금 배분 규칙
 ACTIVE_CAPITAL_RATIO = Decimal("0.60")  # 총 자산의 60% 한도 투입
 
 # [손절 및 방어 설정]
-DEFENSE_TRIGGER_PCT = Decimal("-1.2")  # 방어 틱 사다리 재배치 (-1.2%)
-HARD_STOP_LOSS_PCT = Decimal("-2.2")  # 최종 강제 시장가 청산 (-2.2%)
+DEFENSE_TRIGGER_PCT = Decimal("-1.4")  # 방어 틱 사다리 재배치 (-1.4%)
+HARD_STOP_LOSS_PCT = Decimal("-2.5")  # 최종 강제 시장가 청산 (-2.5%)
 
-# [익절 및 사다리 설정]
+# [익절 설정] 수수료/슬리피지 극복을 위해 최소 시작선 +0.6%로 상향
 MIN_SLOT_NOTIONAL_KRW = Decimal("10000")  # 1슬롯 기본 10,000원
-LADDER_START_PCT = Decimal("0.3")  # 첫 익절 배치 시작선 (+0.3%)
-LADDER_STEP_PCT = Decimal("0.3")  # 단계별 간격 (+0.3%)
+LADDER_START_PCT = Decimal("0.60")  # 첫 익절 배치 시작선 (+0.60%)
+LADDER_STEP_PCT = Decimal("0.30")  # 단계별 간격 (+0.30%)
 
-# [피라미딩(불타기) 설정]
-PYRAMID_BUY_KRW = Decimal("20000")  # 마지막 슬롯 잔여 시 추가 매수 금액 (20,000원)
-MAX_PYRAMID_COUNT = 1  # 종목당 불타기 허용 횟수 (최대 1회로 제한)
-PYRAMID_TRIGGER_MAX_EVAL = Decimal("14000")  # 마지막 1슬롯(약 1만원 부근) 잔여 판별 상한선
+# [불타기 제어] 계좌 갉아먹기 방지를 위해 비활성화
+ENABLE_PYRAMIDING = False
 
 INTERVAL_SECONDS = 3
 MIN_NOTIONAL_KRW = Decimal("5000")
@@ -123,7 +123,7 @@ class PositionState:
                 "avg_buy_price": avg_price,
                 "defense_mode": False,
                 "is_processing_order": False,
-                "pyramid_count": 0,  # 불타기 실행 횟수
+                "entry_ts": now,
                 "last_order_ts": 0.0,
                 "last_update_ts": now
             }
@@ -354,22 +354,6 @@ def get_tick_unit(price: Decimal) -> Decimal:
     return Decimal("0.00001")
 
 
-def get_dynamic_ladder_config(price: Decimal) -> Tuple[Decimal, Decimal]:
-    """
-    코인 가격대에 맞춰 시작 익절 퍼센트와 스텝 간격을 동적으로 반환
-    반환값: (start_pct, step_pct)
-    """
-    p = float(price)
-    if p >= 100_000:       # 10만 원 이상 (BTC, BCH, SOL 등)
-        return Decimal("0.12"), Decimal("0.08")
-    elif p >= 10_000:      # 1만 원 ~ 10만 원 미만
-        return Decimal("0.18"), Decimal("0.12")
-    elif p >= 1_000:       # 1천 원 ~ 1만 원 미만
-        return Decimal("0.25"), Decimal("0.20")
-    else:  # 1천 원 미만 동전주
-        return Decimal("0.30"), Decimal("0.30")
-
-
 def adjust_price_to_tick(raw_price: Decimal, side: str = "ask") -> Decimal:
     price = Decimal(str(raw_price))
     if price <= 0: return Decimal("0")
@@ -425,40 +409,6 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
         print(f"[CANCEL-ALL][ERR] {market} 미체결 취소 실패: {e}")
 
 
-def calculate_ladder_slots(total_eval: Decimal) -> Tuple[int, Decimal, Decimal]:
-    """
-    투자금액에 따라 (슬롯 개수, 시작 익절%, 스텝 증가폭%)을 동적으로 산출
-    반환값: (slot_count, start_pct, step_pct)
-    """
-    amt = float(total_eval)
-
-    if amt <= 55_000:          # [4만 ~ 5만 원]: 1만 원 단위 4~5슬롯
-        slot_unit = Decimal("10000")
-        slot_count = int(total_eval // slot_unit)
-        start_pct = Decimal("0.30")
-        step_pct = Decimal("0.20")
-
-    elif amt <= 155_000:       # [6만 ~ 15만 원]: 1만 원 단위, 최대 10슬롯으로 압축
-        slot_count = min(10, max(5, int(total_eval // Decimal("10000"))))
-        start_pct = Decimal("0.25")
-        step_pct = Decimal("0.12")
-
-    elif amt <= 305_000:       # [16만 ~ 30만 원]: 2만 원 단위 격상 (8~10슬롯)
-        slot_unit = Decimal("20000")
-        slot_count = min(10, max(6, int(total_eval // slot_unit)))
-        start_pct = Decimal("0.22")
-        step_pct = Decimal("0.14")
-
-    else:                      # [31만 ~ 50만 원]: 3만~5만 원 단위 격상 (8~10슬롯 유지)
-        slot_unit = Decimal("40000")
-        slot_count = min(10, max(8, int(total_eval // slot_unit)))
-        start_pct = Decimal("0.20")
-        step_pct = Decimal("0.16")
-
-    return max(1, slot_count), start_pct, step_pct
-
-
-
 # ============================================================
 # 9. 상승 모멘텀 검증 (15분봉 정배열 & 실시간 양봉)
 # ============================================================
@@ -482,7 +432,8 @@ async def check_bullish_momentum(market: str) -> bool:
         ma5 = sum(closes[:5]) / Decimal("5")
         ma20 = sum(closes[:20]) / Decimal("20")
 
-        return bool((cur_price >= ma5) and (ma5 >= ma20) and (cur_price >= open_price))
+        # 5이평선이 20이평선 위에 있고, 현재가가 5선 위에 있는 양봉 캔들만 통과
+        return bool((cur_price >= ma5) and (ma5 > ma20) and (cur_price >= open_price))
     except Exception as e:
         print(f"[MOMENTUM][WARN] {market} 모멘텀 확인 실패: {e}")
         return False
@@ -558,15 +509,41 @@ async def order_limit_sell(access_key: str, secret_key: str, market: str, volume
 
 
 # ============================================================
-# 12. [동적 적용] 4만~50만원 전 구간 대응 사다리 배치 함수
+# 12. [핵심] 수수료/슬리피지 방어형 동적 사다리 계산 & 발주
 # ============================================================
-async def place_ladder_tp_orders(
-    access_key: str,
-    secret_key: str,
-    market: str,
-    ps: PositionState,
-    start_step_override: Decimal = None
-):
+def calculate_ladder_slots(total_eval: Decimal, avg_price: Decimal) -> Tuple[int, Decimal, Decimal]:
+    """
+    수수료(0.1%) 및 슬리피지(0.15%)를 넘어서는 실현 마진을 보장하도록
+    가격대 및 투자금에 따른 시작선과 스텝 간격 산출
+    """
+    amt = float(total_eval)
+    p = float(avg_price)
+
+    # 1. 가격대별 기본 스케일링 (단가별 틱 무게 고려)
+    if p >= 100_000:
+        base_start = Decimal("0.45")
+        base_step = Decimal("0.20")
+    elif p >= 10_000:
+        base_start = Decimal("0.55")
+        base_step = Decimal("0.25")
+    else:
+        base_start = Decimal("0.60")
+        base_step = Decimal("0.30")
+
+    # 2. 투자금 규모에 따른 슬롯 분할
+    if amt <= 55_000:  # [4만 ~ 5만 원]: 1만 원 단위 4슬롯
+        slot_count = max(1, int(total_eval // Decimal("10000")))
+    elif amt <= 155_000:  # [6만 ~ 15만 원]: 6~10슬롯
+        slot_count = min(10, max(5, int(total_eval // Decimal("10000"))))
+    elif amt <= 305_000:  # [16만 ~ 30만 원]: 2만 원 단위 격상
+        slot_count = min(10, max(6, int(total_eval // Decimal("20000"))))
+    else:  # [31만 ~ 50만 원]: 4만 원 단위
+        slot_count = min(10, max(8, int(total_eval // Decimal("40000"))))
+
+    return max(1, slot_count), base_start, base_step
+
+
+async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, ps: PositionState):
     st = ps.data.setdefault(market, {})
     if st.get("is_processing_order"):
         return
@@ -577,7 +554,7 @@ async def place_ladder_tp_orders(
         avail_bal = Decimal("0")
         avg_price = Decimal("0")
 
-        # 체결 잔고 확정 대기 (최대 4초 폴링)
+        # 체결 잔고 반영 대기 (최대 4초)
         for _ in range(4):
             await asyncio.sleep(1.0)
             accounts = await fetch_upbit_accounts(access_key, secret_key)
@@ -592,18 +569,15 @@ async def place_ladder_tp_orders(
         if total_eval < MIN_ORDER_NOTIONAL_KRW:
             return
 
-        # ★ [핵심] 4만 ~ 50만 원 전 구간 동적 슬롯 계산
-        slot_count, def_start_pct, step_pct = calculate_ladder_slots(total_eval)
-        start_pct = start_step_override if start_step_override else def_start_pct
-
+        slot_count, start_pct, step_pct = calculate_ladder_slots(total_eval, avg_price)
         slice_vol = quantize_volume(avail_bal / Decimal(str(slot_count)))
         remaining_vol = avail_bal
         prev_limit_p = Decimal("0")
 
         print(
-            f"📐 [LADDER-TP] {market} 동적 사다리 배치 시작 | "
-            f"투자평가액: {total_eval:,.0f}원 | {slot_count}개 슬롯 | "
-            f"시작: +{start_pct}% / 스텝: +{step_pct}%"
+            f"📐 [LADDER-TP] {market} 익절 사다리 발주 | "
+            f"평단: {avg_price:,.0f}원 | 총액: {total_eval:,.0f}원 ({slot_count}슬롯) | "
+            f"시작: +{start_pct}% / 간격: +{step_pct}%"
         )
 
         for i in range(1, slot_count + 1):
@@ -611,22 +585,20 @@ async def place_ladder_tp_orders(
             target_p = avg_price * (Decimal("1") + (curr_target_pct / Decimal("100")))
             limit_p = adjust_price_to_tick(target_p, side="ask")
 
-            # 틱 겹침 방지: 최소 1틱 이상 강제 상승
             if i > 1 and limit_p <= prev_limit_p:
                 tick = get_tick_unit(limit_p)
                 limit_p = prev_limit_p + tick
 
-            # 마지막 슬롯은 잔여 오차 없이 전량 털어내도록 수량 일치
             order_v = quantize_volume(remaining_vol) if i == slot_count else slice_vol
             order_v = min(order_v, remaining_vol)
 
             if order_v * limit_p >= MIN_ORDER_NOTIONAL_KRW:
                 if LIVE_TRADING:
                     await order_limit_sell(access_key, secret_key, market, order_v, limit_p)
-                print(f"  └ [{market}] 슬롯 #{i}: {order_v}개 @ {limit_p}원 (+{curr_target_pct:.2f}%)")
+                print(f"  └ [{market}] 익절 슬롯 #{i}: {order_v}개 @ {limit_p}원 (+{curr_target_pct:.2f}%)")
                 remaining_vol -= order_v
                 prev_limit_p = limit_p
-                await asyncio.sleep(0.15) # 업비트 API 초당 호출제한(초당 8회) 준수
+                await asyncio.sleep(0.15)
 
         st["last_order_ts"] = time.time()
 
@@ -695,80 +667,7 @@ async def place_defense_ladder_orders(access_key: str, secret_key: str, market: 
 
 
 # ============================================================
-# 14. [수정] 초기 투자금 50% 반영 피라미딩(불타기) 연장 함수
-# ============================================================
-async def process_pyramiding_extension(
-        access_key: str,
-        secret_key: str,
-        market: str,
-        ps: PositionState,
-        available_krw: Decimal,
-        available_invest_krw: Decimal,
-        initial_budget: Decimal = RANGE_BUY_KRW
-):
-    """
-    앞선 1~3차 익절로 원금과 수익을 확보한 상태에서,
-    마지막 1슬롯만 남았고 15분봉 상승 추세가 견고할 때
-    '초기 투입 금액의 50%'를 추가 매수하여 사다리를 상방으로 연장
-    """
-    st = ps.data.setdefault(market, {})
-    if st.get("is_processing_order") or st.get("defense_mode"):
-        return
-    if st.get("pyramid_count", 0) >= MAX_PYRAMID_COUNT:
-        return
-
-    # ★ [핵심] 초기 투입 금액의 50% 계산 (예: 4만원 -> 2만원, 10만원 -> 5만원)
-    pyramid_target_krw = (initial_budget * Decimal("0.50")).quantize(Decimal("100"))
-
-    # 가용 원화 및 60% 총 자산 운용 한도 내로 보정
-    buy_amt = min(pyramid_target_krw, available_krw, available_invest_krw)
-    if buy_amt < MIN_ORDER_NOTIONAL_KRW:
-        print(f"[PYRAMIDING][SKIP] {market} 불타기 예산 부족 (계산액: {buy_amt:,.0f}원 < 최소주문 {MIN_ORDER_NOTIONAL_KRW}원)")
-        return
-
-    st["is_processing_order"] = True
-    try:
-        print(
-            f"🔥 [PYRAMIDING] {market} 마지막 슬롯 잔여 & 상승 모멘텀 유지! "
-            f"초기금액의 50% 불타기 매수 집행 (금액: {buy_amt:,.0f}원 / 초기기준: {initial_budget:,.0f}원)"
-        )
-
-        # 1. 기존 마지막 슬롯 미체결 주문 취소
-        await cancel_all_open_orders_for_market(access_key, secret_key, market)
-        await asyncio.sleep(0.3)
-
-        # 2. 시장가 추가 매수
-        if LIVE_TRADING:
-            await order_market_buy_price(access_key, secret_key, market, buy_amt)
-
-        st["pyramid_count"] += 1
-        st["last_order_ts"] = time.time()
-        print(f"✅ [PYRAMIDING-SUCCESS] {market} 불타기 완료! (누적 {st['pyramid_count']}회) → 사다리 상방 연장 재배치")
-
-        # 3. 새로운 평단가 기준 동적 시작선(1.5배 탄력 상향) 계산
-        current_avg_price = Decimal(str(st.get("avg_buy_price", "0")))
-        dyn_start, _ = get_dynamic_ladder_config(current_avg_price)
-        pyramid_start_pct = (dyn_start * Decimal("1.5")).quantize(Decimal("0.01"))
-
-        # 4. 상방 확장 사다리 재배치 트리거 (금액이 커진 만큼 calculate_ladder_slots에 의해 슬롯 자동 재분할)
-        asyncio.create_task(
-            place_ladder_tp_orders(
-                access_key,
-                secret_key,
-                market,
-                ps,
-                start_step_override=pyramid_start_pct
-            )
-        )
-
-    except Exception as e:
-        print(f"[PYRAMIDING][ERR] {market} 불타기 실패: {e}")
-    finally:
-        st["is_processing_order"] = False
-
-
-# ============================================================
-# 15. 메인 모니터링 루프
+# 14. 메인 모니터링 루프
 # ============================================================
 async def monitor_positions(user_no: int, server_no: int):
     start_ts = time.time()
@@ -785,7 +684,7 @@ async def monitor_positions(user_no: int, server_no: int):
         access_key, secret_key = row[0], row[1]
 
     ps = PositionState()
-    print("=== [단기 모멘텀 스캘핑 + 방어형 손절 + 수익 담보 불타기 엔진 가동] ===")
+    print("=== [단기 모멘텀 스캘핑 + 실마진 보장 사다리 엔진 가동] ===")
     excluded = await get_excluded_markets(force_reload=True)
 
     while True:
@@ -799,7 +698,7 @@ async def monitor_positions(user_no: int, server_no: int):
             excluded = await get_excluded_markets()
             raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
 
-            # 1. 원화 및 코인 잔고 조회
+            # 1. 잔고 집계
             available_krw = Decimal("0")
             held_markets = []
             for a in raw_accounts:
@@ -835,28 +734,26 @@ async def monitor_positions(user_no: int, server_no: int):
                         "avg_buy_price": avg, "current_price": cur_price, "pnl_percent": pnl
                     })
 
-            # 전체 자금(원화 + 코인 평가액) 기준 60% 한도 제어
+            # 총 자산 한도(60%) 계산
             total_equity = available_krw + total_coin_val
             active_capital_limit = total_equity * ACTIVE_CAPITAL_RATIO
             current_invested = total_coin_val
             available_invest_krw = max(Decimal("0"), active_capital_limit - current_invested)
 
-            # 2. 보유 포지션 수시 감시, 불타기, 방어손절
+            # 2. 보유 포지션 감시 및 리밸런싱
             for pos in enriched:
                 market = pos["market"]
                 pnl = pos["pnl_percent"]
                 cur_p = pos.get("current_price")
                 avg_p = pos.get("avg_buy_price")
                 avail_vol = pos["balance"]
-                total_vol = pos["balance"] + pos["locked"]
-                total_pos_eval = total_vol * cur_p
 
                 if cur_p is None or avg_p is None or cur_p <= 0 or avg_p <= 0:
                     continue
 
                 st = ps.update_or_init(market, pnl, avg_p)
 
-                # [A] 최종 안전 손절 (-2.2% 도달 시 반등 실패 전량 시장가 청산)
+                # [A] 최종 안전 손절 (-2.5% 도달 시 전량 시장가 청산)
                 if pnl <= HARD_STOP_LOSS_PCT:
                     print(f"🚨 [HARD-STOP-LOSS] {market} 방어선 붕괴 ({pnl}%) → 시장가 전량 청산")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
@@ -873,36 +770,20 @@ async def monitor_positions(user_no: int, server_no: int):
                             break
                     continue
 
-                # [B] 방어 모드 진입: -1.2% 도달 시 현재가 바로 위 1~3틱에 분할 재배치
+                # [B] 방어 모드 진입: -1.4% 도달 시 현재가 바로 위 1~3틱 분할 재배치
                 if pnl <= DEFENSE_TRIGGER_PCT and not st.get("defense_mode"):
                     asyncio.create_task(place_defense_ladder_orders(access_key, secret_key, market, ps))
                     continue
 
-                # [C] 피라미딩(불타기) 조건 검증 및 연장
-                is_last_slot_remaining = (total_pos_eval <= PYRAMID_TRIGGER_MAX_EVAL) and (
-                            total_pos_eval >= MIN_ORDER_NOTIONAL_KRW)
-                if not st.get("defense_mode") and st.get("pyramid_count",0) < MAX_PYRAMID_COUNT and is_last_slot_remaining:
-                    if await check_bullish_momentum(market):
-                        if available_krw >= MIN_ORDER_NOTIONAL_KRW and available_invest_krw >= MIN_ORDER_NOTIONAL_KRW:
-                            asyncio.create_task(process_pyramiding_extension(
-                                access_key,
-                                secret_key,
-                                market,
-                                ps,
-                                available_krw,
-                                available_invest_krw,
-                                initial_budget=RANGE_BUY_KRW  # 초기 설정 금액 전달
-                            ))
-                            continue
-
-                # [D] 수시 잔액 감시: 주문 취소 등으로 5,500원 이상의 잔여 코인이 놀고 있다면 즉시 사다리 재배치
+                # [C] 미체결 잔여 코인 수시 사다리 재배치
                 if not st.get("defense_mode") and not st.get("is_processing_order"):
                     if avail_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
+                        # 3초 이상 경과 시에만 재배치 (API 호출 안정성 확보)
                         if loop_now - st.get("last_order_ts", 0.0) >= 3.0:
                             print(f"🔄 [AUTO-REALLOC] {market} 미배치 잔여 수량 ({avail_vol}개) → 사다리 재배치")
                             asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market, ps))
 
-            # 전량 매도 완료된 종목 정리
+            # 전량 매도 완료된 종목 정리 및 쿨다운 적용
             for mkt in list(ps.data.keys()):
                 if mkt not in [p["market"] for p in enriched]:
                     is_defense = ps.data[mkt].get("defense_mode", False)
@@ -919,6 +800,7 @@ async def monitor_positions(user_no: int, server_no: int):
                         break
 
                     market = item["market"]
+                    # 이미 보유 중이거나 쿨다운(최근 매도 후 3분) 적용 중인 종목 진입 원천 차단
                     if market in [p["market"] for p in enriched] or ps.recently_sold(market):
                         continue
 
@@ -938,6 +820,7 @@ async def monitor_positions(user_no: int, server_no: int):
                             print(f"🚀 [BUY][DRY] {market} 신규 진입: {buy_amt:,.0f}원")
 
                         ps.update_or_init(market, Decimal("0"), item["price"])
+                        # 매수 즉시 실마진 보장형 사다리 발주
                         asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market, ps))
 
                         available_krw -= buy_amt
@@ -962,7 +845,7 @@ async def monitor_positions(user_no: int, server_no: int):
 
 
 # ============================================================
-# 16. 컨트롤러 및 진입점
+# 15. 컨트롤러 및 진입점
 # ============================================================
 async def run_mtpond_controller(user_no: int, server_no: int):
     task = None
