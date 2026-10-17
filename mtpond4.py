@@ -68,29 +68,21 @@ class ResetRequested(Exception):
 
 
 # ============================================================
-# 4. STATIC CONFIG (손익비 개선 & 방어 쿨다운 강화)
+# 4. STATIC CONFIG (기본 상수)
 # ============================================================
 BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))
 
-# [쿨다운 대폭 강화] 연타 매수 방지: 익절 후 180초(3분), 손절 후 300초(5분)
-COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "180"))
-COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300"))
+COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "180"))  # 익절 후 재매수 방지 180초
+COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300"))  # 손절 후 재매수 방지 300초
 
-# 자금 배분 규칙
 ACTIVE_CAPITAL_RATIO = Decimal("0.60")  # 총 자산의 60% 한도 투입
-
-# [손절 및 방어 설정]
 DEFENSE_TRIGGER_PCT = Decimal("-1.4")  # 방어 틱 사다리 재배치 (-1.4%)
 HARD_STOP_LOSS_PCT = Decimal("-2.5")  # 최종 강제 시장가 청산 (-2.5%)
 
-# [익절 설정] 수수료/슬리피지 극복을 위해 최소 시작선 +0.6%로 상향
 MIN_SLOT_NOTIONAL_KRW = Decimal("10000")  # 1슬롯 기본 10,000원
 LADDER_START_PCT = Decimal("0.60")  # 첫 익절 배치 시작선 (+0.60%)
 LADDER_STEP_PCT = Decimal("0.30")  # 단계별 간격 (+0.30%)
-
-# [불타기 제어] 계좌 갉아먹기 방지를 위해 비활성화
-ENABLE_PYRAMIDING = False
 
 INTERVAL_SECONDS = 3
 MIN_NOTIONAL_KRW = Decimal("5000")
@@ -100,11 +92,11 @@ LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
 UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
 # ============================================================
-# 5. RUNTIME CONFIG (Redis 연동 동적 설정 관리)
+# 5. RUNTIME CONFIG (Redis 우선 동적 설정 관리)
 # ============================================================
 _CONFIG_INITIALIZED = False
 MAX_ACTIVE_MARKETS = 2
-RANGE_BUY_KRW = Decimal("40000")
+RANGE_BUY_KRW = Decimal("40000")  # 초기 폴백값 (Redis 로드 시 즉시 덮어씌워짐)
 BB_MIN_OVERALL_SCORE = 3
 BB_MIN_TRADE_COUNT_10M = 60
 
@@ -166,6 +158,7 @@ class PositionState:
 
 
 def init_config(force: bool = False):
+    """환경변수 기반 1차 초기화 (Redis 연결 전 기본 틀 마련)"""
     global _CONFIG_INITIALIZED
     if _CONFIG_INITIALIZED and not force:
         return
@@ -180,10 +173,11 @@ def init_config(force: bool = False):
     BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
     _CONFIG_INITIALIZED = True
-    print(f"[INIT] 설정 초기화 완료 | 활성최대:{MAX_ACTIVE_MARKETS}개, 종목당할당:{RANGE_BUY_KRW}원")
+    print(f"[INIT] 시스템 1차 설정 완료 | 종목당 초기할당: {RANGE_BUY_KRW:,.0f}원, 활성최대: {MAX_ACTIVE_MARKETS}개")
 
 
 def apply_dynamic_config(cfg: dict):
+    """★ Redis 설정값을 전역 변수에 최우선 반영"""
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
 
     def to_dec(v):
@@ -192,24 +186,36 @@ def apply_dynamic_config(cfg: dict):
         except:
             return None
 
-    for key in ("initAmt", "range_buy_krw", "RANGE_BUY_KRW"):
+    # 1. 최초 투입 금액 우선 반영 (initAmt, range_buy_krw, firstBuyAmt 등 포괄 수용)
+    for key in ("initAmt", "range_buy_krw", "RANGE_BUY_KRW", "firstBuyAmt", "init_amt"):
         if key in cfg:
             v = to_dec(cfg.get(key))
             if v and v > 0:
+                old_val = RANGE_BUY_KRW
                 RANGE_BUY_KRW = v
+                if old_val != v:
+                    print(f"📌 [REDIS-CONFIG] 최초 투입 금액 갱신: {old_val:,.0f}원 → {RANGE_BUY_KRW:,.0f}원")
+                break
 
+    # 2. 최대 종목 수 반영 (설정값이 없으면 투입 금액에 맞춰 자동 산정)
+    has_custom_cnt = False
     for key in ("maxCoincnt", "max_active_markets", "MAX_ACTIVE_MARKETS"):
         if key in cfg:
             try:
                 nv = int(cfg[key])
-                if nv > 0: MAX_ACTIVE_MARKETS = nv
+                if nv > 0:
+                    MAX_ACTIVE_MARKETS = nv
+                    has_custom_cnt = True
+                    break
             except:
                 pass
-        else:
-            MAX_ACTIVE_MARKETS = 5 if RANGE_BUY_KRW <= Decimal("25000") else 2
+
+    if not has_custom_cnt:
+        MAX_ACTIVE_MARKETS = 5 if RANGE_BUY_KRW <= Decimal("25000") else 2
 
 
 async def sync_redis_config(user_no: int):
+    """Redis에서 설정 JSON을 읽어와 즉시 반영"""
     try:
         c = await redis_client.get(f"mtpond:setup:{user_no}")
         if c:
@@ -217,8 +223,10 @@ async def sync_redis_config(user_no: int):
             cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
             if isinstance(cfg, dict):
                 apply_dynamic_config(cfg)
+                return True
     except Exception as e:
         print(f"[CONFIG][WARN] Redis 설정 동기화 실패: {e}")
+    return False
 
 
 # ============================================================
@@ -432,7 +440,6 @@ async def check_bullish_momentum(market: str) -> bool:
         ma5 = sum(closes[:5]) / Decimal("5")
         ma20 = sum(closes[:20]) / Decimal("20")
 
-        # 5이평선이 20이평선 위에 있고, 현재가가 5선 위에 있는 양봉 캔들만 통과
         return bool((cur_price >= ma5) and (ma5 > ma20) and (cur_price >= open_price))
     except Exception as e:
         print(f"[MOMENTUM][WARN] {market} 모멘텀 확인 실패: {e}")
@@ -509,17 +516,12 @@ async def order_limit_sell(access_key: str, secret_key: str, market: str, volume
 
 
 # ============================================================
-# 12. [핵심] 수수료/슬리피지 방어형 동적 사다리 계산 & 발주
+# 12. 사다리 계산 및 발주
 # ============================================================
 def calculate_ladder_slots(total_eval: Decimal, avg_price: Decimal) -> Tuple[int, Decimal, Decimal]:
-    """
-    수수료(0.1%) 및 슬리피지(0.15%)를 넘어서는 실현 마진을 보장하도록
-    가격대 및 투자금에 따른 시작선과 스텝 간격 산출
-    """
     amt = float(total_eval)
     p = float(avg_price)
 
-    # 1. 가격대별 기본 스케일링 (단가별 틱 무게 고려)
     if p >= 100_000:
         base_start = Decimal("0.45")
         base_step = Decimal("0.20")
@@ -530,14 +532,13 @@ def calculate_ladder_slots(total_eval: Decimal, avg_price: Decimal) -> Tuple[int
         base_start = Decimal("0.60")
         base_step = Decimal("0.30")
 
-    # 2. 투자금 규모에 따른 슬롯 분할
-    if amt <= 55_000:  # [4만 ~ 5만 원]: 1만 원 단위 4슬롯
+    if amt <= 55_000:
         slot_count = max(1, int(total_eval // Decimal("10000")))
-    elif amt <= 155_000:  # [6만 ~ 15만 원]: 6~10슬롯
+    elif amt <= 155_000:
         slot_count = min(10, max(5, int(total_eval // Decimal("10000"))))
-    elif amt <= 305_000:  # [16만 ~ 30만 원]: 2만 원 단위 격상
+    elif amt <= 305_000:
         slot_count = min(10, max(6, int(total_eval // Decimal("20000"))))
-    else:  # [31만 ~ 50만 원]: 4만 원 단위
+    else:
         slot_count = min(10, max(8, int(total_eval // Decimal("40000"))))
 
     return max(1, slot_count), base_start, base_step
@@ -554,7 +555,6 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, 
         avail_bal = Decimal("0")
         avg_price = Decimal("0")
 
-        # 체결 잔고 반영 대기 (최대 4초)
         for _ in range(4):
             await asyncio.sleep(1.0)
             accounts = await fetch_upbit_accounts(access_key, secret_key)
@@ -609,7 +609,7 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, 
 
 
 # ============================================================
-# 13. 손절 시 바로 위 틱(+1~3틱) 반등 탈출 사다리 재배치
+# 13. 방어형 틱 리밸런싱
 # ============================================================
 async def place_defense_ladder_orders(access_key: str, secret_key: str, market: str, ps: PositionState):
     st = ps.data.setdefault(market, {})
@@ -673,6 +673,9 @@ async def monitor_positions(user_no: int, server_no: int):
     start_ts = time.time()
     last_cfg_sync = time.time()
 
+    # ★ 진입 전 Redis 설정을 즉시 1회 동기화하여 최초 투입 금액 우선 반영
+    await sync_redis_config(user_no)
+
     async with SessionLocal() as session:
         sql = text("""SELECT apiKey1, apiKey2
                       FROM traceUser
@@ -684,13 +687,14 @@ async def monitor_positions(user_no: int, server_no: int):
         access_key, secret_key = row[0], row[1]
 
     ps = PositionState()
-    print("=== [단기 모멘텀 스캘핑 + 실마진 보장 사다리 엔진 가동] ===")
+    print(f"=== [단기 모멘텀 스캘핑 엔진 가동] 종목당 투입예산: {RANGE_BUY_KRW:,.0f}원 | 최대종목: {MAX_ACTIVE_MARKETS}개 ===")
     excluded = await get_excluded_markets(force_reload=True)
 
     while True:
         try:
             loop_now = time.time()
 
+            # 주기적 Redis 설정 재동기화
             if loop_now - last_cfg_sync >= CONTROLLER_POLL_SEC:
                 last_cfg_sync = loop_now
                 await sync_redis_config(user_no)
@@ -698,7 +702,6 @@ async def monitor_positions(user_no: int, server_no: int):
             excluded = await get_excluded_markets()
             raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
 
-            # 1. 잔고 집계
             available_krw = Decimal("0")
             held_markets = []
             for a in raw_accounts:
@@ -734,13 +737,12 @@ async def monitor_positions(user_no: int, server_no: int):
                         "avg_buy_price": avg, "current_price": cur_price, "pnl_percent": pnl
                     })
 
-            # 총 자산 한도(60%) 계산
             total_equity = available_krw + total_coin_val
             active_capital_limit = total_equity * ACTIVE_CAPITAL_RATIO
             current_invested = total_coin_val
             available_invest_krw = max(Decimal("0"), active_capital_limit - current_invested)
 
-            # 2. 보유 포지션 감시 및 리밸런싱
+            # 포지션 감시
             for pos in enriched:
                 market = pos["market"]
                 pnl = pos["pnl_percent"]
@@ -753,7 +755,7 @@ async def monitor_positions(user_no: int, server_no: int):
 
                 st = ps.update_or_init(market, pnl, avg_p)
 
-                # [A] 최종 안전 손절 (-2.5% 도달 시 전량 시장가 청산)
+                # 최종 손절
                 if pnl <= HARD_STOP_LOSS_PCT:
                     print(f"🚨 [HARD-STOP-LOSS] {market} 방어선 붕괴 ({pnl}%) → 시장가 전량 청산")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
@@ -770,26 +772,25 @@ async def monitor_positions(user_no: int, server_no: int):
                             break
                     continue
 
-                # [B] 방어 모드 진입: -1.4% 도달 시 현재가 바로 위 1~3틱 분할 재배치
+                # 방어 틱 사다리
                 if pnl <= DEFENSE_TRIGGER_PCT and not st.get("defense_mode"):
                     asyncio.create_task(place_defense_ladder_orders(access_key, secret_key, market, ps))
                     continue
 
-                # [C] 미체결 잔여 코인 수시 사다리 재배치
+                # 잔여 수량 재배치
                 if not st.get("defense_mode") and not st.get("is_processing_order"):
                     if avail_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
-                        # 3초 이상 경과 시에만 재배치 (API 호출 안정성 확보)
                         if loop_now - st.get("last_order_ts", 0.0) >= 3.0:
                             print(f"🔄 [AUTO-REALLOC] {market} 미배치 잔여 수량 ({avail_vol}개) → 사다리 재배치")
                             asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market, ps))
 
-            # 전량 매도 완료된 종목 정리 및 쿨다운 적용
+            # 매도 완료 정리
             for mkt in list(ps.data.keys()):
                 if mkt not in [p["market"] for p in enriched]:
                     is_defense = ps.data[mkt].get("defense_mode", False)
                     ps.mark_sold(mkt, reason="DEFENSE" if is_defense else "TP")
 
-            # 3. 신규 매수 탐색 (슬롯 및 60% 한도 범위 내)
+            # 신규 매수 (Redis 투입 예산 RANGE_BUY_KRW 반영)
             active_count = len(enriched)
             remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
 
@@ -800,11 +801,9 @@ async def monitor_positions(user_no: int, server_no: int):
                         break
 
                     market = item["market"]
-                    # 이미 보유 중이거나 쿨다운(최근 매도 후 3분) 적용 중인 종목 진입 원천 차단
                     if market in [p["market"] for p in enriched] or ps.recently_sold(market):
                         continue
 
-                    # 15분봉 정배열 & 실시간 양봉 모멘텀 확인
                     if not await check_bullish_momentum(market):
                         continue
 
@@ -815,12 +814,11 @@ async def monitor_positions(user_no: int, server_no: int):
                     try:
                         if LIVE_TRADING:
                             resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
-                            print(f"🚀 [BUY] {market} 모멘텀 신규 진입: {buy_amt:,.0f}원 (uuid={resp.get('uuid')})")
+                            print(f"🚀 [BUY] {market} 모멘텀 진입: {buy_amt:,.0f}원 (uuid={resp.get('uuid')})")
                         else:
-                            print(f"🚀 [BUY][DRY] {market} 신규 진입: {buy_amt:,.0f}원")
+                            print(f"🚀 [BUY][DRY] {market} 모멘텀 진입: {buy_amt:,.0f}원")
 
                         ps.update_or_init(market, Decimal("0"), item["price"])
-                        # 매수 즉시 실마진 보장형 사다리 발주
                         asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market, ps))
 
                         available_krw -= buy_amt
@@ -832,7 +830,6 @@ async def monitor_positions(user_no: int, server_no: int):
                     except Exception as e:
                         print(f"[BUY-ERR] {market} 매수 실패: {e}")
 
-            # 24시간 1회 정기 리셋
             if PERIODIC_RESET_SEC > 0 and (loop_now - start_ts) >= PERIODIC_RESET_SEC:
                 raise ResetRequested()
 
@@ -853,6 +850,7 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
     while True:
         try:
+            # 1. Redis 최신 설정 먼저 로드
             await sync_redis_config(user_no)
 
             cfg = {}
@@ -888,7 +886,6 @@ async def run_mtpond_controller(user_no: int, server_no: int):
                 task = None
 
             if active_flag and task is None:
-                init_config(force=True)
                 task = asyncio.create_task(monitor_positions(user_no, server_no))
             elif not active_flag and task:
                 print("[CTRL] activeYN=N → 모니터링 태스크 중단")
@@ -909,6 +906,10 @@ async def main():
     init_config(force=True)
     user_no = int(os.getenv("USER_NO", "100001"))
     server_no = int(os.getenv("SERVER_NO", "21"))
+
+    # ★ 프로그램 진입 즉시 Redis 설정을 1차 동기화
+    await sync_redis_config(user_no)
+
     await run_mtpond_controller(user_no, server_no)
 
 
