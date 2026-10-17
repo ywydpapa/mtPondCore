@@ -516,29 +516,38 @@ async def order_limit_sell(access_key: str, secret_key: str, market: str, volume
 
 
 # ============================================================
-# 12. 사다리 계산 및 발주
+# 12. [가격대별 맞춤] 동적 사다리 슬롯 및 익절선 계산
 # ============================================================
 def calculate_ladder_slots(total_eval: Decimal, avg_price: Decimal) -> Tuple[int, Decimal, Decimal]:
+    """
+    코인 단가(avg_price)와 총 투자평가액(total_eval)에 맞춰
+    (슬롯 개수, 시작 익절%, 스텝 증가폭%)을 최적으로 산출
+    """
     amt = float(total_eval)
     p = float(avg_price)
 
-    if p >= 100_000:
+    # 1. 코인 단가에 따른 동적 시작선 및 간격 스케일링
+    if p >= 100_000:          # 10만 원 이상 대형 코인 (BTC, BCH, SOL 등)
+        base_start = Decimal("0.25")
+        base_step = Decimal("0.12")
+    elif p >= 10_000:         # 1만 ~ 10만 원 미만 중형 코인 (NMR 등)
+        base_start = Decimal("0.35")
+        base_step = Decimal("0.18")
+    elif p >= 1_000:          # 1천 ~ 1만 원 미만
         base_start = Decimal("0.45")
-        base_step = Decimal("0.20")
-    elif p >= 10_000:
-        base_start = Decimal("0.55")
         base_step = Decimal("0.25")
-    else:
+    else:                     # 1천 원 미만 동전주 (GTC, TIA 등)
         base_start = Decimal("0.60")
         base_step = Decimal("0.30")
 
-    if amt <= 55_000:
+    # 2. 투자금 규모에 따른 슬롯 분할
+    if amt <= 55_000:         # [4만 ~ 5만 원]: 1만 원 단위 4~5슬롯
         slot_count = max(1, int(total_eval // Decimal("10000")))
-    elif amt <= 155_000:
+    elif amt <= 155_000:      # [6만 ~ 15만 원]: 5~10슬롯
         slot_count = min(10, max(5, int(total_eval // Decimal("10000"))))
-    elif amt <= 305_000:
+    elif amt <= 305_000:      # [16만 ~ 30만 원]: 2만 원 단위 격상
         slot_count = min(10, max(6, int(total_eval // Decimal("20000"))))
-    else:
+    else:                     # [31만 ~ 50만 원]: 4만 원 단위
         slot_count = min(10, max(8, int(total_eval // Decimal("40000"))))
 
     return max(1, slot_count), base_start, base_step
