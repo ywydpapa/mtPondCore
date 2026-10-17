@@ -50,17 +50,17 @@ redis_client = aioredis.Redis(
 BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = 60  # 외부 분석 서버 캐시 주기 60초
 
-RATIO_TREND = Decimal("0.50")       # 추세 스캘핑: 50%
-RATIO_GRID = Decimal("0.20")        # 그리드 하베스트: 20%
-RATIO_CASH_BUFFER = Decimal("0.30") # 현금 버퍼: 30% (항시 유지)
+RATIO_TREND = Decimal("0.50")  # 추세 스캘핑: 50%
+RATIO_GRID = Decimal("0.20")  # 그리드 하베스트: 20%
+RATIO_CASH_BUFFER = Decimal("0.30")  # 현금 버퍼: 30% (항시 유지)
 
 TREND_STOP_LOSS_PCT = Decimal("-1.4")
 TREND_HARD_STOP_PCT = Decimal("-2.5")
 
-GRID_STEP_COUNT = 4                 # 4단계 매수 그물망
+GRID_STEP_COUNT = 4  # 4단계 매수 그물망
 GRID_INTERVAL_PCT = Decimal("0.5")  # -0.5% 간격
-GRID_TARGET_TP_PCT = Decimal("0.5") # +0.5% 합산 익절
-GRID_HARD_STOP_PCT = Decimal("-2.2")# -2.2% 하단 이탈 손절
+GRID_TARGET_TP_PCT = Decimal("0.5")  # +0.5% 합산 익절
+GRID_HARD_STOP_PCT = Decimal("-2.2")  # -2.2% 하단 이탈 손절
 
 MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
 COOLDOWN_TP_SEC = 180
@@ -68,6 +68,7 @@ COOLDOWN_DEFENSE_SEC = 300
 FORCE_LIVE = True
 LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
 UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
+
 
 # ============================================================
 # 4. 동적 포트폴리오 스케일링 계산기
@@ -115,6 +116,7 @@ def calculate_dynamic_portfolio(total_equity: Decimal) -> Dict[str, Any]:
         "cash_buffer_limit": (total_equity * RATIO_CASH_BUFFER).quantize(Decimal("1000"))
     }
 
+
 # ============================================================
 # 5. 상태 관리 구조 (Redis 영속화 지원)
 # ============================================================
@@ -146,9 +148,12 @@ class CompositeStateManager:
         if data:
             clean_data = {}
             for k, v in data.items():
-                if isinstance(v, Decimal): clean_data[k] = str(v)
-                elif isinstance(v, list): clean_data[k] = v
-                else: clean_data[k] = v
+                if isinstance(v, Decimal):
+                    clean_data[k] = str(v)
+                elif isinstance(v, list):
+                    clean_data[k] = v
+                else:
+                    clean_data[k] = v
             await self.r.set(self.get_grid_key(), json.dumps(clean_data))
         else:
             await self.r.delete(self.get_grid_key())
@@ -204,7 +209,8 @@ class CompositeStateManager:
                 print(f"  └ ⚠️ [미등록 코인 감지] {mkt} → 추세 포지션 자동 편입 (수량: {w_info['total_vol']})")
                 await self.save_trend_position(mkt, {"avg_price": w_info["avg_price"], "entry_ts": time.time()})
 
-        print(f"✅ [RESTORE-COMPLETE] 복원 완료: 그리드={self.grid_position.get('market') if self.grid_position else '없음'}, 추세={list(self.trend_positions.keys())}")
+        print(
+            f"✅ [RESTORE-COMPLETE] 복원 완료: 그리드={self.grid_position.get('market') if self.grid_position else '없음'}, 추세={list(self.trend_positions.keys())}")
 
     def set_cooldown(self, market: str, is_tp: bool):
         sec = COOLDOWN_TP_SEC if is_tp else COOLDOWN_DEFENSE_SEC
@@ -213,6 +219,7 @@ class CompositeStateManager:
 
     def is_cooling_down(self, market: str) -> bool:
         return time.time() < self.cooldowns.get(market, 0.0)
+
 
 # ============================================================
 # 6. Upbit API & 호가 헬퍼
@@ -228,22 +235,29 @@ def build_jwt(access_key: str, secret_key: str, query: dict = None) -> str:
         payload['query_hash_alg'] = 'SHA512'
     return jwt.encode(payload, secret_key, algorithm="HS256")
 
+
 async def upbit_api(method: str, url: str, access_key: str, secret_key: str, params: dict = None) -> Any:
     token = build_jwt(access_key, secret_key, params)
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
     async with httpx.AsyncClient(timeout=8.0) as client:
         m = method.upper()
-        if m == "GET": r = await client.get(url, headers=headers, params=params)
-        elif m == "POST": r = await client.post(url, headers=headers, params=params)
-        elif m == "DELETE": r = await client.delete(url, headers=headers, params=params)
-        else: raise ValueError(f"지원하지 않는 메서드: {m}")
+        if m == "GET":
+            r = await client.get(url, headers=headers, params=params)
+        elif m == "POST":
+            r = await client.post(url, headers=headers, params=params)
+        elif m == "DELETE":
+            r = await client.delete(url, headers=headers, params=params)
+        else:
+            raise ValueError(f"지원하지 않는 메서드: {m}")
 
         if r.status_code >= 400: raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
         return r.json()
 
+
 def quantize_volume(vol: Decimal) -> Decimal:
     return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
 
 def get_tick_unit(price: Decimal) -> Decimal:
     p = float(price)
@@ -258,15 +272,18 @@ def get_tick_unit(price: Decimal) -> Decimal:
     if p >= 10:        return Decimal("0.1")
     return Decimal("0.01")
 
+
 def adjust_price_to_tick(raw_price: Decimal, side: str = "ask") -> Decimal:
     unit = get_tick_unit(raw_price)
     steps = raw_price / unit
     mode = ROUND_CEILING if side == "ask" else ROUND_FLOOR
     return (steps.to_integral_value(rounding=mode) * unit).quantize(unit)
 
+
 async def cancel_all_orders(access_key: str, secret_key: str, market: str):
     try:
-        orders = await upbit_api("GET", "https://api.upbit.com/v1/orders", access_key, secret_key, {"market": market, "state": "wait"})
+        orders = await upbit_api("GET", "https://api.upbit.com/v1/orders", access_key, secret_key,
+                                 {"market": market, "state": "wait"})
         if not orders or not isinstance(orders, list): return
         tasks = [
             upbit_api("DELETE", "https://api.upbit.com/v1/order", access_key, secret_key, {"uuid": o["uuid"]})
@@ -276,36 +293,71 @@ async def cancel_all_orders(access_key: str, secret_key: str, market: str):
     except Exception as e:
         print(f"[CANCEL][ERR] {market} 취소 실패: {e}")
 
+
 async def fetch_current_prices(markets: List[str], access_key: str, secret_key: str) -> Dict[str, Decimal]:
     if not markets: return {}
     try:
-        data = await upbit_api("GET", "https://api.upbit.com/v1/ticker", access_key, secret_key, {"markets": ",".join(markets)})
-        return {item["market"]: Decimal(str(item["trade_price"])) for item in data if item.get("trade_price") is not None}
+        data = await upbit_api("GET", "https://api.upbit.com/v1/ticker", access_key, secret_key,
+                               {"markets": ",".join(markets)})
+        return {item["market"]: Decimal(str(item["trade_price"])) for item in data if
+                item.get("trade_price") is not None}
     except Exception:
         return {}
 
+
 # ============================================================
-# 7. 비트코인 체력 진단 & 외부 캔들 추세 서버 연동
+# 7. 비트코인 3단계 방어 체력 진단 & 외부 캔들 추세 서버 연동
 # ============================================================
-async def check_btc_macro_health() -> Tuple[bool, str]:
+async def check_btc_market_health() -> Dict[str, Any]:
+    """
+    비트코인(KRW-BTC)의 1시간/4시간 캔들을 정밀 분석하여 시장 전체의 위험도 판별
+    반환: {"status": "NORMAL" / "CAUTION" / "EMERGENCY", "btc_pnl_1h": 변동률, "msg": 상태메시지}
+    """
     try:
         url = "https://api.upbit.com/v1/candles/minutes/60"
         async with httpx.AsyncClient(timeout=5.0) as client:
             res = await client.get(url, params={"market": "KRW-BTC", "count": 25})
-            if res.status_code != 200: return False, "BTC 캔들 조회 실패"
+            if res.status_code != 200:
+                return {"status": "NORMAL", "btc_pnl_1h": 0.0, "msg": "BTC 캔들 조회 실패"}
             candles = res.json()
 
         cur_price = Decimal(str(candles[0]["trade_price"]))
+        prev_1h_price = Decimal(str(candles[1]["trade_price"]))
+        prev_4h_price = Decimal(str(candles[4]["trade_price"]))
+
         closes = [Decimal(str(c["trade_price"])) for c in candles]
         ma20 = sum(closes[:20]) / Decimal("20")
 
-        if cur_price < ma20:
-            return False, f"BTC 60분봉 20이평 하회 (현재: {cur_price:,.0f} < MA20: {ma20:,.0f})"
-        return True, "BTC 60분봉 안정적 추세 유지"
+        pnl_1h = float(((cur_price - prev_1h_price) / prev_1h_price) * 100)
+        pnl_4h = float(((cur_price - prev_4h_price) / prev_4h_price) * 100)
+
+        # 1. 비상 상태 (EMERGENCY): 1시간 내 -1.8% 이상 급락 또는 4시간 내 -3.5% 이상 하락 또는 MA20 이탈 심화
+        if pnl_1h <= -1.8 or pnl_4h <= -3.5 or cur_price < (ma20 * Decimal("0.985")):
+            return {
+                "status": "EMERGENCY",
+                "btc_pnl_1h": round(pnl_1h, 2),
+                "msg": f"🚨 [BTC-EMERGENCY] 급락 감지! (1시간: {pnl_1h:+.2f}%, 4시간: {pnl_4h:+.2f}%, 현재가 < MA20)"
+            }
+
+        # 2. 주의 상태 (CAUTION): 1시간 내 -0.8% ~ -1.8% 조정 중 또는 MA20 하회
+        elif pnl_1h <= -0.8 or cur_price < ma20:
+            return {
+                "status": "CAUTION",
+                "btc_pnl_1h": round(pnl_1h, 2),
+                "msg": f"⚠️ [BTC-CAUTION] 조정세 감지 (1시간: {pnl_1h:+.2f}%, MA20 근접/하회)"
+            }
+
+        return {
+            "status": "NORMAL",
+            "btc_pnl_1h": round(pnl_1h, 2),
+            "msg": "✅ [BTC-NORMAL] 안정적 추세 유지"
+        }
     except Exception as e:
-        return False, f"BTC 분석 에러: {e}"
+        return {"status": "NORMAL", "btc_pnl_1h": 0.0, "msg": f"BTC 분석 에러: {e}"}
+
 
 _patterns_cache: Dict[str, Any] = {"ts": 0.0, "data": []}
+
 
 async def fetch_all_candle_patterns() -> List[Dict[str, Any]]:
     """외부 캔들 추세 분석 서버에서 전체 코인 최신 평가 데이터를 1회 일괄 조회"""
@@ -328,6 +380,7 @@ async def fetch_all_candle_patterns() -> List[Dict[str, Any]]:
 
     return _patterns_cache.get("data", [])
 
+
 async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
     """추세 스캘핑용: 점수(overall_score >= 3) 및 단기 거래 체결량이 풍부한 종목 추출"""
     coins = await fetch_all_candle_patterns()
@@ -339,9 +392,9 @@ async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
             score = int(c.get("overall_score", 0))
             price = float(c.get("price", 0))
             trades = int((c.get("trade_activity") or {}).get("trade_count_10m", 0))
-        except (ValueError, TypeError): continue
+        except (ValueError, TypeError):
+            continue
 
-        # 3점 이상, 10분 거래수 50회 이상, 동전주~중형주 범위
         if score >= 3 and trades >= 50 and price >= 30:
             qualified.append({
                 "market": mkt,
@@ -350,9 +403,9 @@ async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
                 "price": price
             })
 
-    # 패턴 점수 우선, 거래수 차순 정렬
     qualified.sort(key=lambda x: (x["overall_score"], x["trade_count"]), reverse=True)
     return qualified
+
 
 async def get_grid_active_candidates() -> List[Dict[str, Any]]:
     """그리드 하베스트용: 점수 무관, 10분 체결 빈도가 가장 높은 횡보형 종목 추출"""
@@ -364,9 +417,9 @@ async def get_grid_active_candidates() -> List[Dict[str, Any]]:
         try:
             price = float(c.get("price", 0))
             trades = int((c.get("trade_activity") or {}).get("trade_count_10m", 0))
-        except (ValueError, TypeError): continue
+        except (ValueError, TypeError):
+            continue
 
-        # 단가 50원 ~ 50,000원, 체결 빈도 80회 이상
         if 50 <= price <= 50_000 and trades >= 80:
             candidates.append({
                 "market": mkt,
@@ -376,6 +429,7 @@ async def get_grid_active_candidates() -> List[Dict[str, Any]]:
 
     candidates.sort(key=lambda x: x["trade_count"], reverse=True)
     return candidates
+
 
 async def check_bullish_trend(market: str) -> bool:
     """업비트 실시간 15분봉 정배열(5 > 20) & 양봉 재확인"""
@@ -396,6 +450,7 @@ async def check_bullish_trend(market: str) -> bool:
     except Exception:
         return False
 
+
 async def check_sideways_grid_candidate(market: str) -> bool:
     """그리드용 15분봉 밴드폭(1.2% ~ 3.0%) 횡보성 확인"""
     try:
@@ -412,6 +467,7 @@ async def check_sideways_grid_candidate(market: str) -> bool:
         return bool(1.2 <= bandwidth_pct <= 3.0)
     except Exception:
         return False
+
 
 # ============================================================
 # 8. 사다리 익절 주문 배치 함수
@@ -432,10 +488,14 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, 
         if total_eval < MIN_ORDER_NOTIONAL_KRW: return
 
         p = float(avg_price)
-        if p >= 100_000:   start_pct, step_pct = Decimal("0.25"), Decimal("0.12")
-        elif p >= 10_000:  start_pct, step_pct = Decimal("0.35"), Decimal("0.18")
-        elif p >= 1_000:   start_pct, step_pct = Decimal("0.45"), Decimal("0.25")
-        else:              start_pct, step_pct = Decimal("0.60"), Decimal("0.30")
+        if p >= 100_000:
+            start_pct, step_pct = Decimal("0.25"), Decimal("0.12")
+        elif p >= 10_000:
+            start_pct, step_pct = Decimal("0.35"), Decimal("0.18")
+        elif p >= 1_000:
+            start_pct, step_pct = Decimal("0.45"), Decimal("0.25")
+        else:
+            start_pct, step_pct = Decimal("0.60"), Decimal("0.30")
 
         slot_count = max(1, min(10, int(total_eval // Decimal("10000"))))
         slice_vol = quantize_volume(avail_bal / Decimal(str(slot_count)))
@@ -467,10 +527,12 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, 
     except Exception as e:
         print(f"[LADDER-TP][ERR] {market} 사다리 주문 실패: {e}")
 
+
 # ============================================================
 # 9. 단일 종목 그리드 하베스트 발주 및 관리
 # ============================================================
-async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: str, budget: Decimal, step_amt: Decimal, sm: CompositeStateManager):
+async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: str, budget: Decimal, step_amt: Decimal,
+                                     sm: CompositeStateManager):
     print(f"🕸️ [GRID-HARVEST] {market} 그리드 배치 (총예산: {budget:,.0f}원 | 단계당: {step_amt:,.0f}원)")
     await cancel_all_orders(access_key, secret_key, market)
 
@@ -478,7 +540,6 @@ async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: s
     cur_p = Decimal(str(t_res[0]["trade_price"]))
     grid_orders = []
 
-    # 1단계 시장가 즉시 진입
     if LIVE_TRADING:
         buy_r = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
             "market": market, "side": "bid", "price": str(step_amt), "ord_type": "price"
@@ -491,7 +552,6 @@ async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: s
         raw_target_p = cur_p * (Decimal("1") - (drop_pct / Decimal("100")))
         limit_buy_p = adjust_price_to_tick(raw_target_p, side="bid")
 
-        # 1틱 아래로 강제 분리
         if limit_buy_p >= prev_buy_p:
             limit_buy_p = prev_buy_p - get_tick_unit(limit_buy_p)
 
@@ -513,6 +573,7 @@ async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: s
         "last_tp_uuid": None,
         "deployed_ts": time.time()
     })
+
 
 async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeStateManager):
     if not sm.grid_position or sm.grid_position.get("deploying"):
@@ -565,17 +626,22 @@ async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeSt
         target_tp_p = adjust_price_to_tick(avg_p * (Decimal("1") + (GRID_TARGET_TP_PCT / Decimal("100"))), side="ask")
         if LIVE_TRADING:
             tp_res = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                "market": mkt, "side": "ask", "volume": str(quantize_volume(bal)), "price": str(target_tp_p), "ord_type": "limit"
+                "market": mkt, "side": "ask", "volume": str(quantize_volume(bal)), "price": str(target_tp_p),
+                "ord_type": "limit"
             })
             sm.grid_position["last_tp_uuid"] = tp_res.get("uuid")
             print(f"🎯 [GRID-TP-PLACED] {mkt} 합산 평단가({avg_p:,.0f}원) 대비 +{GRID_TARGET_TP_PCT}% 매도 등록 (@{target_tp_p}원)")
 
+
 # ============================================================
-# 10. 메인 트레이딩 엔진 루프
+# 10. 메인 트레이딩 엔진 루프 (비트코인 3단계 방어 통합)
 # ============================================================
 async def run_hybrid_engine(user_no: int, server_no: int):
     async with SessionLocal() as session:
-        sql = text("""SELECT apiKey1, apiKey2 FROM traceUser WHERE userNo = :u AND serverNo = :s LIMIT 1""")
+        sql = text("""SELECT apiKey1, apiKey2
+                      FROM traceUser
+                      WHERE userNo = :u
+                        AND serverNo = :s LIMIT 1""")
         result = await session.execute(sql, {"u": user_no, "s": server_no})
         row = result.fetchone()
         if not row: return
@@ -585,12 +651,16 @@ async def run_hybrid_engine(user_no: int, server_no: int):
     await sm.restore_state_from_redis(access_key, secret_key)
 
     last_heartbeat_ts = time.time()
-    print(f"=== [복합 포트폴리오 엔진 가동] 설정비율: 추세 50% / 그리드 20% / 현금버퍼 30% ===")
+    print(f"=== [복합 포트폴리오 엔진 가동] 설정비율: 추세 50% / 그리드 20% / 현금버퍼 30% (BTC 3단계 방어 활성) ===")
 
     while True:
         try:
             loop_now = time.time()
-            btc_healthy, btc_msg = await check_btc_macro_health()
+
+            # ★ 비트코인 3단계 방어 체력 진단 호출
+            btc_health = await check_btc_market_health()
+            btc_status = btc_health["status"]
+            btc_msg = btc_health["msg"]
 
             # 1. 잔고 및 보유 코인 집계
             accounts = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
@@ -617,7 +687,8 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 b_avail = Decimal(str(a.get("balance", "0")))
                 b_avg = Decimal(str(a.get("avg_buy_price", "0")))
                 if b_avail * b_avg >= MIN_ORDER_NOTIONAL_KRW:
-                    st = sm.trend_positions.setdefault(mkt, {"avg_price": b_avg, "entry_ts": time.time(), "realloc_ts": 0.0})
+                    st = sm.trend_positions.setdefault(mkt,
+                                                       {"avg_price": b_avg, "entry_ts": time.time(), "realloc_ts": 0.0})
                     if loop_now - float(st.get("realloc_ts", 0.0)) >= 10.0:
                         st["realloc_ts"] = loop_now
                         print(f"📥 [AUTO-REALLOC] {mkt} 미배치 잔고({b_avail}개) 감지 → 사다리 재배치 실행")
@@ -644,7 +715,7 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 trend_status = list(sm.trend_positions.keys()) if sm.trend_positions else "없음"
                 print(
                     f"💓 [HEARTBEAT] 총자산: {total_equity:,.0f}원 (원화: {krw_balance:,.0f}원 / 버퍼: {cash_buffer_limit:,.0f}원) | "
-                    f"그리드: {grid_status} | 추세: {trend_status} | BTC: {'정상' if btc_healthy else '주의'}"
+                    f"그리드: {grid_status} | 추세: {trend_status} | 시장상태: {btc_status}"
                 )
 
             # 4. 그리드 포지션 관리
@@ -667,12 +738,18 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 avg_p = sm.trend_positions[mkt]["avg_price"]
                 if avg_p <= 0: continue
 
-                t_res = await upbit_api("GET", "https://api.upbit.com/v1/ticker", access_key, secret_key, {"markets": mkt})
+                t_res = await upbit_api("GET", "https://api.upbit.com/v1/ticker", access_key, secret_key,
+                                        {"markets": mkt})
                 cur_p = Decimal(str(t_res[0]["trade_price"]))
                 pnl = ((cur_p - avg_p) / avg_p) * Decimal("100")
 
-                if pnl <= TREND_HARD_STOP_PCT:
-                    print(f"🚨 [TREND-STOP] {mkt} 최종 손절선({pnl:.2f}%) 도달 → 전량 시장가 청산")
+                # 만약 시장이 EMERGENCY 상태이면 기존 손절선보다 타이트하게 방어 손절(-1.8%) 적용
+                effective_stop_cut = TREND_HARD_STOP_PCT
+                if btc_status == "EMERGENCY":
+                    effective_stop_cut = Decimal("-1.8")
+
+                if pnl <= effective_stop_cut:
+                    print(f"🚨 [TREND-STOP] {mkt} 손절선 도달 (현재 PNL: {pnl:.2f}% / 기준: {effective_stop_cut}%) → 전량 시장가 청산")
                     await cancel_all_orders(access_key, secret_key, mkt)
                     await asyncio.sleep(0.4)
                     accs = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
@@ -686,50 +763,72 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                     sm.set_cooldown(mkt, is_tp=False)
                     await sm.remove_trend_position(mkt)
 
-            # 6. 신규 매수 탐색 (★ BTC 건전 & 현금버퍼 30% 보존 조건 충족 시만 실행)
-            if btc_healthy:
-                investable_krw = krw_balance - cash_buffer_limit
+                # 6. 신규 매수 탐색 (★ BTC 상태 및 현금버퍼 30% 보존 조건 검증)
+                if btc_status == "EMERGENCY":
+                    print(f"🛑 {btc_msg} -> 모든 신규 매수 및 진입을 전면 차단합니다.")
+                elif btc_status == "CAUTION":
+                    print(f"⚠️ {btc_msg} -> 조정세 구간: 신규 매수를 일시 보류합니다.")
+                else:
+                    # [NORMAL 상태]
+                    investable_krw = krw_balance - cash_buffer_limit
+                    trend_slots_remain = max_trend_slots - len(sm.trend_positions)
 
-                # A) 그리드 신규 (외부 캔들 서버 기반 체결빈도 최상위 횡보 종목 동적 추출)
-                if sm.grid_position is None and investable_krw >= grid_budget:
-                    grid_candidates = await get_grid_active_candidates()
-                    for cand_item in grid_candidates:
-                        cand = cand_item["market"]
-                        if cand not in held_coins and not sm.is_cooling_down(cand):
-                            if await check_sideways_grid_candidate(cand):
-                                print(f"🎯 [GRID-PICK] 캔들 분석 기반 활성 횡보 종목 선정: {cand} (10분 거래수: {cand_item['trade_count']})")
-                                sm.grid_position = {"market": cand, "deploying": True}
-                                asyncio.create_task(deploy_single_grid_harvest(access_key, secret_key, cand, grid_budget, grid_step_amt, sm))
-                                krw_balance -= grid_budget
-                                investable_krw -= grid_budget
-                                break
+                    trend_executed = False  # 이번 루프에서 추세 스캘핑 진입 여부 추적
 
-                # B) 추세 신규 (외부 캔들 서버 기반 종합점수 overall_score >= 3 종목 동적 추출)
-                trend_slots_remain = max_trend_slots - len(sm.trend_positions)
-                if trend_slots_remain > 0 and investable_krw >= trend_per_trade:
-                    trend_candidates = await get_trend_scalping_candidates()
-                    for cand_item in trend_candidates:
-                        cand = cand_item["market"]
-                        if cand not in held_coins and cand != (sm.grid_position.get("market") if sm.grid_position else None):
-                            if not sm.is_cooling_down(cand) and await check_bullish_trend(cand):
-                                t_res = await upbit_api("GET", "https://api.upbit.com/v1/ticker", access_key, secret_key, {"markets": cand})
-                                cur_p = Decimal(str(t_res[0]["trade_price"]))
+                    # -------------------------------------------------------------
+                    # [1순위] 추세 스캘핑 적극 탐색 (상승 모멘텀 종목 우선 공략)
+                    # -------------------------------------------------------------
+                    if trend_slots_remain > 0 and investable_krw >= trend_per_trade:
+                        trend_candidates = await get_trend_scalping_candidates()
+                        for cand_item in trend_candidates:
+                            cand = cand_item["market"]
+                            if cand not in held_coins and cand != (
+                            sm.grid_position.get("market") if sm.grid_position else None):
+                                if not sm.is_cooling_down(cand) and await check_bullish_trend(cand):
+                                    t_res = await upbit_api("GET", "https://api.upbit.com/v1/ticker", access_key,
+                                                            secret_key, {"markets": cand})
+                                    cur_p = Decimal(str(t_res[0]["trade_price"]))
 
-                                print(f"🚀 [TREND-BUY] 캔들 분석 기반 모멘텀 진입: {cand} (점수: {cand_item['overall_score']}, 10분 거래: {cand_item['trade_count']}) | 금액: {trend_per_trade:,.0f}원")
-                                if LIVE_TRADING:
-                                    await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                                        "market": cand, "side": "bid", "price": str(trend_per_trade), "ord_type": "price"
-                                    })
-                                await sm.save_trend_position(cand, {"avg_price": cur_p, "entry_ts": time.time()})
-                                asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, cand, sm))
-                                krw_balance -= trend_per_trade
-                                investable_krw -= trend_per_trade
-                                break
+                                    print(
+                                        f"🚀 [TREND-BUY] 모멘텀 진입: {cand} (점수: {cand_item['overall_score']}) | 금액: {trend_per_trade:,.0f}원")
+                                    if LIVE_TRADING:
+                                        await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+                                            "market": cand, "side": "bid", "price": str(trend_per_trade),
+                                            "ord_type": "price"
+                                        })
+                                    await sm.save_trend_position(cand,
+                                                                    {"avg_price": cur_p, "entry_ts": time.time()})
+                                    asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, cand, sm))
+                                    krw_balance -= trend_per_trade
+                                    investable_krw -= trend_per_trade
+                                    trend_executed = True  # 추세 진입 성공 플래그 ON
+                                    break
+
+                    # -------------------------------------------------------------
+                    # [2순위] 추세 스캘핑이 저조할 때(진입 종목이 없을 때) 그리드 하베스트 발동
+                    # -------------------------------------------------------------
+                    if not trend_executed and sm.grid_position is None and investable_krw >= grid_budget:
+                        grid_candidates = await get_grid_active_candidates()
+                        for cand_item in grid_candidates:
+                            cand = cand_item["market"]
+                            if cand not in held_coins:
+                                if await check_sideways_grid_candidate(cand):
+                                    print(
+                                        f"🎯 [GRID-PICK] 추세 스캘핑 부진/조건 미달 → 횡보 그리드 하베스트 전환 발동: {cand} (10분 거래수: {cand_item['trade_count']})")
+                                    sm.grid_position = {"market": cand, "deploying": True}
+                                    asyncio.create_task(
+                                        deploy_single_grid_harvest(access_key, secret_key, cand, grid_budget,
+                                                                    grid_step_amt, sm))
+                                    krw_balance -= grid_budget
+                                    investable_krw -= grid_budget
+                                    break
+
 
         except Exception as e:
             print(f"[HYBRID-LOOP][ERR] {e}")
 
         await asyncio.sleep(4)
+
 
 # ============================================================
 # 11. Redis On/Off 감시 컨트롤러 및 진입점
@@ -776,10 +875,12 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
         await asyncio.sleep(CONTROLLER_POLL_SEC)
 
+
 async def main():
     user_no = int(os.getenv("USER_NO", "100001"))
     server_no = int(os.getenv("SERVER_NO", "21"))
     await run_mtpond_controller(user_no, server_no)
+
 
 if __name__ == "__main__":
     try:
