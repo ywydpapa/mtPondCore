@@ -425,6 +425,40 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
         print(f"[CANCEL-ALL][ERR] {market} 미체결 취소 실패: {e}")
 
 
+def calculate_ladder_slots(total_eval: Decimal) -> Tuple[int, Decimal, Decimal]:
+    """
+    투자금액에 따라 (슬롯 개수, 시작 익절%, 스텝 증가폭%)을 동적으로 산출
+    반환값: (slot_count, start_pct, step_pct)
+    """
+    amt = float(total_eval)
+
+    if amt <= 55_000:          # [4만 ~ 5만 원]: 1만 원 단위 4~5슬롯
+        slot_unit = Decimal("10000")
+        slot_count = int(total_eval // slot_unit)
+        start_pct = Decimal("0.30")
+        step_pct = Decimal("0.20")
+
+    elif amt <= 155_000:       # [6만 ~ 15만 원]: 1만 원 단위, 최대 10슬롯으로 압축
+        slot_count = min(10, max(5, int(total_eval // Decimal("10000"))))
+        start_pct = Decimal("0.25")
+        step_pct = Decimal("0.12")
+
+    elif amt <= 305_000:       # [16만 ~ 30만 원]: 2만 원 단위 격상 (8~10슬롯)
+        slot_unit = Decimal("20000")
+        slot_count = min(10, max(6, int(total_eval // slot_unit)))
+        start_pct = Decimal("0.22")
+        step_pct = Decimal("0.14")
+
+    else:                      # [31만 ~ 50만 원]: 3만~5만 원 단위 격상 (8~10슬롯 유지)
+        slot_unit = Decimal("40000")
+        slot_count = min(10, max(8, int(total_eval // slot_unit)))
+        start_pct = Decimal("0.20")
+        step_pct = Decimal("0.16")
+
+    return max(1, slot_count), start_pct, step_pct
+
+
+
 # ============================================================
 # 9. 상승 모멘텀 검증 (15분봉 정배열 & 실시간 양봉)
 # ============================================================
@@ -524,9 +558,15 @@ async def order_limit_sell(access_key: str, secret_key: str, market: str, volume
 
 
 # ============================================================
-# 12. [동적 개선] 가격대별 사다리 익절 주문 배치 함수
+# 12. [동적 적용] 4만~50만원 전 구간 대응 사다리 배치 함수
 # ============================================================
-async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, ps: PositionState, start_step_override: Decimal = None):
+async def place_ladder_tp_orders(
+    access_key: str,
+    secret_key: str,
+    market: str,
+    ps: PositionState,
+    start_step_override: Decimal = None
+):
     st = ps.data.setdefault(market, {})
     if st.get("is_processing_order"):
         return
@@ -537,7 +577,7 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, 
         avail_bal = Decimal("0")
         avg_price = Decimal("0")
 
-        # 체결 지갑 반영 대기 (최대 4초 폴링)
+        # 체결 잔고 확정 대기 (최대 4초 폴링)
         for _ in range(4):
             await asyncio.sleep(1.0)
             accounts = await fetch_upbit_accounts(access_key, secret_key)
@@ -552,47 +592,46 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str, 
         if total_eval < MIN_ORDER_NOTIONAL_KRW:
             return
 
-        slot_count = int(total_eval // MIN_SLOT_NOTIONAL_KRW)
-        if slot_count < 1:
-            slot_count = 1
+        # ★ [핵심] 4만 ~ 50만 원 전 구간 동적 슬롯 계산
+        slot_count, def_start_pct, step_pct = calculate_ladder_slots(total_eval)
+        start_pct = start_step_override if start_step_override else def_start_pct
 
         slice_vol = quantize_volume(avail_bal / Decimal(str(slot_count)))
         remaining_vol = avail_bal
-
-        # ★ 가격대에 따른 동적 시작선 및 간격 추출
-        dynamic_start, dynamic_step = get_dynamic_ladder_config(avg_price)
-        start_pct = start_step_override if start_step_override else dynamic_start
+        prev_limit_p = Decimal("0")
 
         print(
-            f"📐 [DYNAMIC-LADDER] {market} (평단가: {avg_price:,.0f}원) | "
-            f"시작: +{start_pct}% / 간격: +{dynamic_step}% | 총액: {total_eval:,.0f}원 ({slot_count}슬롯)"
+            f"📐 [LADDER-TP] {market} 동적 사다리 배치 시작 | "
+            f"투자평가액: {total_eval:,.0f}원 | {slot_count}개 슬롯 | "
+            f"시작: +{start_pct}% / 스텝: +{step_pct}%"
         )
 
         for i in range(1, slot_count + 1):
-            step_pct = start_pct + (dynamic_step * Decimal(str(i - 1)))
-            target_p = avg_price * (Decimal("1") + (step_pct / Decimal("100")))
+            curr_target_pct = start_pct + (step_pct * Decimal(str(i - 1)))
+            target_p = avg_price * (Decimal("1") + (curr_target_pct / Decimal("100")))
             limit_p = adjust_price_to_tick(target_p, side="ask")
 
-            # 틱 맞춤 후 직전 호가와 겹치지 않도록 최소 1틱 이상 상승 보정
+            # 틱 겹침 방지: 최소 1틱 이상 강제 상승
             if i > 1 and limit_p <= prev_limit_p:
                 tick = get_tick_unit(limit_p)
                 limit_p = prev_limit_p + tick
 
+            # 마지막 슬롯은 잔여 오차 없이 전량 털어내도록 수량 일치
             order_v = quantize_volume(remaining_vol) if i == slot_count else slice_vol
             order_v = min(order_v, remaining_vol)
 
             if order_v * limit_p >= MIN_ORDER_NOTIONAL_KRW:
                 if LIVE_TRADING:
                     await order_limit_sell(access_key, secret_key, market, order_v, limit_p)
-                print(f"  └ [{market}] 슬롯 #{i}: {order_v}개 @ {limit_p}원 (+{step_pct}%)")
+                print(f"  └ [{market}] 슬롯 #{i}: {order_v}개 @ {limit_p}원 (+{curr_target_pct:.2f}%)")
                 remaining_vol -= order_v
                 prev_limit_p = limit_p
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.15) # 업비트 API 초당 호출제한(초당 8회) 준수
 
         st["last_order_ts"] = time.time()
 
     except Exception as e:
-        print(f"[LADDER-TP][ERR] {market} 동적 사다리 주문 배치 실패: {e}")
+        print(f"[LADDER-TP][ERR] {market} 사다리 주문 배치 실패: {e}")
     finally:
         st["is_processing_order"] = False
 
