@@ -186,7 +186,7 @@ def apply_dynamic_config(cfg: dict):
         except:
             return None
 
-    # 1. 최초 투입 금액 우선 반영 (initAmt, range_buy_krw, firstBuyAmt 등 포괄 수용)
+    # 1. 최초 투입 금액 우선 반영
     for key in ("initAmt", "range_buy_krw", "RANGE_BUY_KRW", "firstBuyAmt", "init_amt"):
         if key in cfg:
             v = to_dec(cfg.get(key))
@@ -197,7 +197,7 @@ def apply_dynamic_config(cfg: dict):
                     print(f"📌 [REDIS-CONFIG] 최초 투입 금액 갱신: {old_val:,.0f}원 → {RANGE_BUY_KRW:,.0f}원")
                 break
 
-    # 2. 최대 종목 수 반영 (설정값이 없으면 투입 금액에 맞춰 자동 산정)
+    # 2. 최대 종목 수 반영
     has_custom_cnt = False
     for key in ("maxCoincnt", "max_active_markets", "MAX_ACTIVE_MARKETS"):
         if key in cfg:
@@ -304,7 +304,7 @@ async def upbit_request(method: str, url: str, access_key: str, secret_key: str,
     backoff = 1.0
     for attempt in range(1, max_retry + 1):
         token = build_upbit_jwt_with_params(access_key, secret_key, params) if (
-                    params or method.upper() != "GET") else build_upbit_jwt_simple(access_key, secret_key)
+                params or method.upper() != "GET") else build_upbit_jwt_simple(access_key, secret_key)
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
@@ -418,6 +418,57 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
 
 
 # ============================================================
+# 8.1. 비트코인 3단계 방어 체력 진단 함수 (★ 정지 장치)
+# ============================================================
+async def check_btc_market_health() -> Dict[str, Any]:
+    """
+    비트코인(KRW-BTC)의 1시간/4시간 캔들을 정밀 분석하여 시장 전체의 위험도 판별
+    반환: {"status": "NORMAL" / "CAUTION" / "EMERGENCY", "btc_pnl_1h": 변동률, "msg": 상태메시지}
+    """
+    try:
+        url = "https://api.upbit.com/v1/candles/minutes/60"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.get(url, params={"market": "KRW-BTC", "count": 25})
+            if res.status_code != 200:
+                return {"status": "NORMAL", "btc_pnl_1h": 0.0, "msg": "BTC 캔들 조회 실패"}
+            candles = res.json()
+
+        cur_price = Decimal(str(candles[0]["trade_price"]))
+        prev_1h_price = Decimal(str(candles[1]["trade_price"]))
+        prev_4h_price = Decimal(str(candles[4]["trade_price"]))
+
+        closes = [Decimal(str(c["trade_price"])) for c in candles]
+        ma20 = sum(closes[:20]) / Decimal("20")
+
+        pnl_1h = float(((cur_price - prev_1h_price) / prev_1h_price) * 100)
+        pnl_4h = float(((cur_price - prev_4h_price) / prev_4h_price) * 100)
+
+        # 1. 비상 상태 (EMERGENCY): 1시간 내 -1.8% 이상 급락 또는 4시간 내 -3.5% 이상 하락 또는 MA20 이탈 심화
+        if pnl_1h <= -1.8 or pnl_4h <= -3.5 or cur_price < (ma20 * Decimal("0.985")):
+            return {
+                "status": "EMERGENCY",
+                "btc_pnl_1h": round(pnl_1h, 2),
+                "msg": f"🚨 [BTC-EMERGENCY] 급락 감지! (1시간: {pnl_1h:+.2f}%, 4시간: {pnl_4h:+.2f}%, 현재가 < MA20)"
+            }
+
+        # 2. 주의 상태 (CAUTION): 1시간 내 -0.8% ~ -1.8% 조정 중 또는 MA20 하회
+        elif pnl_1h <= -0.8 or cur_price < ma20:
+            return {
+                "status": "CAUTION",
+                "btc_pnl_1h": round(pnl_1h, 2),
+                "msg": f"⚠️ [BTC-CAUTION] 조정세 감지 (1시간: {pnl_1h:+.2f}%, MA20 근접/하회)"
+            }
+
+        return {
+            "status": "NORMAL",
+            "btc_pnl_1h": round(pnl_1h, 2),
+            "msg": "✅ [BTC-NORMAL] 안정적 추세 유지"
+        }
+    except Exception as e:
+        return {"status": "NORMAL", "btc_pnl_1h": 0.0, "msg": f"BTC 분석 에러: {e}"}
+
+
+# ============================================================
 # 9. 상승 모멘텀 검증 (15분봉 정배열 & 실시간 양봉)
 # ============================================================
 async def check_bullish_momentum(market: str) -> bool:
@@ -527,27 +578,27 @@ def calculate_ladder_slots(total_eval: Decimal, avg_price: Decimal) -> Tuple[int
     p = float(avg_price)
 
     # 1. 코인 단가에 따른 동적 시작선 및 간격 스케일링
-    if p >= 100_000:          # 10만 원 이상 대형 코인 (BTC, BCH, SOL 등)
+    if p >= 100_000:  # 10만 원 이상 대형 코인 (BTC, BCH, SOL 등)
         base_start = Decimal("0.25")
         base_step = Decimal("0.12")
-    elif p >= 10_000:         # 1만 ~ 10만 원 미만 중형 코인 (NMR 등)
+    elif p >= 10_000:  # 1만 ~ 10만 원 미만 중형 코인 (NMR 등)
         base_start = Decimal("0.35")
         base_step = Decimal("0.18")
-    elif p >= 1_000:          # 1천 ~ 1만 원 미만
+    elif p >= 1_000:  # 1천 ~ 1만 원 미만
         base_start = Decimal("0.45")
         base_step = Decimal("0.25")
-    else:                     # 1천 원 미만 동전주 (GTC, TIA 등)
+    else:  # 1천 원 미만 동전주 (GTC, TIA 등)
         base_start = Decimal("0.60")
         base_step = Decimal("0.30")
 
     # 2. 투자금 규모에 따른 슬롯 분할
-    if amt <= 55_000:         # [4만 ~ 5만 원]: 1만 원 단위 4~5슬롯
+    if amt <= 55_000:  # [4만 ~ 5만 원]: 1만 원 단위 4~5슬롯
         slot_count = max(1, int(total_eval // Decimal("10000")))
-    elif amt <= 155_000:      # [6만 ~ 15만 원]: 5~10슬롯
+    elif amt <= 155_000:  # [6만 ~ 15만 원]: 5~10슬롯
         slot_count = min(10, max(5, int(total_eval // Decimal("10000"))))
-    elif amt <= 305_000:      # [16만 ~ 30만 원]: 2만 원 단위 격상
+    elif amt <= 305_000:  # [16만 ~ 30만 원]: 2만 원 단위 격상
         slot_count = min(10, max(6, int(total_eval // Decimal("20000"))))
-    else:                     # [31만 ~ 50만 원]: 4만 원 단위
+    else:  # [31만 ~ 50만 원]: 4만 원 단위
         slot_count = min(10, max(8, int(total_eval // Decimal("40000"))))
 
     return max(1, slot_count), base_start, base_step
@@ -676,7 +727,7 @@ async def place_defense_ladder_orders(access_key: str, secret_key: str, market: 
 
 
 # ============================================================
-# 14. 메인 모니터링 루프
+# 14. 메인 모니터링 루프 (비트코인 3단계 정지 장치 통합)
 # ============================================================
 async def monitor_positions(user_no: int, server_no: int):
     start_ts = time.time()
@@ -696,7 +747,7 @@ async def monitor_positions(user_no: int, server_no: int):
         access_key, secret_key = row[0], row[1]
 
     ps = PositionState()
-    print(f"=== [단기 모멘텀 스캘핑 엔진 가동] 종목당 투입예산: {RANGE_BUY_KRW:,.0f}원 | 최대종목: {MAX_ACTIVE_MARKETS}개 ===")
+    print(f"=== [단기 모멘텀 스캘핑 + BTC 정지 장치 적용] 종목당 투입예산: {RANGE_BUY_KRW:,.0f}원 | 최대종목: {MAX_ACTIVE_MARKETS}개 ===")
     excluded = await get_excluded_markets(force_reload=True)
 
     while True:
@@ -707,6 +758,11 @@ async def monitor_positions(user_no: int, server_no: int):
             if loop_now - last_cfg_sync >= CONTROLLER_POLL_SEC:
                 last_cfg_sync = loop_now
                 await sync_redis_config(user_no)
+
+            # ★ 비트코인 3단계 방어 체력 진단 호출 (정지 장치)
+            btc_health = await check_btc_market_health()
+            btc_status = btc_health["status"]
+            btc_msg = btc_health["msg"]
 
             excluded = await get_excluded_markets()
             raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
@@ -764,9 +820,14 @@ async def monitor_positions(user_no: int, server_no: int):
 
                 st = ps.update_or_init(market, pnl, avg_p)
 
+                # 만약 시장이 EMERGENCY 상태이면 기존 손절선보다 타이트하게 방어 손절(-1.8%) 적용
+                effective_stop_cut = HARD_STOP_LOSS_PCT
+                if btc_status == "EMERGENCY":
+                    effective_stop_cut = Decimal("-1.8")
+
                 # 최종 손절
-                if pnl <= HARD_STOP_LOSS_PCT:
-                    print(f"🚨 [HARD-STOP-LOSS] {market} 방어선 붕괴 ({pnl}%) → 시장가 전량 청산")
+                if pnl <= effective_stop_cut:
+                    print(f"🚨 [HARD-STOP-LOSS] {market} 방어선 붕괴 (PNL: {pnl}% / 기준: {effective_stop_cut}%) → 시장가 전량 청산")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
                     await asyncio.sleep(0.4)
                     accs = await fetch_upbit_accounts(access_key, secret_key)
@@ -781,7 +842,7 @@ async def monitor_positions(user_no: int, server_no: int):
                             break
                     continue
 
-                # 방어 틱 사다리
+                # 방어 틱 사다리 (BTC EMERGENCY 상태가 아닐 때만 작동 허용 혹은 유지)
                 if pnl <= DEFENSE_TRIGGER_PCT and not st.get("defense_mode"):
                     asyncio.create_task(place_defense_ladder_orders(access_key, secret_key, market, ps))
                     continue
@@ -799,45 +860,51 @@ async def monitor_positions(user_no: int, server_no: int):
                     is_defense = ps.data[mkt].get("defense_mode", False)
                     ps.mark_sold(mkt, reason="DEFENSE" if is_defense else "TP")
 
-            # 신규 매수 (Redis 투입 예산 RANGE_BUY_KRW 반영)
+            # 신규 매수 탐색 (★ BTC 상태 정지 장치 적용)
             active_count = len(enriched)
             remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
 
-            if remaining_slots > 0 and available_krw >= MIN_ORDER_NOTIONAL_KRW and available_invest_krw >= MIN_ORDER_NOTIONAL_KRW:
-                candidates = await fetch_bb_patterns_candidates()
-                for item in candidates:
-                    if remaining_slots <= 0:
-                        break
+            if btc_status == "EMERGENCY":
+                print(f"🛑 {btc_msg} -> 모든 신규 매수 및 추세 진입을 전면 차단합니다.")
+            elif btc_status == "CAUTION":
+                print(f"⚠️ {btc_msg} -> 조정세 구간: 신규 매수를 일시 보류합니다.")
+            else:
+                # [NORMAL 상태일 때만 신규 매수 허용]
+                if remaining_slots > 0 and available_krw >= MIN_ORDER_NOTIONAL_KRW and available_invest_krw >= MIN_ORDER_NOTIONAL_KRW:
+                    candidates = await fetch_bb_patterns_candidates()
+                    for item in candidates:
+                        if remaining_slots <= 0:
+                            break
 
-                    market = item["market"]
-                    if market in [p["market"] for p in enriched] or ps.recently_sold(market):
-                        continue
+                        market = item["market"]
+                        if market in [p["market"] for p in enriched] or ps.recently_sold(market):
+                            continue
 
-                    if not await check_bullish_momentum(market):
-                        continue
+                        if not await check_bullish_momentum(market):
+                            continue
 
-                    buy_amt = min(RANGE_BUY_KRW, available_krw, available_invest_krw)
-                    if buy_amt < MIN_ORDER_NOTIONAL_KRW:
-                        continue
+                        buy_amt = min(RANGE_BUY_KRW, available_krw, available_invest_krw)
+                        if buy_amt < MIN_ORDER_NOTIONAL_KRW:
+                            continue
 
-                    try:
-                        if LIVE_TRADING:
-                            resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
-                            print(f"🚀 [BUY] {market} 모멘텀 진입: {buy_amt:,.0f}원 (uuid={resp.get('uuid')})")
-                        else:
-                            print(f"🚀 [BUY][DRY] {market} 모멘텀 진입: {buy_amt:,.0f}원")
+                        try:
+                            if LIVE_TRADING:
+                                resp = await order_market_buy_price(access_key, secret_key, market, buy_amt)
+                                print(f"🚀 [BUY] {market} 모멘텀 진입: {buy_amt:,.0f}원 (uuid={resp.get('uuid')})")
+                            else:
+                                print(f"🚀 [BUY][DRY] {market} 모멘텀 진입: {buy_amt:,.0f}원")
 
-                        ps.update_or_init(market, Decimal("0"), item["price"])
-                        asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market, ps))
+                            ps.update_or_init(market, Decimal("0"), item["price"])
+                            asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market, ps))
 
-                        available_krw -= buy_amt
-                        available_invest_krw -= buy_amt
-                        current_invested += buy_amt
-                        remaining_slots -= 1
-                        await asyncio.sleep(1.0)
+                            available_krw -= buy_amt
+                            available_invest_krw -= buy_amt
+                            current_invested += buy_amt
+                            remaining_slots -= 1
+                            await asyncio.sleep(1.0)
 
-                    except Exception as e:
-                        print(f"[BUY-ERR] {market} 매수 실패: {e}")
+                        except Exception as e:
+                            print(f"[BUY-ERR] {market} 매수 실패: {e}")
 
             if PERIODIC_RESET_SEC > 0 and (loop_now - start_ts) >= PERIODIC_RESET_SEC:
                 raise ResetRequested()
