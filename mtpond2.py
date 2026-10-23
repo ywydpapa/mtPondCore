@@ -795,6 +795,29 @@ async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[st
     r.raise_for_status()
     return r.json()
 
+async def register_loss_cut(
+        user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
+    if not API_BASE:
+        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
+        return
+
+    payload = {
+        "userNo": user_no,
+        "coinCode": market,
+        "losscutQty": float(quantity),
+        "losscutPrice": float(price),
+        "lossRate": float(loss_rate),
+        "losscutReason": "손절 조건 도달",
+    }
+    try:
+        client = get_http_client()
+        response = await client.post(f"{API_BASE}/api/regLC", json=payload)
+        response.raise_for_status()
+        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
+    except httpx.HTTPError as e:
+        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
+
+
 def quantize_volume(vol: Decimal) -> Decimal:
     return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
@@ -1235,6 +1258,7 @@ async def process_additional_buys(
                             print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
                         else:
                             print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
+                        await register_loss_cut(ps.user_no, market, sell_vol, cur_price, pnl)
                         ps.mark_sold(market, reason=reason_tag)
                     break
             continue
@@ -1763,6 +1787,7 @@ async def monitor_positions(user_no: int, server_no: int):
                             print(f"   ▶ 시장가 손절 청산 완료: 수량={sell_vol} (uuid={resp.get('uuid')})")
                         else:
                             print(f"   ▶ [DRY] 시장가 손절 청산 시뮬레이션: 수량={sell_vol}")
+                        await register_loss_cut(user_no, market, sell_vol, cur_p, pnl)
                         ps.mark_sold(market, reason=reason_tag)
                     else:
                         print(f"   ▶ [LOSS-CUT][SKIP] {market} 주문 취소 후 가용 잔고 미달로 매도 스킵 (수량={sell_vol})")

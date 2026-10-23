@@ -255,6 +255,29 @@ async def upbit_api(method: str, url: str, access_key: str, secret_key: str, par
         return r.json()
 
 
+async def register_loss_cut(
+        user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
+    if not API_BASE:
+        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
+        return
+
+    payload = {
+        "userNo": user_no,
+        "coinCode": market,
+        "losscutQty": float(quantity),
+        "losscutPrice": float(price),
+        "lossRate": float(loss_rate),
+        "losscutReason": "손절 조건 도달",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
+            response.raise_for_status()
+        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
+    except httpx.HTTPError as e:
+        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
+
+
 def quantize_volume(vol: Decimal) -> Decimal:
     return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
@@ -612,12 +635,14 @@ async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeSt
         await asyncio.sleep(0.4)
         accs = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
         target_a = next((a for a in accs if a.get("currency") == base), None)
-        if target_a and LIVE_TRADING:
+        if target_a:
             s_vol = quantize_volume(Decimal(str(target_a.get("balance", "0"))))
             if s_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
-                await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                    "market": mkt, "side": "ask", "volume": str(s_vol), "ord_type": "market"
-                })
+                if LIVE_TRADING:
+                    await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+                        "market": mkt, "side": "ask", "volume": str(s_vol), "ord_type": "market"
+                    })
+                await register_loss_cut(sm.user_no, mkt, s_vol, cur_p, pnl)
         sm.set_cooldown(mkt, is_tp=False)
         await sm.save_grid_position(None)
         return
@@ -754,12 +779,14 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                     await asyncio.sleep(0.4)
                     accs = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
                     cur_a = next((a for a in accs if a.get("currency") == base), None)
-                    if cur_a and LIVE_TRADING:
+                    if cur_a:
                         s_vol = quantize_volume(Decimal(str(cur_a.get("balance", "0"))))
                         if s_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
-                            await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                                "market": mkt, "side": "ask", "volume": str(s_vol), "ord_type": "market"
-                            })
+                            if LIVE_TRADING:
+                                await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+                                    "market": mkt, "side": "ask", "volume": str(s_vol), "ord_type": "market"
+                                })
+                            await register_loss_cut(user_no, mkt, s_vol, cur_p, pnl)
                     sm.set_cooldown(mkt, is_tp=False)
                     await sm.remove_trend_position(mkt)
 

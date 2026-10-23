@@ -357,6 +357,29 @@ async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[st
         return r.json()
 
 
+async def register_loss_cut(
+        user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
+    if not API_BASE:
+        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
+        return
+
+    payload = {
+        "userNo": user_no,
+        "coinCode": market,
+        "losscutQty": float(quantity),
+        "losscutPrice": float(price),
+        "lossRate": float(loss_rate),
+        "losscutReason": "손절 조건 도달",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
+            response.raise_for_status()
+        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
+    except httpx.HTTPError as e:
+        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
+
+
 def quantize_volume(vol: Decimal) -> Decimal:
     return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
@@ -1072,6 +1095,7 @@ async def monitor_positions(user_no: int, server_no: int):
                                 if s_vol and (s_vol * cur_p) >= MIN_ORDER_NOTIONAL_KRW:
                                     if LIVE_TRADING:
                                         await order_market_sell(access_key, secret_key, market, s_vol)
+                                    await register_loss_cut(user_no, market, s_vol, cur_p, pnl)
                                     ps.mark_sold(market, reason="LOSS_CUT")
                                 break
                     continue
