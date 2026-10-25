@@ -54,7 +54,7 @@ RATIO_AVERAGING = Decimal("0.40")
 RATIO_BREAKOUT = Decimal("0.10")
 RATIO_CASH_RESERVE = Decimal("0.30")
 BUY_FEE_BUFFER_RATIO = Decimal("0.01")
-BUY_AMOUNT_UNIT_KRW = Decimal("1000")
+BUY_AMOUNT_UNIT_KRW = Decimal("10000")
 
 GRID_STEP_COUNT = 4  # 4단계 매수 그물망
 GRID_INTERVAL_PCT = Decimal("0.5")  # -0.5% 간격
@@ -121,16 +121,21 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
 
 
 def calculate_bucket_limits(total_equity: Decimal) -> Dict[str, Decimal]:
+    allocation_equity = floor_buy_amount(total_equity)
     return {
-        "initial": (total_equity * RATIO_INITIAL).quantize(Decimal("1"), rounding=ROUND_DOWN),
-        "averaging": (total_equity * RATIO_AVERAGING).quantize(Decimal("1"), rounding=ROUND_DOWN),
-        "breakout": (total_equity * RATIO_BREAKOUT).quantize(Decimal("1"), rounding=ROUND_DOWN),
-        "reserve": (total_equity * RATIO_CASH_RESERVE).quantize(Decimal("1"), rounding=ROUND_DOWN),
+        "initial": floor_buy_amount(allocation_equity * RATIO_INITIAL),
+        "averaging": floor_buy_amount(allocation_equity * RATIO_AVERAGING),
+        "breakout": floor_buy_amount(allocation_equity * RATIO_BREAKOUT),
+        "reserve": (allocation_equity * RATIO_CASH_RESERVE).quantize(Decimal("1"), rounding=ROUND_DOWN),
     }
 
 
 def floor_buy_amount(amount: Decimal) -> Decimal:
     return (amount / BUY_AMOUNT_UNIT_KRW).to_integral_value(rounding=ROUND_DOWN) * BUY_AMOUNT_UNIT_KRW
+
+
+def ceil_buy_amount(amount: Decimal) -> Decimal:
+    return (amount / BUY_AMOUNT_UNIT_KRW).to_integral_value(rounding=ROUND_CEILING) * BUY_AMOUNT_UNIT_KRW
 
 
 def calculate_bucket_usage(sm: "CompositeStateManager", accounts: List[Dict[str, Any]]) -> Dict[str, Decimal]:
@@ -168,7 +173,7 @@ def calculate_bucket_usage(sm: "CompositeStateManager", accounts: List[Dict[str,
         for bucket, amount in commitments.items():
             usage[bucket] += amount * accounted_cost / committed_total
 
-    return usage
+    return {bucket: ceil_buy_amount(amount) for bucket, amount in usage.items()}
 
 
 def create_budget_state(total_equity: Decimal, krw_available: Decimal, sm: "CompositeStateManager",
@@ -198,14 +203,17 @@ def create_budget_state(total_equity: Decimal, krw_available: Decimal, sm: "Comp
             for bucket in ("initial", "averaging", "breakout")
         }
         recorded_cost = sum(commitments.values(), Decimal("0"))
-        market_used[market] = max(actual_cost, recorded_cost)
+        market_used[market] = ceil_buy_amount(max(actual_cost, recorded_cost))
         if recorded_cost <= 0:
             market_bucket_used[market] = {
-                "initial": actual_cost, "averaging": Decimal("0"), "breakout": Decimal("0")}
+                "initial": ceil_buy_amount(actual_cost),
+                "averaging": Decimal("0"),
+                "breakout": Decimal("0")}
         else:
             accounted_cost = max(actual_cost, recorded_cost)
             market_bucket_used[market] = {
-                bucket: amount * accounted_cost / recorded_cost for bucket, amount in commitments.items()
+                bucket: ceil_buy_amount(amount * accounted_cost / recorded_cost)
+                for bucket, amount in commitments.items()
             }
     limits = calculate_bucket_limits(total_equity)
     return {
@@ -218,7 +226,7 @@ def create_budget_state(total_equity: Decimal, krw_available: Decimal, sm: "Comp
             if db_setup else Decimal("0")
             for bucket in ("initial", "averaging", "breakout")
         },
-        "equity": total_equity,
+        "equity": floor_buy_amount(total_equity),
         "krw_available": krw_available,
         "db_setup": db_setup,
     }
@@ -1045,7 +1053,7 @@ async def run_hybrid_engine(user_no: int, server_no: int):
             if now - last_heartbeat_ts >= 60:
                 last_heartbeat_ts = now
                 print(
-                    f"[mtpond6][HEARTBEAT] 평가액={total_equity:,.0f}원 원화={krw_available:,.0f}원 "
+                    f"[mtpond6][HEARTBEAT] 평가액={budget['equity']:,.0f}원 원화={krw_available:,.0f}원 "
                     f"예비금={budget['limits']['reserve']:,.0f}원 "
                     f"버킷 사용 초기/물타기/불타기="
                     f"{budget['used']['initial']:,.0f}/{budget['used']['averaging']:,.0f}/"
