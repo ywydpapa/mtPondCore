@@ -348,6 +348,7 @@ async def register_loss_cut(
         "coinCode": market,
         "losscutQty": float(quantity),
         "losscutPrice": float(price),
+        "currentPrice": float(price),
         "lossRate": float(loss_rate),
         "losscutReason": "손절 조건 도달",
     }

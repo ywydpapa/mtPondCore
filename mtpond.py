@@ -662,6 +662,30 @@ async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[st
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     return await http_get_json(url, headers=headers)
 
+async def register_loss_cut(
+        user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
+    if not API_BASE:
+        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
+        return
+
+    payload = {
+        "userNo": user_no,
+        "coinCode": market,
+        "losscutQty": float(quantity),
+        "losscutPrice": float(price),
+        "currentPrice": float(price),
+        "lossRate": float(loss_rate),
+        "losscutReason": "손절 조건 도달",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
+            response.raise_for_status()
+        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
+    except httpx.HTTPError as e:
+        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
+
+
 async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
     if not markets:
         return {}
@@ -2745,6 +2769,8 @@ async def monitor_positions(user_no: int, server_no: int):
                     else:
                         resp = await order_market_sell(access_key, secret_key, mkt, vol)
                         print(f"[LOSS-CUT] {mkt} pnl={item['pnl']}% → SELL ALL uuid={resp.get('uuid')} vol={vol}")
+                    await register_loss_cut(
+                        user_no, mkt, vol, item["current_price"], item["pnl"])
                     # 손절 후 마틴/스톱 상태 초기화 및 포지션 종료
                     st["stop_mode_active"] = False
                     st["martingale_count"] = 0
@@ -3576,4 +3602,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[MAIN] 종료 요청(Ctrl+C)")
-
