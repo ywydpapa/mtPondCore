@@ -504,6 +504,35 @@ def quantize_volume(vol: Decimal) -> Decimal:
     return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
 
+def calculate_ladder_volumes(total_volume: Decimal, total_eval: Decimal, avg_price: Decimal) -> List[Decimal]:
+    if total_volume <= 0 or total_eval < MIN_ORDER_NOTIONAL_KRW or avg_price <= 0:
+        return []
+
+    slot_count = min(5, max(1, int(total_eval // Decimal("10000"))))
+    while slot_count > 1:
+        slice_krw = floor_buy_amount(total_eval / Decimal(str(slot_count)))
+        slice_volume = quantize_volume(slice_krw / avg_price)
+        if slice_volume * avg_price >= MIN_ORDER_NOTIONAL_KRW:
+            break
+        slot_count -= 1
+
+    if slot_count == 1:
+        return [quantize_volume(total_volume)]
+
+    volumes = []
+    remaining = quantize_volume(total_volume)
+    for _ in range(slot_count - 1):
+        volume = min(slice_volume, remaining)
+        if volume * avg_price < MIN_ORDER_NOTIONAL_KRW:
+            break
+        volumes.append(volume)
+        remaining = quantize_volume(remaining - volume)
+
+    if remaining > 0:
+        volumes.append(remaining)
+    return volumes
+
+
 def get_tick_unit(price: Decimal) -> Decimal:
     p = float(price)
     if p >= 2_000_000: return Decimal("1000")
@@ -727,14 +756,16 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str):
         else:
             start_pct, step_pct = Decimal("0.60"), Decimal("0.30")
 
-        slot_count = max(1, min(10, int(total_eval // Decimal("10000"))))
-        slice_vol = quantize_volume(avail_bal / Decimal(str(slot_count)))
-        rem_vol = avail_bal
+        order_volumes = calculate_ladder_volumes(avail_bal, total_eval, avg_price)
+        if not order_volumes:
+            print(f"[LADDER-TP][SKIP] {market} 매도 가능 수량이 최소 주문금액 미만")
+            return
         prev_limit = Decimal("0")
 
-        print(f"📐 [LADDER-TP] {market} 사다리 익절 발주 (평단: {avg_price:,.0f}원 | 총액: {total_eval:,.0f}원 | {slot_count}슬롯)")
+        print(f"📐 [LADDER-TP] {market} 사다리 익절 발주 "
+              f"(평단: {avg_price:,.0f}원 | 총액: {total_eval:,.0f}원 | {len(order_volumes)}슬롯)")
 
-        for i in range(1, slot_count + 1):
+        for i, order_v in enumerate(order_volumes, start=1):
             curr_target_pct = start_pct + (step_pct * Decimal(str(i - 1)))
             target_p = avg_price * (Decimal("1") + (curr_target_pct / Decimal("100")))
             limit_p = adjust_price_to_tick(target_p, side="ask")
@@ -742,17 +773,17 @@ async def place_ladder_tp_orders(access_key: str, secret_key: str, market: str):
             if i > 1 and limit_p <= prev_limit:
                 limit_p = prev_limit + get_tick_unit(limit_p)
 
-            order_v = quantize_volume(rem_vol) if i == slot_count else slice_vol
-            order_v = min(order_v, rem_vol)
-
-            if order_v * limit_p >= MIN_ORDER_NOTIONAL_KRW and LIVE_TRADING:
+            if order_v * limit_p < MIN_ORDER_NOTIONAL_KRW:
+                print(f"[LADDER-TP][SKIP] {market} 슬롯 #{i} 최소 주문금액 미달")
+                continue
+            if LIVE_TRADING:
                 await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                    "market": market, "side": "ask", "volume": str(order_v), "price": str(limit_p), "ord_type": "limit"
+                    "market": market, "side": "ask", "volume": str(order_v), "price": str(limit_p),
+                    "ord_type": "limit"
                 })
-                print(f"  └ [슬롯 #{i}] {order_v}개 @ {limit_p}원 (+{curr_target_pct:.2f}%)")
-                rem_vol -= order_v
-                prev_limit = limit_p
-                await asyncio.sleep(0.15)
+            print(f"  └ [슬롯 #{i}] {order_v}개 @ {limit_p}원 (+{curr_target_pct:.2f}%)")
+            prev_limit = limit_p
+            await asyncio.sleep(0.15)
 
     except Exception as e:
         print(f"[LADDER-TP][ERR] {market} 사다리 주문 실패: {e}")
@@ -996,7 +1027,8 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 available_volume = Decimal(str(account.get("balance", "0")))
                 total_volume = available_volume + Decimal(str(account.get("locked", "0")))
                 average_price = Decimal(str(account.get("avg_buy_price", "0")))
-                if total_volume * average_price < MIN_ORDER_NOTIONAL_KRW:
+                current_price = price_map.get(market, Decimal("0"))
+                if current_price <= 0 or available_volume * current_price < MIN_ORDER_NOTIONAL_KRW:
                     continue
                 state = state_manager.trend_positions.setdefault(market, {
                     "avg_price": average_price,
