@@ -24,6 +24,18 @@ from sqlalchemy import text
 # ============================================================
 dotenv.load_dotenv()
 
+
+def _decimal_env(name: str, default: str) -> Decimal:
+    raw_value = os.getenv(name, default)
+    try:
+        return Decimal(raw_value.split("#", 1)[0].strip())
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"환경 변수 {name} 값이 유효한 Decimal 숫자가 아닙니다: "
+            f"{raw_value!r}. 프로세스 환경변수는 .env 값보다 우선 적용됩니다."
+        ) from exc
+
+
 # ============================================================
 # 3. DB & 기본 상수
 # ============================================================
@@ -97,14 +109,14 @@ BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
 ARM_PNL = Decimal("0.25")
 HARD_TP = Decimal("0.6")
-HARD_TP2_OFFSET = Decimal(os.getenv("HARD_TP2_OFFSET", "0.5"))
+HARD_TP2_OFFSET = _decimal_env("HARD_TP2_OFFSET", "0.5")
 HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 TRAIL_DROP = Decimal("0.15")
 TRAIL_START_PNL = Decimal("0.45")
 
-SELL_PORTION = Decimal(os.getenv("SELL_PORTION", "1.0"))
-HARD_TP_SELL_PORTION = Decimal(os.getenv("HARD_TP_SELL_PORTION", "1.0"))
-HARD_TP2_SELL_PORTION = Decimal(os.getenv("HARD_TP2_SELL_PORTION", "1.0"))
+SELL_PORTION = _decimal_env("SELL_PORTION", "1.0")
+HARD_TP_SELL_PORTION = _decimal_env("HARD_TP_SELL_PORTION", "1.0")
+HARD_TP2_SELL_PORTION = _decimal_env("HARD_TP2_SELL_PORTION", "1.0")
 
 INTERVAL_SECONDS = 5
 MIN_NOTIONAL_KRW = Decimal("5000")
@@ -344,8 +356,8 @@ async def check_3m_candle_trend(market: str) -> bool:
 # 5. RUNTIME CONFIG (동적 설정 관리)
 # ============================================================
 ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1", "Y", "TRUE"))
-STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.2"))
-LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-3.0"))
+STOP_TRIGGER_PNL = _decimal_env("STOP_TRIGGER_PNL", "-1.2")
+LOSS_CUT_RATE = _decimal_env("LOSS_CUT_RATE", "-3.0")
 
 _CONFIG_INITIALIZED = False
 
@@ -492,13 +504,13 @@ def init_config(force: bool = False):
     global BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
 
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "10"))
-    RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
-    ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))
-    MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "400000"))
-    BUY_RANGE_LOW = Decimal(os.getenv("BUY_RANGE_LOW", "-2.2"))
-    BUY_RANGE_HIGH = Decimal(os.getenv("BUY_RANGE_HIGH", "0.45"))
-    STOP_TRIGGER_PNL = Decimal(os.getenv("STOP_TRIGGER_PNL", "-1.2"))
-    LOSS_CUT_RATE = Decimal(os.getenv("LOSS_CUT_RATE", "-3.0"))
+    RANGE_BUY_KRW = _decimal_env("RANGE_BUY_KRW", "40000")
+    ADDITIONAL_BUY_KRW = _decimal_env("ADDITIONAL_BUY_KRW", "40000")
+    MAX_TOTAL_INVEST_PER_MARKET = _decimal_env("MAX_TOTAL_INVEST_PER_MARKET", "400000")
+    BUY_RANGE_LOW = _decimal_env("BUY_RANGE_LOW", "-2.2")
+    BUY_RANGE_HIGH = _decimal_env("BUY_RANGE_HIGH", "0.45")
+    STOP_TRIGGER_PNL = _decimal_env("STOP_TRIGGER_PNL", "-1.2")
+    LOSS_CUT_RATE = _decimal_env("LOSS_CUT_RATE", "-3.0")
     ENABLE_STOP = (str(os.getenv("ENABLE_STOP", "1")).upper() in ("1", "Y", "TRUE"))
     BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
     BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
@@ -1082,7 +1094,7 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
 # ============================================================
 VOLATILITY_CACHE_TTL_SEC = 180
 _volatility_cache: Dict[str, Tuple[float, Decimal]] = {}
-PANIC_DROP_MULTIPLIER = Decimal(os.getenv("PANIC_DROP_MULTIPLIER", "1.8"))
+PANIC_DROP_MULTIPLIER = _decimal_env("PANIC_DROP_MULTIPLIER", "1.8")
 
 async def get_candle_volatility(market: str, unit: int = 10, count: int = 10) -> Decimal:
     now = time.time()

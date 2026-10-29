@@ -7,7 +7,7 @@ import requests
 # ==============================
 # 설정
 # ==============================
-API_URL = "http://ywydpapa.iptime.org:8000/api/bbtrend30"
+API_URL = "http://becog.iptime.org:8088/api/bbtrend30"
 REFRESH_INTERVAL_SEC = 30
 TIMEOUT_SEC = 8
 DEFAULT_TOP_N = 8

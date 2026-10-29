@@ -24,6 +24,18 @@ from sqlalchemy import text
 # ============================================================
 dotenv.load_dotenv()
 
+
+def _decimal_env(name: str, default: str) -> Decimal:
+    raw_value = os.getenv(name, default)
+    try:
+        return Decimal(raw_value.split("#", 1)[0].strip())
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"환경 변수 {name} 값이 유효한 Decimal 숫자가 아닙니다: "
+            f"{raw_value!r}."
+        ) from exc
+
+
 # ============================================================
 # 3. DB & 기본 상수
 # ============================================================
@@ -165,7 +177,7 @@ def init_config(force: bool = False):
 
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
 
-    RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
+    RANGE_BUY_KRW = _decimal_env("RANGE_BUY_KRW", "40000")
     default_markets = 5 if RANGE_BUY_KRW <= Decimal("25000") else 2
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", str(default_markets)))
 

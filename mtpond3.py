@@ -24,6 +24,18 @@ from sqlalchemy import text
 # ============================================================
 dotenv.load_dotenv()
 
+
+def _decimal_env(name: str, default: str) -> Decimal:
+    raw_value = os.getenv(name, default)
+    try:
+        return Decimal(raw_value.split("#", 1)[0].strip())
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(
+            f"환경 변수 {name} 값이 유효한 Decimal 숫자가 아닙니다: "
+            f"{raw_value!r}."
+        ) from exc
+
+
 # ============================================================
 # 3. DB & 기본 상수
 # ============================================================
@@ -77,16 +89,16 @@ COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "60"))  # 정상익절 1분
 COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300"))  # 손절/방어 5분
 
 # 캔들 변동폭 대비 익절 목표 비율 (65% 채택)
-PROFIT_RANGE_RATIO = Decimal(os.getenv("PROFIT_RANGE_RATIO", "0.65"))
+PROFIT_RANGE_RATIO = _decimal_env("PROFIT_RANGE_RATIO", "0.65")
 MIN_PROFIT_TARGET_PCT = Decimal("0.8")  # 최소 목표 익절선 (+0.8%)
 MAX_PROFIT_TARGET_PCT = Decimal("4.0")  # 최대 목표 익절선 (+4.0%)
 MIN_ROOM_TO_1H_HIGH_PCT = Decimal("1.2")  # 1시간봉 상단 저항까지 최소 여유폭 (+1.2%)
 
 # 물타기(반등 추종) 및 손절 설정
 MAX_ADDITIONAL_BUYS = 2  # 최대 물타기 2회
-ADD_BUY_1_DROP = Decimal(os.getenv("ADD_BUY_1_DROP", "-2.2"))  # 1차 물타기 기준 (-2.2%)
-ADD_BUY_2_DROP = Decimal(os.getenv("ADD_BUY_2_DROP", "-4.5"))  # 2차 물타기 기준 (-4.5%)
-FINAL_LOSS_CUT_RATE = Decimal(os.getenv("FINAL_LOSS_CUT_RATE", "-6.5"))  # 최종 방어 손절선 (-6.5%)
+ADD_BUY_1_DROP = _decimal_env("ADD_BUY_1_DROP", "-2.2")  # 1차 물타기 기준 (-2.2%)
+ADD_BUY_2_DROP = _decimal_env("ADD_BUY_2_DROP", "-4.5")  # 2차 물타기 기준 (-4.5%)
+FINAL_LOSS_CUT_RATE = _decimal_env("FINAL_LOSS_CUT_RATE", "-6.5")  # 최종 방어 손절선 (-6.5%)
 MAX_LOSS_LIMIT_PCT = Decimal("-25.0")  # 손실이 -25% 초과(미만)일 경우 손절 차단
 
 INTERVAL_SECONDS = 5
@@ -193,14 +205,14 @@ def init_config(force: bool = False):
     global MAX_TOTAL_INVEST_PER_MARKET, BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
 
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "10"))
-    RANGE_BUY_KRW = Decimal(os.getenv("RANGE_BUY_KRW", "40000"))
-    ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))
-    MAX_TOTAL_INVEST_PER_MARKET = Decimal(os.getenv("MAX_TOTAL_INVEST_PER_MARKET", "120000"))
+    RANGE_BUY_KRW = _decimal_env("RANGE_BUY_KRW", "40000")
+    ADDITIONAL_BUY_KRW = _decimal_env("ADDITIONAL_BUY_KRW", "40000")
+    MAX_TOTAL_INVEST_PER_MARKET = _decimal_env("MAX_TOTAL_INVEST_PER_MARKET", "120000")
     BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
     BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
     _CONFIG_INITIALIZED = True
-    print(f"[INIT] 기본 설정 초기화 완료 (force={force}) | 활성최대:{MAX_ACTIVE_MARKETS}개, 최초금액:{RANGE_BUY_KRW}원")
+    print(f"[INIT] 환경 기본값 초기화 완료 (force={force}) | 활성최대:{MAX_ACTIVE_MARKETS}개, 최초금액:{RANGE_BUY_KRW}원")
 
 
 def apply_dynamic_config(cfg: dict):
@@ -1161,8 +1173,6 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
     while True:
         try:
-            await sync_redis_config(user_no)
-
             cfg = {}
             c = await redis_client.get(f"mtpond:setup:{user_no}")
             if c:
@@ -1188,11 +1198,6 @@ async def run_mtpond_controller(user_no: int, server_no: int):
                 except Exception:
                     pass
 
-            if cfg:
-                apply_dynamic_config(cfg)
-
-            active_flag = str(cfg.get("activeYN", "Y")).upper() == "Y"
-
             if task and task.done():
                 exc = task.exception()
                 if isinstance(exc, ResetRequested):
@@ -1201,15 +1206,27 @@ async def run_mtpond_controller(user_no: int, server_no: int):
                     print(f"[CTRL] 모니터링 예외 복구 재기동: {exc}")
                 task = None
 
+            if cfg:
+                apply_dynamic_config(cfg)
+
+            active_flag = str(cfg.get("activeYN", "N")).strip().upper() == "Y"
+
             if active_flag and task is None:
                 init_config(force=True)
+                if cfg:
+                    apply_dynamic_config(cfg)
+                print(
+                    f"[CONFIG] 웹 설정 적용 완료 | 활성최대:{MAX_ACTIVE_MARKETS}개, "
+                    f"최초금액:{RANGE_BUY_KRW}원, 추가금액:{ADDITIONAL_BUY_KRW}원, "
+                    f"종목한도:{MAX_TOTAL_INVEST_PER_MARKET}원"
+                )
                 task = asyncio.create_task(monitor_positions(user_no, server_no))
             elif not active_flag and task:
                 print("[CTRL] activeYN=N → 모니터링 태스크 중단")
                 task.cancel()
                 try:
                     await task
-                except:
+                except asyncio.CancelledError:
                     pass
                 task = None
 
@@ -1220,7 +1237,6 @@ async def run_mtpond_controller(user_no: int, server_no: int):
 
 
 async def main():
-    init_config(force=True)
     user_no = int(os.getenv("USER_NO", "100001"))
     server_no = int(os.getenv("SERVER_NO", "21"))
     await run_mtpond_controller(user_no, server_no)
