@@ -1908,7 +1908,7 @@ async def run_mtpond_controller(user_no: int, server_no: int):
             _last_cfg_signature = sig
 
         if task and task.done():
-            exc = task.exception()
+            exc = None if task.cancelled() else task.exception()
             await close_http_client()  # ★ 이전 세션 소켓 클린업
             if isinstance(exc, ResetRequested):
                 print("[CTRL] 일일 정기 리셋 완료 → 모니터링 재기동")
@@ -1931,7 +1931,7 @@ async def run_mtpond_controller(user_no: int, server_no: int):
             task.cancel()
             try:
                 await task
-            except Exception:
+            except asyncio.CancelledError:
                 pass
             await close_http_client()  # ★ 중단 시 세션 종료
             task = None
