@@ -42,7 +42,7 @@ def _decimal_env(name: str, default: str) -> Decimal:
 engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
-CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
+CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
 BASE_UNIT = "KRW"
 
 # Redis 연결 설정
@@ -107,6 +107,7 @@ UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 # 5. RUNTIME CONFIG (Redis 우선 동적 설정 관리)
 # ============================================================
 _CONFIG_INITIALIZED = False
+ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1", "Y", "TRUE"))
 MAX_ACTIVE_MARKETS = 2
 RANGE_BUY_KRW = Decimal("40000")  # 초기 폴백값 (Redis 로드 시 즉시 덮어씌워짐)
 BB_MIN_OVERALL_SCORE = 3
@@ -191,6 +192,13 @@ def init_config(force: bool = False):
 def apply_dynamic_config(cfg: dict):
     """★ Redis 설정값을 전역 변수에 최우선 반영"""
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
+    global ENABLE_STOP
+
+    if "stopYN" in cfg:
+        flag = str(cfg.get("stopYN")).strip().upper() in ("1", "Y", "TRUE")
+        if flag != ENABLE_STOP:
+            print(f"📌 [REDIS-CONFIG] ENABLE_STOP {ENABLE_STOP} -> {flag}")
+            ENABLE_STOP = flag
 
     def to_dec(v):
         try:
@@ -862,7 +870,7 @@ async def monitor_positions(user_no: int, server_no: int):
                     effective_stop_cut = Decimal("-1.8")
 
                 # 최종 손절
-                if pnl <= effective_stop_cut:
+                if ENABLE_STOP and pnl <= effective_stop_cut:
                     print(f"🚨 [HARD-STOP-LOSS] {market} 방어선 붕괴 (PNL: {pnl}% / 기준: {effective_stop_cut}%) → 시장가 전량 청산")
                     await cancel_all_open_orders_for_market(access_key, secret_key, market)
                     await asyncio.sleep(0.4)

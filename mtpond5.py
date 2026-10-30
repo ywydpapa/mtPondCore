@@ -61,6 +61,7 @@ GRID_STEP_COUNT = 4  # 4단계 매수 그물망
 GRID_INTERVAL_PCT = Decimal("0.5")  # -0.5% 간격
 GRID_TARGET_TP_PCT = Decimal("0.5")  # +0.5% 합산 익절
 GRID_HARD_STOP_PCT = Decimal("-2.2")  # -2.2% 하단 이탈 손절
+ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").strip().upper() in ("1", "Y", "TRUE"))
 
 MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
 COOLDOWN_TP_SEC = 180
@@ -630,7 +631,7 @@ async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeSt
 
     pnl = ((cur_p - avg_p) / avg_p) * Decimal("100")
 
-    if pnl <= GRID_HARD_STOP_PCT:
+    if ENABLE_STOP and pnl <= GRID_HARD_STOP_PCT:
         print(f"🚨 [GRID-STOP] {mkt} 박스권 하단 붕괴 ({pnl:.2f}%) → 그리드 전량 시장가 손절")
         await cancel_all_orders(access_key, secret_key, mkt)
         await asyncio.sleep(0.4)
@@ -774,7 +775,7 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 if btc_status == "EMERGENCY":
                     effective_stop_cut = Decimal("-1.8")
 
-                if pnl <= effective_stop_cut:
+                if ENABLE_STOP and pnl <= effective_stop_cut:
                     print(f"🚨 [TREND-STOP] {mkt} 손절선 도달 (현재 PNL: {pnl:.2f}% / 기준: {effective_stop_cut}%) → 전량 시장가 청산")
                     await cancel_all_orders(access_key, secret_key, mkt)
                     await asyncio.sleep(0.4)
@@ -863,6 +864,7 @@ async def run_hybrid_engine(user_no: int, server_no: int):
 # ============================================================
 async def run_mtpond_controller(user_no: int, server_no: int):
     task: Optional[asyncio.Task] = None
+    global ENABLE_STOP
     print(f"[CTRL] Controller 시작 (User: {user_no}, Server: {server_no})")
 
     while True:
@@ -871,12 +873,17 @@ async def run_mtpond_controller(user_no: int, server_no: int):
             raw_status = await redis_client.get(f"mtpond:status:{user_no}")
             if raw_status is not None:
                 active_flag = raw_status.strip().upper() in ("ON", "1", "Y", "TRUE")
-            else:
-                c = await redis_client.get(f"mtpond:setup:{user_no}")
-                if c:
-                    data = json.loads(c)
-                    cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
-                    if isinstance(cfg, dict):
+            c = await redis_client.get(f"mtpond:setup:{user_no}")
+            if c:
+                data = json.loads(c)
+                cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
+                if isinstance(cfg, dict):
+                    if "stopYN" in cfg:
+                        stop_enabled = str(cfg.get("stopYN")).strip().upper() in ("1", "Y", "TRUE")
+                        if stop_enabled != ENABLE_STOP:
+                            print(f"📌 [REDIS-CONFIG] ENABLE_STOP {ENABLE_STOP} -> {stop_enabled}")
+                            ENABLE_STOP = stop_enabled
+                    if raw_status is None:
                         active_flag = str(cfg.get("activeYN", "Y")).strip().upper() == "Y"
 
             if task is not None and task.done():

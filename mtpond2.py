@@ -42,7 +42,7 @@ def _decimal_env(name: str, default: str) -> Decimal:
 engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
-CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
+CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
 BASE_UNIT = "KRW"
 
 # Redis 연결 설정
@@ -1243,7 +1243,7 @@ async def process_additional_buys(
         calculated_cut = -(avg_vol * Decimal("1.5"))
         panic_threshold = min(calculated_cut, Decimal("-1.0"))  # 최소 -1.0% 이하에서만 작동
 
-        is_panic_cut = (pnl <= panic_threshold)
+        is_panic_cut = (ENABLE_STOP and pnl <= panic_threshold)
         is_fixed_cut = (ENABLE_STOP and pnl <= LOSS_CUT_RATE)
 
         if is_panic_cut or is_fixed_cut:
@@ -1774,7 +1774,7 @@ async def monitor_positions(user_no: int, server_no: int):
                 # -------------------------------------------------------------
                 # 2. 듀얼 타임프레임(3m & 10m) 하락 국면 검증 손절
                 # -------------------------------------------------------------
-                is_panic_cut = (pnl <= panic_threshold)
+                is_panic_cut = (ENABLE_STOP and pnl <= panic_threshold)
                 is_fixed_cut = (ENABLE_STOP and pnl <= LOSS_CUT_RATE)
 
                 if is_panic_cut or is_fixed_cut:

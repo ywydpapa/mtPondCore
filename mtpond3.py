@@ -42,7 +42,7 @@ def _decimal_env(name: str, default: str) -> Decimal:
 engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
-CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
+CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
 BASE_UNIT = "KRW"
 
 # Redis 연결 설정
@@ -218,6 +218,13 @@ def init_config(force: bool = False):
 def apply_dynamic_config(cfg: dict):
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, ADDITIONAL_BUY_KRW, MAX_TOTAL_INVEST_PER_MARKET
     global BB_MIN_OVERALL_SCORE, BB_MIN_TRADE_COUNT_10M
+    global ENABLE_STOP
+
+    if "stopYN" in cfg:
+        flag = str(cfg.get("stopYN")).strip().upper() in ("1", "Y", "TRUE")
+        if flag != ENABLE_STOP:
+            print(f"[REDIS-CONFIG] ENABLE_STOP {ENABLE_STOP} -> {flag}")
+            ENABLE_STOP = flag
 
     def to_dec(v):
         try:
@@ -1093,7 +1100,7 @@ async def monitor_positions(user_no: int, server_no: int):
                     effective_stop_cut = Decimal("-1.8")
 
                 # 1. 2회 물타기 소진 상태에서 최종 손절선 도달 시 손절 (-25% 초과 보호)
-                if total_buys - 1 >= MAX_ADDITIONAL_BUYS and pnl <= effective_stop_cut:
+                if ENABLE_STOP and total_buys - 1 >= MAX_ADDITIONAL_BUYS and pnl <= effective_stop_cut:
                     if pnl < MAX_LOSS_LIMIT_PCT:
                         print(f"🛡️ [LOSS-PROTECT] {market} 손실률이 {pnl}%로 -25%를 초과하여 손절 보류")
                     else:
