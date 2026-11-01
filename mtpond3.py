@@ -103,6 +103,7 @@ ADD_BUY_2_DROP = _decimal_env("ADD_BUY_2_DROP", "-4.5")  # 2차 물타기 기준
 RESCUE_MIN_DROP = Decimal("-8.0")
 RESCUE_MAX_DROP = Decimal("-22.0")
 MAX_CONCURRENT_RESCUE = 1
+_rescue_buy_lock = asyncio.Lock()
 
 INTERVAL_SECONDS = 5
 MIN_NOTIONAL_KRW = Decimal("5000")
@@ -253,7 +254,7 @@ def apply_dynamic_config(cfg: dict):
     for key in ("addAmt", "additional_buy_krw", "ADDITIONAL_BUY_KRW"):
         if key in cfg:
             v = to_dec(cfg.get(key))
-            if v and v > 0: ADDITIONAL_BUY_KRW = v
+            if v is not None and v.is_finite() and v >= 0: ADDITIONAL_BUY_KRW = v
 
     for key in ("limitAmt", "max_total_invest_per_market", "MAX_TOTAL_INVEST_PER_MARKET"):
         if key in cfg:
@@ -671,12 +672,17 @@ async def analyze_mtf_trend_and_target(market: str, force: bool = False) -> Opti
 # ============================================================
 # 10. BB-Patterns 기반 신규 매수 후보 발굴
 # ============================================================
-_bb_patterns_cache: Dict[str, Any] = {"fetched_ts": 0.0, "candidates": []}
+_bb_patterns_cache: Dict[str, Any] = {
+    "fetched_ts": 0.0,
+    "candidates": [],
+    "trade_counts": {},
+    "market_scores": {},
+}
 
 
 async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, Any]]:
     now = time.time()
-    if (not force) and (now - _bb_patterns_cache["fetched_ts"] < BB_CACHE_TTL_SEC) and _bb_patterns_cache["candidates"]:
+    if not force and now - _bb_patterns_cache["fetched_ts"] < BB_CACHE_TTL_SEC:
         return _bb_patterns_cache["candidates"]
 
     try:
@@ -692,6 +698,8 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
 
     excluded = await get_excluded_markets()
     qualified = []
+    trade_counts = {}
+    market_scores = {}
 
     for c in coins:
         mkt = c.get("market", "")
@@ -703,6 +711,8 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
         except:
             continue
 
+        trade_counts[mkt] = trades
+        market_scores[mkt] = score
         if price < 30 or score < BB_MIN_OVERALL_SCORE or trades < BB_MIN_TRADE_COUNT_10M:
             continue
 
@@ -716,7 +726,21 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     qualified.sort(key=lambda x: (x["overall_score"], x["trade_count_10m"]), reverse=True)
     _bb_patterns_cache["fetched_ts"] = now
     _bb_patterns_cache["candidates"] = qualified
+    _bb_patterns_cache["trade_counts"] = trade_counts
+    _bb_patterns_cache["market_scores"] = market_scores
     return qualified
+
+
+async def has_minimum_rescue_trade_activity(market: str) -> bool:
+    await fetch_bb_patterns_candidates()
+    trade_count = _bb_patterns_cache["trade_counts"].get(market, 0)
+    if trade_count < BB_MIN_TRADE_COUNT_10M:
+        print(
+            f"[RESCUE-SKIP] {market} 10분 거래량 부족 "
+            f"({trade_count}/{BB_MIN_TRADE_COUNT_10M}건)"
+        )
+        return False
+    return True
 
 
 # ============================================================
@@ -798,43 +822,19 @@ async def sync_or_register_held_positions(access_key: str, secret_key: str, ps: 
 # ============================================================
 # 13. 1시간/15분봉 반등 지지 확인형 물타기 프로세스
 # ============================================================
-async def check_rescue_rebound_signal(market: str) -> bool:
-    """15분봉 가격 흐름으로 단기 반등 신호를 확인합니다."""
-    url_15m = "https://api.upbit.com/v1/candles/minutes/15"
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            response = await client.get(url_15m, params={"market": market, "count": 10})
-            if response.status_code != 200:
-                return False
-            candles = response.json()
-            if len(candles) < 5:
-                return False
-
-            current_price = Decimal(str(candles[0]["trade_price"]))
-            opening_price = Decimal(str(candles[0]["opening_price"]))
-            current_low = Decimal(str(candles[0]["low_price"]))
-            previous_close = Decimal(str(candles[1]["trade_price"]))
-            previous_low = Decimal(str(candles[1]["low_price"]))
-
-            is_bullish = current_price > opening_price
-            is_higher_low = current_low >= previous_low
-            is_recovering = current_price >= previous_close
-            return is_bullish and (is_higher_low or is_recovering)
-    except Exception as e:
-        print(f"[RESCUE-CHECK][ERR] {market} 반등 검증 실패: {e}")
-        return False
-
-
-async def process_rescue_operations(
+async def _process_rescue_operations_unlocked(
         access_key: str,
         secret_key: str,
         enriched_positions: List[dict],
         ps: PositionState,
         available_krw: Decimal
 ) -> Decimal:
-    """반등 신호가 확인된 보유 종목에 구출 매수와 탈출 지정가를 배치합니다."""
+    """상승 추세와 거래량을 확인한 손실 종목을 설정 매수액으로 구출합니다."""
     used_krw = Decimal("0")
-    if available_krw < MIN_ORDER_NOTIONAL_KRW:
+    if (
+        available_krw < MIN_ORDER_NOTIONAL_KRW
+        or ADDITIONAL_BUY_KRW < MIN_ORDER_NOTIONAL_KRW
+    ):
         return used_krw
 
     active_rescue_count = sum(
@@ -843,6 +843,7 @@ async def process_rescue_operations(
     if active_rescue_count >= MAX_CONCURRENT_RESCUE:
         return used_krw
 
+    await fetch_bb_patterns_candidates()
     rescue_candidates = []
     for pos in enriched_positions:
         market = pos["market"]
@@ -855,34 +856,28 @@ async def process_rescue_operations(
         if total_buys - 1 >= MAX_ADDITIONAL_BUYS or pnl <= RESCUE_MIN_DROP:
             rescue_candidates.append(pos)
 
-    rescue_candidates.sort(key=lambda position: position["pnl_percent"])
+    rescue_candidates.sort(
+        key=lambda position: (
+            _bb_patterns_cache["market_scores"].get(position["market"], 0),
+            _bb_patterns_cache["trade_counts"].get(position["market"], 0),
+        ),
+        reverse=True,
+    )
     for target in rescue_candidates:
         market = target["market"]
-        if not await check_rescue_rebound_signal(market):
+        analysis = await analyze_mtf_trend_and_target(market)
+        if not analysis or not analysis.get("is_rebounding"):
+            continue
+        if not await has_minimum_rescue_trade_activity(market):
             continue
 
         balance = target["balance"] + target["locked"]
         avg_price = target["avg_buy_price"]
         try:
-            _, estimated_buy_price = await get_orderbook_top(market)
-            target_avg_price = avg_price / Decimal("1.003")
-            if (
-                balance <= 0
-                or avg_price <= target_avg_price
-                or estimated_buy_price <= 0
-                or estimated_buy_price >= target_avg_price
-            ):
-                print(
-                    f"[RESCUE-SKIP] {market} 목표 탈출가 기준으로 필요한 매수액을 "
-                    "계산할 수 없어 구출 매수를 건너뜁니다."
-                )
+            if balance <= 0 or avg_price <= 0:
                 continue
 
-            required_krw = (
-                balance * (avg_price - target_avg_price)
-                / (target_avg_price / estimated_buy_price - Decimal("1"))
-            ).to_integral_value(rounding=ROUND_CEILING)
-            buy_amount = min(required_krw, available_krw).to_integral_value(
+            buy_amount = min(ADDITIONAL_BUY_KRW, available_krw).to_integral_value(
                 rounding=ROUND_FLOOR
             )
         except Exception as e:
@@ -891,14 +886,16 @@ async def process_rescue_operations(
 
         if buy_amount < MIN_ORDER_NOTIONAL_KRW:
             print(
-                f"[RESCUE-SKIP] {market} 필요 매수액 또는 가용 KRW가 "
-                f"최소 주문금액({MIN_ORDER_NOTIONAL_KRW}원) 미만입니다."
+                f"[RESCUE-SKIP] {market} 주문금액 {buy_amount:,.0f}원 "
+                f"(추가매수 설정 {ADDITIONAL_BUY_KRW:,.0f}원, "
+                f"가용 KRW {available_krw:,.0f}원)이 "
+                f"최소 주문금액({MIN_ORDER_NOTIONAL_KRW:,.0f}원) 미만입니다."
             )
             continue
 
         print(
-            f"🚑 [RESCUE-PLAN] {market} 단기 반등 감지! 구출 매수 "
-            f"(필요금액: {required_krw}원, 주문금액: {buy_amount}원, "
+            f"🚑 [RESCUE-PLAN] {market} 상승 추세 및 거래량 확인! 구출 매수 "
+            f"(주문금액: {buy_amount}원, "
             f"가용금액: {available_krw}원, 현재 손실률: {target['pnl_percent']}%)"
         )
         try:
@@ -958,6 +955,19 @@ async def process_rescue_operations(
         break
 
     return used_krw
+
+
+async def process_rescue_operations(
+        access_key: str,
+        secret_key: str,
+        enriched_positions: List[dict],
+        ps: PositionState,
+        available_krw: Decimal
+) -> Decimal:
+    async with _rescue_buy_lock:
+        return await _process_rescue_operations_unlocked(
+            access_key, secret_key, enriched_positions, ps, available_krw
+        )
 
 
 async def process_strategic_additional_buys(

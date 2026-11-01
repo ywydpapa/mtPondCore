@@ -48,6 +48,8 @@ redis_client = aioredis.Redis(
 # ============================================================
 BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = 60  # 외부 분석 서버 캐시 주기 60초
+BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
+ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))
 
 RATIO_INITIAL = Decimal("0.20")
 RATIO_AVERAGING = Decimal("0.40")
@@ -62,6 +64,7 @@ GRID_TARGET_TP_PCT = Decimal("0.5")  # +0.5% 합산 익절
 RESCUE_MIN_DROP = Decimal("-8.0")
 RESCUE_MAX_DROP = Decimal("-22.0")
 MAX_CONCURRENT_RESCUE = 1
+_rescue_buy_lock = asyncio.Lock()
 ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").strip().upper() in ("1", "Y", "TRUE"))
 
 MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
@@ -80,6 +83,7 @@ _db_setup_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 
 
 async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
+    global ADDITIONAL_BUY_KRW
     now = time.time()
     cached = _db_setup_cache.get(user_no)
     if cached and now - cached[0] < DB_SETUP_CACHE_TTL_SEC:
@@ -108,6 +112,13 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
     except (KeyError, ValueError, TypeError) as exc:
         raise ValueError("DB 매매 설정의 maxCoincnt 값이 없거나 올바르지 않습니다.") from exc
     parsed["activeYN"] = str(setup.get("activeYN", "N")).strip().upper()
+    if "stopYN" in setup:
+        parsed["stopYN"] = str(setup["stopYN"]).strip().upper()
+    if "addAmt" in setup:
+        try:
+            parsed["addAmt"] = Decimal(str(setup["addAmt"]))
+        except (ValueError, TypeError, ArithmeticError) as exc:
+            raise ValueError("DB 매매 설정의 addAmt 값이 올바르지 않습니다.") from exc
 
     if any(not parsed[key].is_finite() for key in decimal_fields):
         raise ValueError("DB 매매 설정의 금액은 유한한 숫자여야 합니다.")
@@ -115,6 +126,10 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
         raise ValueError("DB limitAmt는 0보다 커야 합니다.")
     if parsed["maxCoincnt"] <= 0:
         raise ValueError("DB maxCoincnt는 0보다 커야 합니다.")
+    if "addAmt" in parsed:
+        if not parsed["addAmt"].is_finite() or parsed["addAmt"] < 0:
+            raise ValueError("DB addAmt는 0 이상의 유한한 금액이어야 합니다.")
+        ADDITIONAL_BUY_KRW = parsed["addAmt"]
 
     _db_setup_cache[user_no] = (now, parsed)
     return parsed
@@ -611,7 +626,7 @@ async def fetch_rescue_best_ask(market: str) -> Decimal:
     return Decimal(str(data[0]["orderbook_units"][0]["ask_price"]))
 
 
-async def process_rescue_buy(
+async def _process_rescue_buy_unlocked(
         access_key: str,
         secret_key: str,
         sm: CompositeStateManager,
@@ -640,17 +655,16 @@ async def process_rescue_buy(
         target_avg = avg_price / Decimal("1.003")
         if balance <= 0 or buy_price <= 0 or buy_price >= target_avg:
             return Decimal("0")
-        required_krw = (
-            balance * (avg_price - target_avg)
-            / (target_avg / buy_price - Decimal("1"))
-        ).to_integral_value(rounding=ROUND_CEILING)
-        buy_amount = min(required_krw, available_krw).to_integral_value(
+        buy_amount = min(ADDITIONAL_BUY_KRW, available_krw).to_integral_value(
             rounding=ROUND_FLOOR
         )
     except Exception as exc:
         print(f"[RESCUE][ERR] {market} 매수액 계산 실패: {exc}")
         return Decimal("0")
     if buy_amount < MIN_ORDER_NOTIONAL_KRW:
+        print(f"[RESCUE-SKIP] {market} 구출 매수액 {buy_amount:,.0f}원 "
+              f"(addAmt {ADDITIONAL_BUY_KRW:,.0f}원, 가용 KRW {available_krw:,.0f}원) "
+              f"최소주문액 {MIN_ORDER_NOTIONAL_KRW:,.0f}원 미만")
         return Decimal("0")
 
     buy_completed = False
@@ -701,6 +715,96 @@ async def process_rescue_buy(
     except Exception as exc:
         print(f"[RESCUE][ERR] {market} 구출 매수/탈출 주문 실패: {exc}")
         return buy_amount if buy_completed else Decimal("0")
+
+
+async def process_rescue_buy(
+        access_key: str,
+        secret_key: str,
+        sm: CompositeStateManager,
+        market: str,
+        state: Dict[str, Any],
+        is_grid: bool,
+        balance: Decimal,
+        avg_price: Decimal,
+        current_price: Decimal,
+        pnl: Decimal,
+        available_krw: Decimal
+) -> Decimal:
+    async with _rescue_buy_lock:
+        return await _process_rescue_buy_unlocked(
+            access_key, secret_key, sm, market, state, is_grid, balance,
+            avg_price, current_price, pnl, available_krw
+        )
+
+
+async def process_rescue_candidates(
+        access_key: str,
+        secret_key: str,
+        sm: CompositeStateManager,
+        accounts_by_market: Dict[str, Dict[str, Any]],
+        price_map: Dict[str, Decimal],
+        available_krw: Decimal,
+        btc_status: str
+) -> Decimal:
+    if not ENABLE_STOP or btc_status == "EMERGENCY":
+        return Decimal("0")
+    if sum(
+            1 for state in [sm.grid_position, *sm.trend_positions.values()]
+            if state and state_flag(state, "is_rescued")
+    ) >= MAX_CONCURRENT_RESCUE:
+        return Decimal("0")
+
+    pattern_rows = await fetch_all_candle_patterns()
+    ranks = {}
+    for row in pattern_rows:
+        if not isinstance(row, dict):
+            continue
+        market = row.get("market", "")
+        if not market.startswith("KRW-"):
+            continue
+        try:
+            ranks[market] = (
+                int(row.get("overall_score", 0)),
+                int((row.get("trade_activity") or {}).get("trade_count_10m", 0)),
+            )
+        except (TypeError, ValueError):
+            continue
+
+    positions = []
+    if sm.grid_position:
+        positions.append((sm.grid_position["market"], sm.grid_position, True))
+    positions.extend(
+        (market, state, False) for market, state in sm.trend_positions.items()
+    )
+    candidates = []
+    for market, state, is_grid in positions:
+        account = accounts_by_market.get(market)
+        current_price = price_map.get(market, Decimal("0"))
+        if not account or current_price <= 0 or state_flag(state, "is_rescued"):
+            continue
+        balance = Decimal(str(account.get("balance", "0"))) + Decimal(
+            str(account.get("locked", "0"))
+        )
+        average_price = Decimal(str(account.get("avg_buy_price", "0")))
+        if balance <= 0 or average_price <= 0:
+            continue
+        pnl = (current_price - average_price) / average_price * Decimal("100")
+        score, trades = ranks.get(market, (0, 0))
+        if not (RESCUE_MAX_DROP < pnl <= RESCUE_MIN_DROP) or trades < BB_MIN_TRADE_COUNT_10M:
+            continue
+        candidates.append(
+            (score, trades, market, state, is_grid, balance, average_price, current_price, pnl)
+        )
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _, _, market, state, is_grid, balance, average, current, pnl in candidates:
+        used = await process_rescue_buy(
+            access_key, secret_key, sm, market, state, is_grid, balance,
+            average, current, pnl, available_krw
+        )
+        if used > 0 or state_flag(state, "is_rescued"):
+            return used
+    return Decimal("0")
 
 
 async def handle_rescue_stop(
@@ -1076,15 +1180,6 @@ async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeSt
             access_key, secret_key, sm, mkt, grid_state, cur_p, pnl, is_grid=True
         )
         return
-    if ENABLE_STOP and budget_state.get("btc_status") != "EMERGENCY":
-        rescue_used = await process_rescue_buy(
-            access_key, secret_key, sm, mkt, grid_state, True,
-            bal + locked, avg_p, cur_p, pnl, budget_state["krw_available"]
-        )
-        if rescue_used > 0 or state_flag(grid_state, "is_rescued"):
-            budget_state["krw_available"] -= rescue_used
-            return
-
     if bal * cur_p >= MIN_ORDER_NOTIONAL_KRW and not sm.grid_position.get("last_tp_uuid"):
         target_tp_p = adjust_price_to_tick(avg_p * (Decimal("1") + (GRID_TARGET_TP_PCT / Decimal("100"))), side="ask")
         if LIVE_TRADING:
@@ -1209,6 +1304,11 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                     f"{budget['used']['initial']:,.0f}/{budget['used']['averaging']:,.0f}/"
                     f"{budget['used']['breakout']:,.0f}원 설정={'DB' if db_setup else '불가'}")
 
+            rescue_used = await process_rescue_candidates(
+                access_key, secret_key, state_manager, accounts_by_market,
+                price_map, budget["krw_available"], btc_status
+            )
+            budget["krw_available"] -= rescue_used
             await manage_grid_position(access_key, secret_key, state_manager, budget)
 
             for market in list(state_manager.trend_positions):
@@ -1233,17 +1333,6 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                         current_price, pnl, is_grid=False
                     )
                     continue
-                if ENABLE_STOP and btc_status != "EMERGENCY":
-                    rescue_used = await process_rescue_buy(
-                        access_key, secret_key, state_manager, market, state, False,
-                        Decimal(str(account.get("balance", "0"))) +
-                        Decimal(str(account.get("locked", "0"))),
-                        average_price, current_price, pnl, budget["krw_available"]
-                    )
-                    if rescue_used > 0 or state_flag(state, "is_rescued"):
-                        budget["krw_available"] -= rescue_used
-                        continue
-
                 if (db_setup and btc_status == "NORMAL" and pnl > 0
                         and not state_flag(state, "breakout_attempted")
                         and await check_bullish_breakout(market)):
@@ -1349,8 +1438,9 @@ async def run_mtpond_controller(user_no: int, server_no: int):
                     if "stopYN" in cfg:
                         stop_enabled = str(cfg.get("stopYN")).strip().upper() in ("1", "Y", "TRUE")
                         if stop_enabled != ENABLE_STOP:
-                            print(f"[REDIS-CONFIG] ENABLE_STOP {ENABLE_STOP} -> {stop_enabled}")
+                            previous = ENABLE_STOP
                             ENABLE_STOP = stop_enabled
+                            print(f"[REDIS-CONFIG] ENABLE_STOP {previous} -> {stop_enabled}")
                     if raw_status is None:
                         active_flag = str(cfg.get("activeYN", "N")).strip().upper() == "Y"
                 else:

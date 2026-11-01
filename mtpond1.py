@@ -150,6 +150,7 @@ MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS","5"))
 RESCUE_MIN_DROP = Decimal("-8.0")
 RESCUE_MAX_DROP = Decimal("-22.0")
 MAX_CONCURRENT_RESCUE = 1
+_rescue_buy_lock = asyncio.Lock()
 # Avg Down
 AVG_DOWN_TP_ARM_PNL = _decimal_env("AVG_DOWN_TP_ARM_PNL", "0.20")
 AVG_DOWN_TP_HARD_PNL = _decimal_env("AVG_DOWN_TP_HARD_PNL", "0.40")
@@ -202,6 +203,9 @@ DUST_CLEANUP_ENABLED = os.getenv("DUST_CLEANUP_ENABLED","1") == "1"
 DUST_LOG_INTERVAL_SEC = int(os.getenv("DUST_LOG_INTERVAL_SEC","600"))
 DUST_LAST_LOG: dict[str,float] = {}
 BBTREND_API_URL = os.getenv("BBTREND_API_URL", "http://becog.iptime.org:8088/api/bbtrend30")
+BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
+BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))
+BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 BBTREND_MIN_EXPECTED_PCT = float(os.getenv("BBTREND_MIN_EXPECTED_PCT", "0.005"))  # 0.005 = 0.5%
 BBTREND_MIN_NOTIONAL_3M = float(os.getenv("BBTREND_MIN_NOTIONAL_3M", "20000000"))
 BBTREND_FETCH_INTERVAL_SEC = int(os.getenv("BBTREND_FETCH_INTERVAL_SEC", "30"))
@@ -329,7 +333,7 @@ def apply_dynamic_config(cfg: dict):
 
         if "addAmt" in cfg:
             val = to_decimal_safe(cfg.get("addAmt"), "addAmt")
-            if val and val > 0 and val != ADDITIONAL_BUY_KRW:
+            if val is not None and val.is_finite() and val >= 0 and val != ADDITIONAL_BUY_KRW:
                 changes.append(f"ADDITIONAL_BUY_KRW {ADDITIONAL_BUY_KRW} -> {val}")
                 ADDITIONAL_BUY_KRW = val
 
@@ -2313,7 +2317,56 @@ async def check_rescue_rebound_signal(market: str) -> bool:
         return False
 
 
-async def process_rescue_operations(
+_rescue_rank_cache: Dict[str, Any] = {
+    "fetched_ts": 0.0,
+    "scores": {},
+    "trade_counts": {},
+}
+
+
+async def fetch_rescue_market_ranks() -> None:
+    now = time.time()
+    if now - _rescue_rank_cache["fetched_ts"] < BB_CACHE_TTL_SEC:
+        return
+    _rescue_rank_cache["fetched_ts"] = now
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            response = await client.get(BB_PATTERNS_API_URL)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        print(f"[RESCUE-RANK][WARN] BB-Patterns 조회 실패: {exc}")
+        return
+
+    if not isinstance(payload, dict):
+        print("[RESCUE-RANK][WARN] BB-Patterns 응답 형식이 올바르지 않습니다.")
+        return
+    coins = payload.get("coins", [])
+    if not isinstance(coins, list):
+        print("[RESCUE-RANK][WARN] BB-Patterns 응답의 coins 형식이 올바르지 않습니다.")
+        return
+
+    scores = {}
+    trade_counts = {}
+    for coin in coins:
+        if not isinstance(coin, dict):
+            continue
+        market = coin.get("market", "")
+        if not market.startswith("KRW-"):
+            continue
+        try:
+            scores[market] = int(coin.get("overall_score", 0))
+            trade_counts[market] = int(
+                (coin.get("trade_activity") or {}).get("trade_count_10m", 0)
+            )
+        except (TypeError, ValueError):
+            continue
+    _rescue_rank_cache.update(
+        fetched_ts=now, scores=scores, trade_counts=trade_counts
+    )
+
+
+async def _process_rescue_operations_unlocked(
     access_key: str,
     secret_key: str,
     enriched_positions: List[dict],
@@ -2325,6 +2378,7 @@ async def process_rescue_operations(
     if sum(st.get("is_rescued", False) for st in ps.data.values()) >= MAX_CONCURRENT_RESCUE:
         return Decimal("0")
 
+    await fetch_rescue_market_ranks()
     candidates = []
     for pos in enriched_positions:
         market = pos.get("market")
@@ -2332,11 +2386,19 @@ async def process_rescue_operations(
         state = ps.data.get(market, {})
         if not market or pnl is None or state.get("is_rescued") or pnl <= RESCUE_MAX_DROP:
             continue
+        if _rescue_rank_cache["trade_counts"].get(market, 0) < BB_MIN_TRADE_COUNT_10M:
+            continue
         total_buys, _ = ps.get_buy_stats(market)
         if total_buys - 1 >= MAX_ADDITIONAL_BUYS or pnl <= RESCUE_MIN_DROP:
             candidates.append(pos)
 
-    candidates.sort(key=lambda pos: pos["pnl_percent"])
+    candidates.sort(
+        key=lambda pos: (
+            _rescue_rank_cache["scores"].get(pos["market"], 0),
+            _rescue_rank_cache["trade_counts"].get(pos["market"], 0),
+        ),
+        reverse=True,
+    )
     for pos in candidates:
         market = pos["market"]
         if not await check_rescue_rebound_signal(market):
@@ -2349,18 +2411,13 @@ async def process_rescue_operations(
         try:
             _, buy_price = await get_orderbook_top(market)
             target_avg = avg_price / Decimal("1.003")
-            if buy_price <= 0 or buy_price >= target_avg or avg_price <= target_avg:
-                print(f"[RESCUE-SKIP] {market} 목표 탈출가 기준 매수액 계산 불가")
+            if buy_price <= 0 or buy_price >= target_avg:
                 continue
-            required_krw = (
-                balance * (avg_price - target_avg)
-                / (target_avg / buy_price - Decimal("1"))
-            ).to_integral_value(rounding=ROUND_CEILING)
-            buy_amount = min(required_krw, available_krw).to_integral_value(
+            buy_amount = min(ADDITIONAL_BUY_KRW, available_krw).to_integral_value(
                 rounding=ROUND_FLOOR
             )
         except Exception as e:
-            print(f"[RESCUE][ERR] {market} 필요 매수액 계산 실패: {e}")
+            print(f"[RESCUE][ERR] {market} 구출 매수액 계산 실패: {e}")
             continue
         if buy_amount < MIN_ORDER_NOTIONAL_KRW:
             print(f"[RESCUE-SKIP] {market} 필요금액/가용 KRW가 최소주문액 미만")
@@ -2432,6 +2489,19 @@ async def process_rescue_operations(
         return buy_amount
 
     return Decimal("0")
+
+
+async def process_rescue_operations(
+    access_key: str,
+    secret_key: str,
+    enriched_positions: List[dict],
+    ps: PositionState,
+    available_krw: Decimal,
+) -> Decimal:
+    async with _rescue_buy_lock:
+        return await _process_rescue_operations_unlocked(
+            access_key, secret_key, enriched_positions, ps, available_krw
+        )
 
 
 async def process_rescue_failures(

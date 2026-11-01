@@ -359,6 +359,7 @@ ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1", "Y", "TRUE"))
 RESCUE_MIN_DROP = Decimal("-8.0")
 RESCUE_MAX_DROP = Decimal("-22.0")
 MAX_CONCURRENT_RESCUE = 1
+_rescue_buy_lock = asyncio.Lock()
 
 _CONFIG_INITIALIZED = False
 
@@ -554,7 +555,7 @@ def apply_dynamic_config(cfg: dict):
 
     if "addAmt" in cfg:
         val = to_decimal_safe(cfg.get("addAmt"))
-        if val and val > 0 and val != ADDITIONAL_BUY_KRW:
+        if val is not None and val.is_finite() and val >= 0 and val != ADDITIONAL_BUY_KRW:
             changes.append(f"ADDITIONAL_BUY_KRW {ADDITIONAL_BUY_KRW} -> {val}")
             ADDITIONAL_BUY_KRW = val
 
@@ -946,7 +947,9 @@ async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
 _bb_patterns_cache: Dict[str, Any] = {
     "fetched_ts": 0.0,
     "last_server_updated": None,
-    "candidates": []
+    "candidates": [],
+    "market_scores": {},
+    "trade_counts": {},
 }
 
 async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, Any]]:
@@ -976,6 +979,8 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     server_updated = data.get("updated")
     excluded = await get_excluded_markets()
     qualified = []
+    market_scores = {}
+    trade_counts = {}
 
     cnt_total = len(coins)
     cnt_excluded = 0
@@ -1004,15 +1009,16 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             overall_score = int(c.get("overall_score", 0))
         except Exception:
             overall_score = 0
-        if overall_score < BB_MIN_OVERALL_SCORE:
-            cnt_score_drop += 1
-            continue
-
         act = c.get("trade_activity") or {}
         try:
             count_10m = int(act.get("trade_count_10m", 0))
         except Exception:
             count_10m = 0
+        market_scores[market] = overall_score
+        trade_counts[market] = count_10m
+        if overall_score < BB_MIN_OVERALL_SCORE:
+            cnt_score_drop += 1
+            continue
 
         if count_10m < BB_MIN_TRADE_COUNT_10M:
             cnt_trade_drop += 1
@@ -1032,6 +1038,8 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     _bb_patterns_cache["fetched_ts"] = now
     _bb_patterns_cache["last_server_updated"] = server_updated
     _bb_patterns_cache["candidates"] = qualified
+    _bb_patterns_cache["market_scores"] = market_scores
+    _bb_patterns_cache["trade_counts"] = trade_counts
 
     print(
         f"\n[BB-PATTERNS 갱신] 서버시각: {server_updated}\n"
@@ -1112,7 +1120,7 @@ async def check_rescue_rebound_signal(market: str) -> bool:
         return False
 
 
-async def process_rescue_operations(
+async def _process_rescue_operations_unlocked(
         access_key: str,
         secret_key: str,
         positions: List[dict],
@@ -1124,10 +1132,21 @@ async def process_rescue_operations(
     ) >= MAX_CONCURRENT_RESCUE:
         return Decimal("0")
 
-    for pos in sorted(positions, key=lambda item: item["pnl_percent"]):
+    await fetch_bb_patterns_candidates()
+    ranked_positions = sorted(
+        positions,
+        key=lambda item: (
+            _bb_patterns_cache["market_scores"].get(item["market"], 0),
+            _bb_patterns_cache["trade_counts"].get(item["market"], 0),
+        ),
+        reverse=True,
+    )
+    for pos in ranked_positions:
         market = pos["market"]
         pnl = pos["pnl_percent"]
         if pnl <= RESCUE_MAX_DROP or pnl > RESCUE_MIN_DROP:
+            continue
+        if _bb_patterns_cache["trade_counts"].get(market, 0) < BB_MIN_TRADE_COUNT_10M:
             continue
         state = ps.update_or_init(market, pnl, pos["avg_buy_price"])
         if state.get("is_rescued", False):
@@ -1145,17 +1164,16 @@ async def process_rescue_operations(
             target_avg = avg_price / Decimal("1.003")
             if balance <= 0 or buy_price <= 0 or buy_price >= target_avg:
                 continue
-            required_krw = (
-                balance * (avg_price - target_avg)
-                / (target_avg / buy_price - Decimal("1"))
-            ).to_integral_value(rounding=ROUND_CEILING)
-            buy_amount = min(required_krw, available_krw).to_integral_value(
+            buy_amount = min(ADDITIONAL_BUY_KRW, available_krw).to_integral_value(
                 rounding=ROUND_FLOOR
             )
         except Exception as exc:
             print(f"[RESCUE][ERR] {market} 매수액 계산 실패: {exc}")
             continue
         if buy_amount < MIN_ORDER_NOTIONAL_KRW:
+            print(f"[RESCUE-SKIP] {market} 구출 매수액 {buy_amount:,.0f}원 "
+                  f"(addAmt {ADDITIONAL_BUY_KRW:,.0f}원, 가용 KRW {available_krw:,.0f}원) "
+                  f"최소주문액 {MIN_ORDER_NOTIONAL_KRW:,.0f}원 미만")
             continue
 
         buy_completed = False
@@ -1199,6 +1217,19 @@ async def process_rescue_operations(
             continue
         return buy_amount
     return Decimal("0")
+
+
+async def process_rescue_operations(
+        access_key: str,
+        secret_key: str,
+        positions: List[dict],
+        ps: PositionState,
+        available_krw: Decimal
+) -> Decimal:
+    async with _rescue_buy_lock:
+        return await _process_rescue_operations_unlocked(
+            access_key, secret_key, positions, ps, available_krw
+        )
 
 
 # ============================================================
