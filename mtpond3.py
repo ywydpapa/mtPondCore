@@ -98,8 +98,11 @@ MIN_ROOM_TO_1H_HIGH_PCT = Decimal("1.2")  # 1시간봉 상단 저항까지 최�
 MAX_ADDITIONAL_BUYS = 2  # 최대 물타기 2회
 ADD_BUY_1_DROP = _decimal_env("ADD_BUY_1_DROP", "-2.2")  # 1차 물타기 기준 (-2.2%)
 ADD_BUY_2_DROP = _decimal_env("ADD_BUY_2_DROP", "-4.5")  # 2차 물타기 기준 (-4.5%)
-FINAL_LOSS_CUT_RATE = _decimal_env("FINAL_LOSS_CUT_RATE", "-6.5")  # 최종 방어 손절선 (-6.5%)
-MAX_LOSS_LIMIT_PCT = Decimal("-25.0")  # 손실이 -25% 초과(미만)일 경우 손절 차단
+
+# 구출 물타기 설정
+RESCUE_MIN_DROP = Decimal("-8.0")
+RESCUE_MAX_DROP = Decimal("-22.0")
+MAX_CONCURRENT_RESCUE = 1
 
 INTERVAL_SECONDS = 5
 MIN_NOTIONAL_KRW = Decimal("5000")
@@ -143,7 +146,9 @@ class PositionState:
                 "dynamic_tp": None,
                 "last_additional_buy_ts": now,
                 "last_additional_buy_price": avg_price,
-                "last_additional_buy_pnl": Decimal("0")
+                "last_additional_buy_pnl": Decimal("0"),
+                "is_rescued": False,
+                "rescue_buy_price": None
             }
             return self.data[market]
 
@@ -750,8 +755,9 @@ async def cancel_all_open_orders_for_market(access_key: str, secret_key: str, ma
                 if uid:
                     await upbit_request("DELETE", "https://api.upbit.com/v1/order", access_key, secret_key,
                                         params={"uuid": uid}, max_retry=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ORDER-CANCEL][ERR] {market} 미체결 주문 취소 실패: {e}")
+        raise
 
 
 # ============================================================
@@ -792,6 +798,168 @@ async def sync_or_register_held_positions(access_key: str, secret_key: str, ps: 
 # ============================================================
 # 13. 1시간/15분봉 반등 지지 확인형 물타기 프로세스
 # ============================================================
+async def check_rescue_rebound_signal(market: str) -> bool:
+    """15분봉 가격 흐름으로 단기 반등 신호를 확인합니다."""
+    url_15m = "https://api.upbit.com/v1/candles/minutes/15"
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            response = await client.get(url_15m, params={"market": market, "count": 10})
+            if response.status_code != 200:
+                return False
+            candles = response.json()
+            if len(candles) < 5:
+                return False
+
+            current_price = Decimal(str(candles[0]["trade_price"]))
+            opening_price = Decimal(str(candles[0]["opening_price"]))
+            current_low = Decimal(str(candles[0]["low_price"]))
+            previous_close = Decimal(str(candles[1]["trade_price"]))
+            previous_low = Decimal(str(candles[1]["low_price"]))
+
+            is_bullish = current_price > opening_price
+            is_higher_low = current_low >= previous_low
+            is_recovering = current_price >= previous_close
+            return is_bullish and (is_higher_low or is_recovering)
+    except Exception as e:
+        print(f"[RESCUE-CHECK][ERR] {market} 반등 검증 실패: {e}")
+        return False
+
+
+async def process_rescue_operations(
+        access_key: str,
+        secret_key: str,
+        enriched_positions: List[dict],
+        ps: PositionState,
+        available_krw: Decimal
+) -> Decimal:
+    """반등 신호가 확인된 보유 종목에 구출 매수와 탈출 지정가를 배치합니다."""
+    used_krw = Decimal("0")
+    if available_krw < MIN_ORDER_NOTIONAL_KRW:
+        return used_krw
+
+    active_rescue_count = sum(
+        1 for state in ps.data.values() if state.get("is_rescued", False)
+    )
+    if active_rescue_count >= MAX_CONCURRENT_RESCUE:
+        return used_krw
+
+    rescue_candidates = []
+    for pos in enriched_positions:
+        market = pos["market"]
+        pnl = pos["pnl_percent"]
+        state = ps.data.get(market, {})
+        if state.get("is_rescued", False) or pnl <= RESCUE_MAX_DROP:
+            continue
+
+        total_buys, _ = ps.get_buy_stats(market)
+        if total_buys - 1 >= MAX_ADDITIONAL_BUYS or pnl <= RESCUE_MIN_DROP:
+            rescue_candidates.append(pos)
+
+    rescue_candidates.sort(key=lambda position: position["pnl_percent"])
+    for target in rescue_candidates:
+        market = target["market"]
+        if not await check_rescue_rebound_signal(market):
+            continue
+
+        balance = target["balance"] + target["locked"]
+        avg_price = target["avg_buy_price"]
+        try:
+            _, estimated_buy_price = await get_orderbook_top(market)
+            target_avg_price = avg_price / Decimal("1.003")
+            if (
+                balance <= 0
+                or avg_price <= target_avg_price
+                or estimated_buy_price <= 0
+                or estimated_buy_price >= target_avg_price
+            ):
+                print(
+                    f"[RESCUE-SKIP] {market} 목표 탈출가 기준으로 필요한 매수액을 "
+                    "계산할 수 없어 구출 매수를 건너뜁니다."
+                )
+                continue
+
+            required_krw = (
+                balance * (avg_price - target_avg_price)
+                / (target_avg_price / estimated_buy_price - Decimal("1"))
+            ).to_integral_value(rounding=ROUND_CEILING)
+            buy_amount = min(required_krw, available_krw).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        except Exception as e:
+            print(f"[RESCUE][ERR] {market} 필요 매수액 계산 실패: {e}")
+            continue
+
+        if buy_amount < MIN_ORDER_NOTIONAL_KRW:
+            print(
+                f"[RESCUE-SKIP] {market} 필요 매수액 또는 가용 KRW가 "
+                f"최소 주문금액({MIN_ORDER_NOTIONAL_KRW}원) 미만입니다."
+            )
+            continue
+
+        print(
+            f"🚑 [RESCUE-PLAN] {market} 단기 반등 감지! 구출 매수 "
+            f"(필요금액: {required_krw}원, 주문금액: {buy_amount}원, "
+            f"가용금액: {available_krw}원, 현재 손실률: {target['pnl_percent']}%)"
+        )
+        try:
+            if LIVE_TRADING:
+                response = await order_market_buy_price(
+                    access_key, secret_key, market, buy_amount
+                )
+                print(f"🚑 [RESCUE-BUY] {market} 체결 완료 (uuid={response.get('uuid')})")
+            else:
+                print(f"🚑 [RESCUE-BUY][DRY] {market} 구출 매수: {buy_amount}원")
+
+            ps.record_buy(market, buy_amount)
+            state = ps.data.setdefault(market, {})
+            state["is_rescued"] = True
+            state["rescue_buy_price"] = target["current_price"]
+            used_krw += buy_amount
+        except Exception as e:
+            print(f"[RESCUE][ERR] {market} 구출 매수 실패: {e}")
+            continue
+
+        try:
+            await asyncio.sleep(0.8)
+            await cancel_all_open_orders_for_market(access_key, secret_key, market)
+            await asyncio.sleep(0.3)
+
+            accounts = await fetch_upbit_accounts(access_key, secret_key)
+            base = market.split("-")[1]
+            for account in accounts:
+                if account.get("currency") != base:
+                    continue
+
+                balance = Decimal(str(account.get("balance", "0")))
+                new_avg = Decimal(str(account.get("avg_buy_price", "0")))
+                if balance <= 0 or new_avg <= 0:
+                    break
+
+                target_exit_price = new_avg * Decimal("1.003")
+                _, best_ask = await get_orderbook_top(market)
+                limit_price = adjust_price_to_tick(
+                    max(target_exit_price, best_ask), side="ask"
+                )
+                volume = quantize_volume(balance)
+                if volume * limit_price >= MIN_ORDER_NOTIONAL_KRW:
+                    response = await order_limit_sell(
+                        access_key, secret_key, market, volume, limit_price
+                    )
+                    state["active_limit_uuid"] = response.get("uuid")
+                    state["dynamic_tp"] = Decimal("0.3")
+                    print(
+                        f"🎯 [RESCUE-TP] {market} 탈출용 지정가 배치 완료: "
+                        f"{limit_price}원 (신규평단: {new_avg}원)"
+                    )
+                break
+        except Exception as e:
+            print(f"[RESCUE-TP][ERR] {market} 탈출 지정가 배치 실패: {e}")
+
+        break
+
+    return used_krw
+
+
 async def process_strategic_additional_buys(
         access_key: str,
         secret_key: str,
@@ -817,6 +985,9 @@ async def process_strategic_additional_buys(
         cur_price = pos.get("current_price")
 
         if market in excluded or pnl is None or cur_price is None:
+            continue
+
+        if ps.data.get(market, {}).get("is_rescued", False):
             continue
 
         total_buys, total_invested = ps.get_buy_stats(market)
@@ -1081,6 +1252,13 @@ async def monitor_positions(user_no: int, server_no: int):
             active_count = len(enriched)
             remaining_slots = max(0, MAX_ACTIVE_MARKETS - active_count)
 
+            rescue_krw_used = Decimal("0")
+            if ENABLE_STOP and btc_status != "EMERGENCY":
+                rescue_krw_used = await process_rescue_operations(
+                    access_key, secret_key, enriched, ps, available_krw
+                )
+                available_krw -= rescue_krw_used
+
             # [A] 매도 판단: 최종 방어 손절 및 고점 대비 이익 보존 트레일링
             for pos in enriched:
                 market = pos["market"]
@@ -1091,34 +1269,43 @@ async def monitor_positions(user_no: int, server_no: int):
                 if cur_p is None or avg_p is None or cur_p <= 0 or avg_p <= 0:
                     continue
 
-                total_buys, _ = ps.get_buy_stats(market)
                 st = ps.update_or_init(market, pnl, avg_p)
 
-                # 만약 시장이 EMERGENCY 상태이면 기존 손절선보다 타이트하게 방어 손절(-1.8%) 적용
-                effective_stop_cut = FINAL_LOSS_CUT_RATE
-                if btc_status == "EMERGENCY":
-                    effective_stop_cut = Decimal("-1.8")
+                if ENABLE_STOP and st.get("is_rescued", False):
+                    rescue_price = st.get("rescue_buy_price")
+                    if rescue_price is not None and rescue_price > 0:
+                        rescue_pnl = (
+                            (cur_p - rescue_price) / rescue_price * Decimal("100")
+                        )
+                        if rescue_pnl <= Decimal("-2.5"):
+                            print(
+                                f"🚨 [RESCUE-FAIL] {market} 구출 매수 후 반등 실패로 "
+                                f"전량 손절 (구출가대비: {rescue_pnl:.2f}%)"
+                            )
+                            await cancel_all_open_orders_for_market(
+                                access_key, secret_key, market
+                            )
+                            await asyncio.sleep(0.3)
+                            accounts = await fetch_upbit_accounts(access_key, secret_key)
+                            for account in accounts:
+                                if account.get("currency") != market.split("-")[1]:
+                                    continue
 
-                # 1. 2회 물타기 소진 상태에서 최종 손절선 도달 시 손절 (-25% 초과 보호)
-                if ENABLE_STOP and total_buys - 1 >= MAX_ADDITIONAL_BUYS and pnl <= effective_stop_cut:
-                    if pnl < MAX_LOSS_LIMIT_PCT:
-                        print(f"🛡️ [LOSS-PROTECT] {market} 손실률이 {pnl}%로 -25%를 초과하여 손절 보류")
-                    else:
-                        print(f"🚨 [FINAL-DEFENSE] {market} 최종 손절 실행 (PNL: {pnl}%)")
-                        await cancel_all_open_orders_for_market(access_key, secret_key, market)
-                        await asyncio.sleep(0.4)
-                        accs = await fetch_upbit_accounts(access_key, secret_key)
-                        for a in accs:
-                            if a.get("currency") == market.split("-")[1]:
-                                bal_dec = Decimal(str(a.get("balance", "0")))
-                                s_vol = quantize_volume(bal_dec)
-                                if s_vol and (s_vol * cur_p) >= MIN_ORDER_NOTIONAL_KRW:
+                                balance = Decimal(str(account.get("balance", "0")))
+                                sell_volume = quantize_volume(balance)
+                                if sell_volume and (
+                                    sell_volume * cur_p
+                                ) >= MIN_ORDER_NOTIONAL_KRW:
                                     if LIVE_TRADING:
-                                        await order_market_sell(access_key, secret_key, market, s_vol)
-                                    await register_loss_cut(user_no, market, s_vol, cur_p, pnl)
-                                    ps.mark_sold(market, reason="LOSS_CUT")
+                                        await order_market_sell(
+                                            access_key, secret_key, market, sell_volume
+                                        )
+                                    await register_loss_cut(
+                                        user_no, market, sell_volume, cur_p, pnl
+                                    )
+                                    ps.mark_sold(market, reason="RESCUE_LOSS_CUT")
                                 break
-                    continue
+                            continue
 
                 raw_tp = st.get("dynamic_tp")
                 target_tp = Decimal(str(raw_tp)) if raw_tp is not None else Decimal("1.5")

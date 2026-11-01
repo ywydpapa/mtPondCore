@@ -59,8 +59,9 @@ BUY_AMOUNT_UNIT_KRW = Decimal("10000")
 GRID_STEP_COUNT = 4  # 4단계 매수 그물망
 GRID_INTERVAL_PCT = Decimal("0.5")  # -0.5% 간격
 GRID_TARGET_TP_PCT = Decimal("0.5")  # +0.5% 합산 익절
-FAILSAFE_TREND_STOP_PCT = Decimal("-2.5")
-FAILSAFE_GRID_STOP_PCT = Decimal("-2.2")
+RESCUE_MIN_DROP = Decimal("-8.0")
+RESCUE_MAX_DROP = Decimal("-22.0")
+MAX_CONCURRENT_RESCUE = 1
 ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").strip().upper() in ("1", "Y", "TRUE"))
 
 MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
@@ -95,7 +96,7 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
     if not isinstance(setup, dict):
         raise ValueError("DB 매매 설정 응답이 객체가 아닙니다.")
 
-    decimal_fields = ("lcRate", "limitAmt")
+    decimal_fields = ("limitAmt",)
     parsed: Dict[str, Any] = {}
     for key in decimal_fields:
         try:
@@ -109,9 +110,7 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
     parsed["activeYN"] = str(setup.get("activeYN", "N")).strip().upper()
 
     if any(not parsed[key].is_finite() for key in decimal_fields):
-        raise ValueError("DB 매매 설정의 금액/손절 값은 유한한 숫자여야 합니다.")
-    if parsed["lcRate"] >= 0:
-        raise ValueError("DB lcRate는 손실률인 음수 값이어야 합니다.")
+        raise ValueError("DB 매매 설정의 금액은 유한한 숫자여야 합니다.")
     if parsed["limitAmt"] <= 0:
         raise ValueError("DB limitAmt는 0보다 커야 합니다.")
     if parsed["maxCoincnt"] <= 0:
@@ -577,6 +576,175 @@ async def cancel_all_orders(access_key: str, secret_key: str, market: str):
         print(f"[CANCEL][ERR] {market} 취소 실패: {e}")
 
 
+async def check_rescue_rebound_signal(market: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            response = await client.get(
+                "https://api.upbit.com/v1/candles/minutes/15",
+                params={"market": market, "count": 10}
+            )
+        if response.status_code != 200:
+            return False
+        candles = response.json()
+        if len(candles) < 2:
+            return False
+        current_close = Decimal(str(candles[0]["trade_price"]))
+        current_open = Decimal(str(candles[0]["opening_price"]))
+        current_low = Decimal(str(candles[0]["low_price"]))
+        previous_close = Decimal(str(candles[1]["trade_price"]))
+        previous_low = Decimal(str(candles[1]["low_price"]))
+        return current_close > current_open and (
+            current_low >= previous_low or current_close >= previous_close
+        )
+    except Exception as exc:
+        print(f"[RESCUE-CHECK][ERR] {market} 15분봉 반등 확인 실패: {exc}")
+        return False
+
+
+async def fetch_rescue_best_ask(market: str) -> Decimal:
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        response = await client.get(
+            "https://api.upbit.com/v1/orderbook", params={"markets": market}
+        )
+        response.raise_for_status()
+        data = response.json()
+    return Decimal(str(data[0]["orderbook_units"][0]["ask_price"]))
+
+
+async def process_rescue_buy(
+        access_key: str,
+        secret_key: str,
+        sm: CompositeStateManager,
+        market: str,
+        state: Dict[str, Any],
+        is_grid: bool,
+        balance: Decimal,
+        avg_price: Decimal,
+        current_price: Decimal,
+        pnl: Decimal,
+        available_krw: Decimal
+) -> Decimal:
+    if available_krw < MIN_ORDER_NOTIONAL_KRW or pnl <= RESCUE_MAX_DROP or pnl > RESCUE_MIN_DROP:
+        return Decimal("0")
+    active_count = int(state_flag(sm.grid_position or {}, "is_rescued"))
+    active_count += sum(
+        1 for item in sm.trend_positions.values() if state_flag(item, "is_rescued")
+    )
+    if active_count >= MAX_CONCURRENT_RESCUE or state_flag(state, "is_rescued"):
+        return Decimal("0")
+    if not await check_rescue_rebound_signal(market):
+        return Decimal("0")
+
+    try:
+        buy_price = await fetch_rescue_best_ask(market)
+        target_avg = avg_price / Decimal("1.003")
+        if balance <= 0 or buy_price <= 0 or buy_price >= target_avg:
+            return Decimal("0")
+        required_krw = (
+            balance * (avg_price - target_avg)
+            / (target_avg / buy_price - Decimal("1"))
+        ).to_integral_value(rounding=ROUND_CEILING)
+        buy_amount = min(required_krw, available_krw).to_integral_value(
+            rounding=ROUND_FLOOR
+        )
+    except Exception as exc:
+        print(f"[RESCUE][ERR] {market} 매수액 계산 실패: {exc}")
+        return Decimal("0")
+    if buy_amount < MIN_ORDER_NOTIONAL_KRW:
+        return Decimal("0")
+
+    buy_completed = False
+    try:
+        result = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+            "market": market, "side": "bid", "price": str(buy_amount), "ord_type": "price"
+        }) if LIVE_TRADING else {}
+        buy_completed = True
+        state["is_rescued"] = True
+        state["rescue_buy_price"] = current_price
+        if is_grid:
+            await sm.save_grid_position(state)
+        else:
+            await sm.save_trend_position(market, state)
+        print(f"[RESCUE-BUY] {market} 구출 매수 {buy_amount:,.0f}원 "
+              f"(uuid={result.get('uuid')})")
+
+        await asyncio.sleep(0.8)
+        await cancel_all_orders(access_key, secret_key, market)
+        await asyncio.sleep(0.3)
+        accounts = await upbit_api(
+            "GET", "https://api.upbit.com/v1/accounts", access_key, secret_key
+        )
+        account = next(
+            (item for item in accounts if item.get("currency") == market.split("-")[1]),
+            None
+        )
+        if account:
+            new_balance = Decimal(str(account.get("balance", "0")))
+            new_avg = Decimal(str(account.get("avg_buy_price", "0")))
+            if new_balance > 0 and new_avg > 0:
+                state["avg_price"] = new_avg
+                limit_price = adjust_price_to_tick(
+                    max(new_avg * Decimal("1.003"), await fetch_rescue_best_ask(market)),
+                    side="ask"
+                )
+                volume = quantize_volume(new_balance)
+                if volume * limit_price >= MIN_ORDER_NOTIONAL_KRW and LIVE_TRADING:
+                    await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+                        "market": market, "side": "ask", "volume": str(volume),
+                        "price": str(limit_price), "ord_type": "limit"
+                    })
+                if is_grid:
+                    await sm.save_grid_position(state)
+                else:
+                    await sm.save_trend_position(market, state)
+        return buy_amount
+    except Exception as exc:
+        print(f"[RESCUE][ERR] {market} 구출 매수/탈출 주문 실패: {exc}")
+        return buy_amount if buy_completed else Decimal("0")
+
+
+async def handle_rescue_stop(
+        access_key: str,
+        secret_key: str,
+        sm: CompositeStateManager,
+        market: str,
+        state: Dict[str, Any],
+        current_price: Decimal,
+        pnl: Decimal,
+        is_grid: bool
+) -> bool:
+    rescue_price = state.get("rescue_buy_price")
+    if not ENABLE_STOP or not state_flag(state, "is_rescued") or rescue_price is None:
+        return False
+    rescue_price = Decimal(str(rescue_price))
+    if rescue_price <= 0 or current_price > rescue_price * Decimal("0.975"):
+        return False
+    await cancel_all_orders(access_key, secret_key, market)
+    await asyncio.sleep(0.4)
+    accounts = await upbit_api(
+        "GET", "https://api.upbit.com/v1/accounts", access_key, secret_key
+    )
+    account = next(
+        (item for item in accounts if item.get("currency") == market.split("-")[1]),
+        None
+    )
+    if account:
+        volume = quantize_volume(Decimal(str(account.get("balance", "0"))))
+        if volume * current_price >= MIN_ORDER_NOTIONAL_KRW:
+            if LIVE_TRADING:
+                await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+                    "market": market, "side": "ask", "volume": str(volume), "ord_type": "market"
+                })
+            await register_loss_cut(sm.user_no, market, volume, current_price, pnl)
+            sm.set_cooldown(market, is_tp=False)
+            if is_grid:
+                await sm.save_grid_position(None)
+            else:
+                await sm.remove_trend_position(market)
+            print(f"[RESCUE-LOSS-CUT] {market} rescue reference 하락으로 전량 청산")
+    return True
+
+
 async def fetch_current_prices(markets: List[str], access_key: str, secret_key: str) -> Dict[str, Decimal]:
     if not markets: return {}
     try:
@@ -902,44 +1070,20 @@ async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeSt
 
     pnl = ((cur_p - avg_p) / avg_p) * Decimal("100")
 
-    db_setup = budget_state["db_setup"]
-    stop_rate = db_setup["lcRate"] if db_setup else FAILSAFE_GRID_STOP_PCT
-    if ENABLE_STOP and pnl <= stop_rate:
-        print(f"🚨 [GRID-STOP-CHECK] {mkt} 손절조건 ({pnl:.2f}% <= {stop_rate}%)")
-        averaging_attempted = state_flag(sm.grid_position, "averaging_attempted")
-        rebound = await fetch_rebound_signal(mkt) if db_setup and not averaging_attempted else False
-        if averaging_attempted:
-            print(f"[GRID-STOP] {mkt} 물타기 완료 후에도 손절선 이탈 상태, 추가매수 없이 손절합니다.")
-        elif rebound is True:
-            invested = await place_capped_buy(
-                access_key, secret_key, mkt, "averaging",
-                budget_state["per_market_limits"]["averaging"],
-                budget_state, sm.grid_position)
-            if invested > 0:
-                sm.grid_position["averaging_attempted"] = True
-                await sm.save_grid_position(sm.grid_position)
-                print(f"[AVERAGE] {mkt} 반등 조건 확인, 물타기 1회 {invested:,.0f}원")
-                return
-            print(f"[AVERAGE][CAP] {mkt} 물타기 예산/예비금 한도로 추가매수 불가, 손절 진행")
-        elif not averaging_attempted and rebound is None:
-            print(f"[GRID-STOP] {mkt} 반등 데이터를 확인할 수 없어 안전하게 손절합니다.")
-        elif not averaging_attempted:
-            print(f"[GRID-STOP] {mkt} 반등 조건 미충족, 손절합니다.")
-        await cancel_all_orders(access_key, secret_key, mkt)
-        await asyncio.sleep(0.4)
-        accs = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
-        target_a = next((a for a in accs if a.get("currency") == base), None)
-        if target_a:
-            s_vol = quantize_volume(Decimal(str(target_a.get("balance", "0"))))
-            if s_vol * cur_p >= MIN_ORDER_NOTIONAL_KRW:
-                if LIVE_TRADING:
-                    await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                        "market": mkt, "side": "ask", "volume": str(s_vol), "ord_type": "market"
-                    })
-                await register_loss_cut(sm.user_no, mkt, s_vol, cur_p, pnl)
-        sm.set_cooldown(mkt, is_tp=False)
-        await sm.save_grid_position(None)
+    grid_state = sm.grid_position
+    if state_flag(grid_state, "is_rescued"):
+        await handle_rescue_stop(
+            access_key, secret_key, sm, mkt, grid_state, cur_p, pnl, is_grid=True
+        )
         return
+    if ENABLE_STOP and budget_state.get("btc_status") != "EMERGENCY":
+        rescue_used = await process_rescue_buy(
+            access_key, secret_key, sm, mkt, grid_state, True,
+            bal + locked, avg_p, cur_p, pnl, budget_state["krw_available"]
+        )
+        if rescue_used > 0 or state_flag(grid_state, "is_rescued"):
+            budget_state["krw_available"] -= rescue_used
+            return
 
     if bal * cur_p >= MIN_ORDER_NOTIONAL_KRW and not sm.grid_position.get("last_tp_uuid"):
         target_tp_p = adjust_price_to_tick(avg_p * (Decimal("1") + (GRID_TARGET_TP_PCT / Decimal("100"))), side="ask")
@@ -1029,6 +1173,7 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 total_equity, krw_available, state_manager, accounts,
                 db_setup if valuation_complete else None)
             budget["allow_breakout"] = btc_status == "NORMAL"
+            budget["btc_status"] = btc_status
 
             for market, account in accounts_by_market.items():
                 if state_manager.grid_position and state_manager.grid_position.get("market") == market:
@@ -1037,7 +1182,7 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                 total_volume = available_volume + Decimal(str(account.get("locked", "0")))
                 average_price = Decimal(str(account.get("avg_buy_price", "0")))
                 current_price = price_map.get(market, Decimal("0"))
-                if current_price <= 0 or available_volume * current_price < MIN_ORDER_NOTIONAL_KRW:
+                if current_price <= 0 or total_volume * current_price < MIN_ORDER_NOTIONAL_KRW:
                     continue
                 state = state_manager.trend_positions.setdefault(market, {
                     "avg_price": average_price,
@@ -1047,6 +1192,10 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                     "breakout_attempted": False,
                     "realloc_ts": 0.0,
                 })
+                position_pnl = (current_price - average_price) / average_price * Decimal("100") if average_price > 0 else Decimal("0")
+                if state_flag(state, "is_rescued") or (
+                        ENABLE_STOP and RESCUE_MAX_DROP < position_pnl <= RESCUE_MIN_DROP):
+                    continue
                 if now - float(state.get("realloc_ts", "0")) >= 10:
                     state["realloc_ts"] = now
                     asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, market))
@@ -1078,49 +1227,22 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                     "GET", "https://api.upbit.com/v1/ticker", access_key, secret_key, {"markets": market})
                 current_price = Decimal(str(ticker[0]["trade_price"]))
                 pnl = (current_price - average_price) / average_price * Decimal("100")
-                stop_rate = db_setup["lcRate"] if db_setup else FAILSAFE_TREND_STOP_PCT
-
-                if ENABLE_STOP and pnl <= stop_rate:
-                    print(f"[TREND-STOP-CHECK] {market} 손익={pnl:.2f}% 기준={stop_rate}%")
-                    averaging_attempted = state_flag(state, "averaging_attempted")
-                    rebound = await fetch_rebound_signal(market) if db_setup and not averaging_attempted else False
-                    if averaging_attempted:
-                        print(f"[STOP] {market} 물타기 완료 후에도 손절선 이탈, 추가매수 없이 손절합니다.")
-                    elif db_setup is not None and rebound is True:
-                        amount = await place_capped_buy(
-                            access_key, secret_key, market, "averaging",
-                            budget["per_market_limits"]["averaging"], budget, state)
-                        if amount > 0:
-                            state["averaging_attempted"] = True
-                            await state_manager.save_trend_position(market, state)
-                            print(f"[AVERAGE] {market} 반등 확인, 1회 물타기 {amount:,.0f}원")
-                            continue
-                        print(f"[AVERAGE][CAP] {market} 예산/예비금 한도로 물타기 불가")
-                    elif not averaging_attempted and rebound is None:
-                        print(f"[STOP] {market} 반등 데이터 확인 실패, 위험 한도에 따라 손절")
-                    elif not averaging_attempted:
-                        print(f"[STOP] {market} 반등 확인 실패, 손절")
-
-                    await cancel_all_orders(access_key, secret_key, market)
-                    await asyncio.sleep(0.4)
-                    refreshed = await upbit_api(
-                        "GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
-                    current_account = next(
-                        (item for item in refreshed if item.get("currency") == market.split("-")[1]), None)
-                    if current_account:
-                        sell_volume = quantize_volume(Decimal(str(current_account.get("balance", "0"))))
-                        if sell_volume * current_price >= MIN_ORDER_NOTIONAL_KRW:
-                            if LIVE_TRADING:
-                                await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                                    "market": market,
-                                    "side": "ask",
-                                    "volume": str(sell_volume),
-                                    "ord_type": "market",
-                                })
-                            await register_loss_cut(user_no, market, sell_volume, current_price, pnl)
-                    state_manager.set_cooldown(market, is_tp=False)
-                    await state_manager.remove_trend_position(market)
+                if state_flag(state, "is_rescued"):
+                    await handle_rescue_stop(
+                        access_key, secret_key, state_manager, market, state,
+                        current_price, pnl, is_grid=False
+                    )
                     continue
+                if ENABLE_STOP and btc_status != "EMERGENCY":
+                    rescue_used = await process_rescue_buy(
+                        access_key, secret_key, state_manager, market, state, False,
+                        Decimal(str(account.get("balance", "0"))) +
+                        Decimal(str(account.get("locked", "0"))),
+                        average_price, current_price, pnl, budget["krw_available"]
+                    )
+                    if rescue_used > 0 or state_flag(state, "is_rescued"):
+                        budget["krw_available"] -= rescue_used
+                        continue
 
                 if (db_setup and btc_status == "NORMAL" and pnl > 0
                         and not state_flag(state, "breakout_attempted")

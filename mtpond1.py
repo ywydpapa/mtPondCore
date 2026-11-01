@@ -10,7 +10,7 @@ import urllib.parse
 import time
 import math
 import json
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 import dotenv
 import httpx
@@ -97,22 +97,7 @@ HARD_TP2_OFFSET = _decimal_env("HARD_TP2_OFFSET", "0.5")
 HARD_TP2_BASE = HARD_TP + HARD_TP2_OFFSET
 TRAIL_DROP = Decimal("0.15")
 TRAIL_START_PNL = Decimal("0.45")
-ENABLE_STOP_TRAIL = os.getenv("ENABLE_STOP_TRAIL", "1") == "1"
-STOP_SELL_PORTION = _decimal_env("STOP_SELL_PORTION", "0.10")
-STOP_MAX_SELLS = int(os.getenv("STOP_MAX_SELLS", "6"))
-STOP_DISABLE_NEW_BUYS = os.getenv("STOP_DISABLE_NEW_BUYS", "1") == "1"
-STOP_REBOUND_COOLDOWN_SEC = int(os.getenv("STOP_REBOUND_COOLDOWN_SEC", "30"))
-STOP_COOLDOWN_BATCH_SELL = os.getenv("STOP_COOLDOWN_BATCH_SELL", "1") == "1"
-STOP_COOLDOWN_MAX_BATCH = int(os.getenv("STOP_COOLDOWN_MAX_BATCH", "5"))
-STOP_RECOVERY_REQUIRE_COOLDOWN = os.getenv("STOP_RECOVERY_REQUIRE_COOLDOWN", "1") == "1"
-STOP_RECOVERY_LOG = os.getenv("STOP_RECOVERY_LOG", "1") == "1"
-STOP_SIMPLE_MODE = os.getenv("STOP_SIMPLE_MODE", "1") == "1"
-# 새 1회성 손절
-ENABLE_NEW_STOP = os.getenv("ENABLE_NEW_STOP", "1") == "1"
-STOP_LOSS_FIRST_PORTION = _decimal_env("STOP_LOSS_FIRST_PORTION", "0.5")
-STOP_LOSS_MIN_REMAIN_KRW = _decimal_env("STOP_LOSS_MIN_REMAIN_KRW", "5000")
-STOP_SECOND_EXIT_EXTRA_PNL = _decimal_env("STOP_SECOND_EXIT_EXTRA_PNL", "0.3")
-USE_LIMIT_SELL_ON_TRAIL = os.getenv("USE_LIMIT_SELL_ON_TRAIL", "1") == "1"
+# 지정가 청산 설정
 LIMIT_SELL_REPRICE_INTERVAL_SEC = int(os.getenv("LIMIT_SELL_REPRICE_INTERVAL_SEC", "5"))
 LIMIT_SELL_UNFILLED_TIMEOUT_SEC = int(os.getenv("LIMIT_SELL_UNFILLED_TIMEOUT_SEC", "25"))
 LIMIT_SELL_FALLBACK_TO_MARKET = os.getenv("LIMIT_SELL_FALLBACK_TO_MARKET", "1") == "1"
@@ -162,6 +147,9 @@ NORMALIZE_MARGIN_PERCENT = os.getenv("NORMALIZE_MARGIN_PERCENT", "0") == "1"
 MARGIN_PERCENT_DIVISOR = _decimal_env("MARGIN_PERCENT_DIVISOR", "1")
 ALLOW_ADDITIONAL_BUY_WHEN_FULL = os.getenv("ALLOW_ADDITIONAL_BUY_WHEN_FULL","1")=="1"
 MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS","5"))
+RESCUE_MIN_DROP = Decimal("-8.0")
+RESCUE_MAX_DROP = Decimal("-22.0")
+MAX_CONCURRENT_RESCUE = 1
 # Avg Down
 AVG_DOWN_TP_ARM_PNL = _decimal_env("AVG_DOWN_TP_ARM_PNL", "0.20")
 AVG_DOWN_TP_HARD_PNL = _decimal_env("AVG_DOWN_TP_HARD_PNL", "0.40")
@@ -226,22 +214,12 @@ DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
 # 5. RUNTIME CONFIG
 # ============================================================
 # ==============================
-# Config 초기화 및 동적 적용 블록(교체본)
-# - 마틴/손절 플래그 불리언 정규화
+# Config 초기화 및 동적 적용 블록
+# - 마틴/구출 실패 손절 플래그 불리언 정규화
 # - cfg 미제공 시 .env fallback
-# - 손절 개시 플래그/자동 실행 분리
-# - 손절 누적 한도(LOSS_CUT_MAX_TOTAL_LOSS_KRW) 도입
 # ==============================
 
-# 전역 런타임 한도(손절 누적액 관리용)
-LOSS_CUT_REALIZED_TOTAL_KRW = Decimal("0")   # 실행부에서 누적 갱신 필요
-LOSS_CUT_MAX_TOTAL_LOSS_KRW = _decimal_env("LOSS_CUT_MAX_TOTAL_LOSS_KRW", "0")  # 0이면 무제한
-
-# 손절 모드/자동 실행 별도 플래그(설정화)
-STOP_MODE_ENABLED = (os.getenv("STOP_MODE_ENABLED", "1").upper() in ("1","Y","TRUE"))     # 손절 기능 자체 ON/OFF
-STOP_AUTO_EXECUTE = (os.getenv("STOP_AUTO_EXECUTE", "1").upper() in ("1","Y","TRUE"))     # 손절 모드 진입 시 자동 매도 허용
-
-# 마틴/손절 전역 플래그(기존 호환)
+# 마틴 및 구출 실패 손절 플래그
 ENABLE_MARTIN = (os.getenv("ENABLE_MARTIN", "0").upper() in ("1","Y","TRUE"))
 ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1","Y","TRUE"))
 
@@ -254,11 +232,8 @@ def init_config(force: bool = False):
     # 전역 선언
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, INTERSECTION_BUY_KRW
     global MAX_TOTAL_INVEST_PER_MARKET, BUY_RANGE_LOW, BUY_RANGE_HIGH
-    global STOP_TRIGGER_PNL, STOP_PEAK_INCREMENT, LOSS_CUT_RATE
     global ADDITIONAL_BUY_KRW, USE_TICK_RATE, TICK_RATE
     global ENABLE_MARTIN, ENABLE_STOP
-    global STOP_MODE_ENABLED, STOP_AUTO_EXECUTE
-    global LOSS_CUT_MAX_TOTAL_LOSS_KRW, LOSS_CUT_REALIZED_TOTAL_KRW
 
     # 불리언/데시멀 안전 초기화
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", "10"))
@@ -268,27 +243,13 @@ def init_config(force: bool = False):
     BUY_RANGE_LOW = _decimal_env("BUY_RANGE_LOW", "-2.2")
     BUY_RANGE_HIGH = _decimal_env("BUY_RANGE_HIGH", "0.45")
 
-    # 손절 트리거/증분/강제 손절 레이트
-    STOP_TRIGGER_PNL = _decimal_env("STOP_TRIGGER_PNL", "-1.2")
-    LOSS_CUT_RATE = _decimal_env("LOSS_CUT_RATE", "-3.0")
-    STOP_PEAK_INCREMENT = _decimal_env("STOP_PEAK_INCREMENT", "0.1")
-
     ADDITIONAL_BUY_KRW = Decimal("0")
     USE_TICK_RATE = False
     TICK_RATE = Decimal("0")
 
-    # 손절 누적 한도 및 플래그 재정규화
-    try:
-        LOSS_CUT_MAX_TOTAL_LOSS_KRW = _decimal_env("LOSS_CUT_MAX_TOTAL_LOSS_KRW", "0")
-    except Exception:
-        LOSS_CUT_MAX_TOTAL_LOSS_KRW = Decimal("0")
-    LOSS_CUT_REALIZED_TOTAL_KRW = Decimal("0")
-
-    # 불리언 플래그 재정규화(안전)
+    # 불리언 플래그 재정규화
     ENABLE_MARTIN = (str(os.getenv("ENABLE_MARTIN", "0")).upper() in ("1","Y","TRUE"))
     ENABLE_STOP = (str(os.getenv("ENABLE_STOP", "1")).upper() in ("1","Y","TRUE"))
-    STOP_MODE_ENABLED = (str(os.getenv("STOP_MODE_ENABLED", "1")).upper() in ("1","Y","TRUE"))
-    STOP_AUTO_EXECUTE = (str(os.getenv("STOP_AUTO_EXECUTE", "1")).upper() in ("1","Y","TRUE"))
 
     _CONFIG_INITIALIZED = True
     print("[INIT] Runtime config 초기화 완료")
@@ -298,21 +259,15 @@ def apply_dynamic_config(cfg: dict):
     required_globals = [
         "MAX_ACTIVE_MARKETS","RANGE_BUY_KRW","INTERSECTION_BUY_KRW",
         "MAX_TOTAL_INVEST_PER_MARKET","BUY_RANGE_LOW","BUY_RANGE_HIGH",
-        "STOP_TRIGGER_PNL","STOP_PEAK_INCREMENT","ADDITIONAL_BUY_KRW",
-        "USE_TICK_RATE","TICK_RATE","LOSS_CUT_RATE",
-        "STOP_MODE_ENABLED","STOP_AUTO_EXECUTE",
-        "LOSS_CUT_MAX_TOTAL_LOSS_KRW"
+        "ADDITIONAL_BUY_KRW","USE_TICK_RATE","TICK_RATE"
     ]
     miss = [k for k in required_globals if k not in globals()]
 
     # 전역 플래그
     global ENABLE_MARTIN, ENABLE_STOP
-    global STOP_MODE_ENABLED, STOP_AUTO_EXECUTE
     global MAX_ACTIVE_MARKETS, RANGE_BUY_KRW, INTERSECTION_BUY_KRW
     global MAX_TOTAL_INVEST_PER_MARKET, BUY_RANGE_LOW, BUY_RANGE_HIGH
-    global STOP_TRIGGER_PNL, STOP_PEAK_INCREMENT, ADDITIONAL_BUY_KRW
-    global USE_TICK_RATE, TICK_RATE, LOSS_CUT_RATE
-    global LOSS_CUT_MAX_TOTAL_LOSS_KRW
+    global ADDITIONAL_BUY_KRW, USE_TICK_RATE, TICK_RATE
 
     changes = []
 
@@ -331,28 +286,17 @@ def apply_dynamic_config(cfg: dict):
         except Exception:
             print(f"[CFG] {name} 변환 실패 value={v}")
 
-    # 1) 마틴/손절 플래그 우선 적용
+    # 1) 마틴 및 구출 실패 손절 플래그 우선 적용
     flag_martin = _bool_from_cfg(cfg, "martinYN", "ENABLE_MARTIN", "0")
     if flag_martin != ENABLE_MARTIN:
         changes.append(f"ENABLE_MARTIN {ENABLE_MARTIN} -> {flag_martin}")
         ENABLE_MARTIN = flag_martin
 
-    # stopYN은 기존 ENABLE_STOP과 의미 겹침: 유지하되, 손절 개시/자동 실행은 별도 키로 제어
+    # stopYN은 구출 실패 손절 활성화에만 사용합니다.
     flag_stop = _bool_from_cfg(cfg, "stopYN", "ENABLE_STOP", "1")
     if flag_stop != ENABLE_STOP:
         changes.append(f"ENABLE_STOP {ENABLE_STOP} -> {flag_stop}")
         ENABLE_STOP = flag_stop
-
-    # 손절 개시(모드 자체)와 자동 실행을 설정에서 분리 제어
-    flag_stop_mode = _bool_from_cfg(cfg, "stopModeYN", "STOP_MODE_ENABLED", "1")
-    if flag_stop_mode != STOP_MODE_ENABLED:
-        changes.append(f"STOP_MODE_ENABLED {STOP_MODE_ENABLED} -> {flag_stop_mode}")
-        STOP_MODE_ENABLED = flag_stop_mode
-
-    flag_stop_auto = _bool_from_cfg(cfg, "stopAutoYN", "STOP_AUTO_EXECUTE", "1")
-    if flag_stop_auto != STOP_AUTO_EXECUTE:
-        changes.append(f"STOP_AUTO_EXECUTE {STOP_AUTO_EXECUTE} -> {flag_stop_auto}")
-        STOP_AUTO_EXECUTE = flag_stop_auto
 
     # 전역 미초기화면 안내 후 반환
     if miss:
@@ -411,27 +355,6 @@ def apply_dynamic_config(cfg: dict):
                     changes.append(f"BUY_RANGE_HIGH {BUY_RANGE_HIGH} -> {v}")
                     BUY_RANGE_HIGH = v
 
-        if "lcRate" in cfg:
-            val = to_decimal_safe(cfg.get("lcRate"), "lcRate")
-            if val is not None:
-                mn, mx = Decimal("-15"), Decimal("-0.1")
-                if mn <= val <= mx:
-                    if val != LOSS_CUT_RATE:
-                        changes.append(f"LOSS_CUT_RATE {LOSS_CUT_RATE} -> {val}")
-                        LOSS_CUT_RATE = val
-                else:
-                    print(f"[CFG] lcRate 범위초과 {val} (허용 {mn} ~ {mx})")
-
-        if "lcGap" in cfg:
-            g = to_decimal_safe(cfg.get("lcGap"), "lcGap")
-            if g is not None:
-                if g < 0:
-                    print(f"[CFG] lcGap 음수 {g} -> abs 처리")
-                    g = abs(g)
-                if g != STOP_PEAK_INCREMENT:
-                    changes.append(f"STOP_PEAK_INCREMENT {STOP_PEAK_INCREMENT} -> {g}")
-                    STOP_PEAK_INCREMENT = g
-
         if "tickRate" in cfg:
             t = to_decimal_safe(cfg.get("tickRate"), "tickRate")
             if t and t > 0 and t != TICK_RATE:
@@ -443,13 +366,6 @@ def apply_dynamic_config(cfg: dict):
             if flag != USE_TICK_RATE:
                 changes.append(f"USE_TICK_RATE {USE_TICK_RATE} -> {flag}")
                 USE_TICK_RATE = flag
-
-        # 손절 누적 한도 동적 설정
-        if "lcCapAmt" in cfg:
-            cap = to_decimal_safe(cfg.get("lcCapAmt"), "lcCapAmt")
-            if cap is not None and cap >= 0 and cap != LOSS_CUT_MAX_TOTAL_LOSS_KRW:
-                changes.append(f"LOSS_CUT_MAX_TOTAL_LOSS_KRW {LOSS_CUT_MAX_TOTAL_LOSS_KRW} -> {cap}")
-                LOSS_CUT_MAX_TOTAL_LOSS_KRW = cap
 
     except Exception as e:
         print(f"[CFG] 적용 예외: {e}")
@@ -1092,6 +1008,10 @@ class PositionState:
         now = time.time()
         st = self.data.get(market)
         if st is None or st.get("avg_buy_price") != avg_price:
+            rescue_state = {
+                key: st[key] for key in ("is_rescued", "rescue_buy_price")
+                if st and key in st
+            }
             self.data[market] = {
                 "peak_pnl": pnl,
                 "min_pnl": pnl,
@@ -1146,7 +1066,10 @@ class PositionState:
                 "stop_mode_active": False,
                 "martingale_count": 0,
                 "last_martin_ts": None,
+                "is_rescued": False,
+                "rescue_buy_price": None,
             }
+            self.data[market].update(rescue_state)
             return self.data[market]
         if pnl > st["peak_pnl"]:
             st["peak_pnl"] = pnl
@@ -1249,8 +1172,8 @@ class PositionState:
         st = self.data.get(market) or {}
         if st.get("over_cap_flag"):
             return False, f"[SKIP] {market} per-market cap reached (flag)"
-        if STOP_DISABLE_NEW_BUYS and st and st.get("stop_triggered"):
-            return False, f"[SKIP] {market} 손절모드(추가매수금지)"
+        if st.get("is_rescued"):
+            return False, f"[SKIP] {market} 구출 관리 중 추가 매수 금지"
 
         total_buys, total_inv = self.get_buy_stats(market)
 
@@ -1657,7 +1580,8 @@ async def place_limit_tp_order(access_key: str, secret_key: str, market: str, vo
 async def manage_full_limit_sells(access_key: str, secret_key: str,
                                   raw_accounts: List[Dict[str, Any]],
                                   price_map: Dict[str, Decimal],
-                                  ps: "PositionState"):
+                                  ps: "PositionState",
+                                  skip_markets: Optional[Set[str]] = None):
     now = time.time()
     for acc in raw_accounts:
         currency = acc.get("currency")
@@ -1672,14 +1596,18 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
         except:
             continue
 
+        market = f"{BASE_UNIT}-{currency}"
         total_qty = bal + locked
         if total_qty <= 0:
+            state = ps.data.get(market)
+            if state and state.get("is_rescued"):
+                ps.mark_sold(market)
             continue
 
-        market = f"{BASE_UNIT}-{currency}"
-
         # 제외 코인 필터링 추가
-        if EXCLUDED_MARKETS and market in EXCLUDED_MARKETS:
+        if (EXCLUDED_MARKETS and market in EXCLUDED_MARKETS) or ps.recently_sold(market):
+            continue
+        if skip_markets and market in skip_markets:
             continue
 
         cur_price = price_map.get(market)
@@ -1689,7 +1617,12 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
         if notional < FULL_LIMIT_SELL_MIN_NOTIONAL:
             continue
 
-        if FULL_LIMIT_SELL_MODE == "percent":
+        st = ps.data.setdefault(market, {})
+        if st.get("is_rescued"):
+            if avg_price <= 0:
+                continue
+            target_price = avg_price * Decimal("1.003")
+        elif FULL_LIMIT_SELL_MODE == "percent":
             base_p = avg_price if (FULL_LIMIT_SELL_PRICE_BASIS == "avg" and avg_price > 0) else cur_price
             target_price = base_p * (Decimal("1") + FULL_LIMIT_SELL_PERCENT / Decimal("100"))
         elif FULL_LIMIT_SELL_MODE == "fixed":
@@ -1698,9 +1631,7 @@ async def manage_full_limit_sells(access_key: str, secret_key: str,
             target_price = FULL_LIMIT_SELL_FIXED_PRICE
         else:
             continue
-
         adj_price = adjust_price_to_tick(target_price, side="ask")
-        st = ps.data.setdefault(market, {})
 
         fl_uuid = st.get("full_limit_uuid")
         fl_ts = st.get("full_limit_ts")
@@ -2362,19 +2293,212 @@ async def process_intersection_buys(
     return used_total
 
 
+async def check_rescue_rebound_signal(market: str) -> bool:
+    try:
+        candles = await fetch_minute_candles(market, unit=15, count=10)
+        if len(candles) < 5:
+            return False
+
+        current, previous = candles[-1], candles[-2]
+        current_price = Decimal(str(current["trade_price"]))
+        return (
+            current_price > Decimal(str(current["opening_price"]))
+            and (
+                Decimal(str(current["low_price"])) >= Decimal(str(previous["low_price"]))
+                or current_price >= Decimal(str(previous["trade_price"]))
+            )
+        )
+    except Exception as e:
+        print(f"[RESCUE-CHECK][ERR] {market} 반등 검증 실패: {e}")
+        return False
+
+
+async def process_rescue_operations(
+    access_key: str,
+    secret_key: str,
+    enriched_positions: List[dict],
+    ps: PositionState,
+    available_krw: Decimal,
+) -> Decimal:
+    if not ENABLE_STOP or available_krw < MIN_ORDER_NOTIONAL_KRW:
+        return Decimal("0")
+    if sum(st.get("is_rescued", False) for st in ps.data.values()) >= MAX_CONCURRENT_RESCUE:
+        return Decimal("0")
+
+    candidates = []
+    for pos in enriched_positions:
+        market = pos.get("market")
+        pnl = pos.get("pnl_percent")
+        state = ps.data.get(market, {})
+        if not market or pnl is None or state.get("is_rescued") or pnl <= RESCUE_MAX_DROP:
+            continue
+        total_buys, _ = ps.get_buy_stats(market)
+        if total_buys - 1 >= MAX_ADDITIONAL_BUYS or pnl <= RESCUE_MIN_DROP:
+            candidates.append(pos)
+
+    candidates.sort(key=lambda pos: pos["pnl_percent"])
+    for pos in candidates:
+        market = pos["market"]
+        if not await check_rescue_rebound_signal(market):
+            continue
+
+        balance = pos.get("balance", Decimal("0")) + pos.get("locked", Decimal("0"))
+        avg_price = pos.get("avg_buy_price")
+        if balance <= 0 or avg_price is None or avg_price <= 0:
+            continue
+        try:
+            _, buy_price = await get_orderbook_top(market)
+            target_avg = avg_price / Decimal("1.003")
+            if buy_price <= 0 or buy_price >= target_avg or avg_price <= target_avg:
+                print(f"[RESCUE-SKIP] {market} 목표 탈출가 기준 매수액 계산 불가")
+                continue
+            required_krw = (
+                balance * (avg_price - target_avg)
+                / (target_avg / buy_price - Decimal("1"))
+            ).to_integral_value(rounding=ROUND_CEILING)
+            buy_amount = min(required_krw, available_krw).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        except Exception as e:
+            print(f"[RESCUE][ERR] {market} 필요 매수액 계산 실패: {e}")
+            continue
+        if buy_amount < MIN_ORDER_NOTIONAL_KRW:
+            print(f"[RESCUE-SKIP] {market} 필요금액/가용 KRW가 최소주문액 미만")
+            continue
+
+        try:
+            if LIVE_TRADING:
+                response = await order_market_buy_price(
+                    access_key, secret_key, market, buy_amount
+                )
+                print(
+                    f"[RESCUE-BUY] {market} 매수 {buy_amount}원 "
+                    f"(uuid={response.get('uuid')})"
+                )
+            else:
+                print(f"[RESCUE-BUY][DRY] {market} 매수 {buy_amount}원")
+        except Exception as e:
+            print(f"[RESCUE][ERR] {market} 구출 매수 실패: {e}")
+            continue
+
+        ps.record_buy(market, buy_amount)
+        state = ps.update_or_init(
+            market, pos["pnl_percent"], avg_price
+        )
+        state["is_rescued"] = True
+        state["rescue_buy_price"] = buy_price
+        state["stop_mode_active"] = False
+
+        try:
+            await asyncio.sleep(0.8)
+            if not await cancel_all_open_orders_for_market(access_key, secret_key, market):
+                raise RuntimeError(f"{market} 기존 주문 취소가 완료되지 않았습니다.")
+            for key in (
+                "active_limit_uuid", "limit_submit_ts", "limit_pending_category",
+                "limit_pending_volume", "pre_tp_uuid", "full_limit_uuid",
+                "passive_limit_uuid",
+            ):
+                state.pop(key, None)
+
+            if not FULL_LIMIT_SELL_ENABLED:
+                accounts = await fetch_upbit_accounts(access_key, secret_key)
+                account = next(
+                    (item for item in accounts if item.get("currency") == market.split("-")[1]),
+                    None,
+                )
+                if account:
+                    held = Decimal(str(account.get("balance", "0")))
+                    new_avg = Decimal(str(account.get("avg_buy_price", "0")))
+                    if held > 0 and new_avg > 0:
+                        _, best_ask = await get_orderbook_top(market)
+                        exit_price = adjust_price_to_tick(
+                            max(new_avg * Decimal("1.003"), best_ask), side="ask"
+                        )
+                        volume = quantize_volume(held)
+                        if volume * exit_price >= MIN_ORDER_NOTIONAL_KRW:
+                            response = await order_limit_sell(
+                                access_key, secret_key, market, volume, exit_price
+                            )
+                            state["active_limit_uuid"] = response.get("uuid")
+                            state["limit_pending_category"] = "RESCUE_TP"
+                            state["limit_pending_volume"] = volume
+                            state["limit_submit_ts"] = time.time()
+                            print(
+                                f"[RESCUE-TP] {market} 탈출 지정가 {exit_price}원 "
+                                f"(평단 {new_avg}원)"
+                            )
+        except Exception as e:
+            print(f"[RESCUE-TP][ERR] {market} 탈출 주문 배치 실패: {e}")
+        return buy_amount
+
+    return Decimal("0")
+
+
+async def process_rescue_failures(
+    access_key: str,
+    secret_key: str,
+    user_no: int,
+    enriched_positions: List[dict],
+    ps: PositionState,
+) -> Set[str]:
+    failed_markets = set()
+    if not ENABLE_STOP:
+        return failed_markets
+
+    for position in enriched_positions:
+        market = position.get("market")
+        pnl = position.get("pnl_percent")
+        avg = position.get("avg_buy_price")
+        cur_price = position.get("current_price")
+        if not market or pnl is None or avg is None or cur_price is None:
+            continue
+
+        state = ps.update_or_init(market, pnl, avg)
+        rescue_price = state.get("rescue_buy_price")
+        if not state.get("is_rescued") or not rescue_price:
+            continue
+        if cur_price > rescue_price * Decimal("0.975"):
+            continue
+
+        failed_markets.add(market)
+        rescue_pnl = (cur_price - rescue_price) / rescue_price * Decimal("100")
+        print(
+            f"[RESCUE-FAIL] {market} 구출 후 반등 실패 "
+            f"(구출가 대비 {rescue_pnl:.2f}%)"
+        )
+        if not await cancel_all_open_orders_for_market(access_key, secret_key, market):
+            print(f"[RESCUE-FAIL][WARN] {market} 기존 주문 미취소로 청산 보류")
+            continue
+
+        await asyncio.sleep(0.3)
+        accounts = await fetch_upbit_accounts(access_key, secret_key)
+        account = next(
+            (item for item in accounts if item.get("currency") == market.split("-")[1]),
+            None,
+        )
+        balance = Decimal(str(account.get("balance", "0"))) if account else Decimal("0")
+        sell_volume = quantize_volume(balance)
+        if sell_volume * cur_price >= MIN_ORDER_NOTIONAL_KRW:
+            if LIVE_TRADING:
+                await order_market_sell(access_key, secret_key, market, sell_volume)
+            await register_loss_cut(user_no, market, sell_volume, cur_price, pnl)
+            ps.mark_sold(market)
+        elif account is None or (
+            balance + Decimal(str(account.get("locked", "0"))) <= 0
+        ):
+            ps.mark_sold(market)
+        else:
+            print(f"[RESCUE-FAIL][SKIP] {market} 잔고가 최소 주문금액 미만입니다.")
+
+    return failed_markets
+
 
 # ============================================================
 # 24. 메인 모니터 루프 (마틴 제한 적용 완성본)
 # ============================================================
 async def monitor_positions(user_no: int, server_no: int):
     start_ts = time.time()  # 주기 리셋 기준 시각
-    print(f"[INFO] ENABLE_MARTIN={ENABLE_MARTIN} ENABLE_STOP={ENABLE_STOP}")
-    if not ENABLE_MARTIN:
-        # 마틴 비활성화 시 설명 메시지
-        print(f"[INFO] 마틴 비활성화: 일반 매수만 수행, 누적 투자금은 MAX_TOTAL_INVEST_PER_MARKET({MAX_TOTAL_INVEST_PER_MARKET})까지만 허용")
-    if not ENABLE_STOP:
-        # 자동 손절 비활성화 시 설명 메시지
-        print("[INFO] 자동 손절 비활성화: STOP/Loss-Cut 로직 전부 미작동")
+    print(f"[INFO] ENABLE_STOP={ENABLE_STOP} (구출/탈출 손절 전용)")
 
     # 사용자 API 키 로드
     keys = await get_keys(user_no, server_no)
@@ -2407,14 +2531,10 @@ async def monitor_positions(user_no: int, server_no: int):
 
     # FULL_LIMIT_SELL 모드일 경우 나머지 로직들이 비활성화됨을 안내
     if FULL_LIMIT_SELL_ENABLED:
-        print("[INFO] FULL_LIMIT_SELL_ENABLED=1 → 기존 TP/Trail/Stop 로직 비활성, 단일 전체 지정가 유지 모드")
+        print("[INFO] FULL_LIMIT_SELL_ENABLED=1 → 일반 TP/Trail 비활성, 구출/탈출 손절은 유지")
         print(f"[INFO] MODE={FULL_LIMIT_SELL_MODE} BASIS={FULL_LIMIT_SELL_PRICE_BASIS} PCT={FULL_LIMIT_SELL_PERCENT} FIXED={FULL_LIMIT_SELL_FIXED_PRICE}")
     else:
         # 손절/트레일/선지정 TP 옵션 로그
-        if ENABLE_NEW_STOP:
-            print(f"[INFO] NEW_STOP 활성화 trigger={STOP_TRIGGER_PNL}% first_portion={STOP_LOSS_FIRST_PORTION*100:.1f}% minRemain={STOP_LOSS_MIN_REMAIN_KRW}")
-        elif ENABLE_STOP_TRAIL:
-            print(f"[INFO] (LEGACY STOP) trigger={STOP_TRIGGER_PNL}% simple={STOP_SIMPLE_MODE}")
         print(f"[INFO] MAX_ACTIVE_MARKETS={MAX_ACTIVE_MARKETS} ALLOW_ADDITIONAL_BUY_WHEN_FULL={ALLOW_ADDITIONAL_BUY_WHEN_FULL}")
         print(f"[INFO] PREPLACE_HARD_TP={PREPLACE_HARD_TP} PREPLACE_TP_TIMEOUT_SEC={PREPLACE_TP_TIMEOUT_SEC} PREPLACE_ON_START={PREPLACE_ON_START}")
 
@@ -2543,10 +2663,28 @@ async def monitor_positions(user_no: int, server_no: int):
             print(f"[WARN] 가격 조회 실패: {e}")
             price_map = {}
 
-        # 4) FULL LIMIT SELL 모드 전용 처리: 나머지 로직 모두 스킵
+        # 4) 잔고 풍부화와 구출 전용 처리는 전체 지정가 모드에서도 수행
         if FULL_LIMIT_SELL_ENABLED:
+            enriched_all = enrich_accounts_with_prices(raw_accounts, price_map, BASE_UNIT)
+            enriched = [
+                row for row in enriched_all
+                if row.get("current_price") is not None
+                and row.get("market") not in (EXCLUDED_MARKETS or set())
+            ]
             try:
-                await manage_full_limit_sells(access_key, secret_key, raw_accounts, price_map, ps)
+                failed_rescues = await process_rescue_failures(
+                    access_key, secret_key, user_no, enriched, ps
+                )
+                available_krw = get_available_krw(raw_accounts)
+                rescue_used = await process_rescue_operations(
+                    access_key, secret_key, enriched, ps, available_krw
+                )
+                if rescue_used > 0:
+                    raw_accounts = await fetch_upbit_accounts(access_key, secret_key)
+                await manage_full_limit_sells(
+                    access_key, secret_key, raw_accounts, price_map, ps,
+                    skip_markets=failed_rescues,
+                )
             except Exception as fle:
                 print(f"[FLS][ERR] 관리루프 예외: {fle}")
             await dynamic_sleep()
@@ -2568,6 +2706,13 @@ async def monitor_positions(user_no: int, server_no: int):
                and r.get("market") not in (EXCLUDED_MARKETS or set())
         ]
         available_krw = get_available_krw(raw_accounts)  # 현재 가용 현금
+        rescue_used = await process_rescue_operations(
+            access_key, secret_key, enriched, ps, available_krw
+        )
+        available_krw -= rescue_used
+        failed_rescues = await process_rescue_failures(
+            access_key, secret_key, user_no, enriched, ps
+        )
 
         # 7) 활성 포지션 셋 계산
         managed_set = set(ps.buy_info.keys())
@@ -2604,6 +2749,9 @@ async def monitor_positions(user_no: int, server_no: int):
             # 상태 업데이트(peak/min/runup/drawdown/armed 등 갱신)
             st = ps.update_or_init(market, pnl, avg)
             ps.ensure_stop_fields(market)  # 마틴/손절용 필드 보장
+            if market in failed_rescues:
+                continue
+
             # 8-a) 이미 제출된 지정가 주문 모니터링(체결/만료/취소)
             if st.get("active_limit_uuid"):
                 uid = st["active_limit_uuid"]
@@ -2660,6 +2808,8 @@ async def monitor_positions(user_no: int, server_no: int):
                                 ps.mark_sold(market)
                         elif cat == "TRAIL":
                             ps.mark_sold(market)
+                        elif cat == "RESCUE_TP":
+                            ps.mark_sold(market)
                         # 지정가 상태 필드 제거
                         for k in ("active_limit_uuid", "limit_submit_ts", "limit_pending_category",
                                   "limit_pending_volume"):
@@ -2707,92 +2857,13 @@ async def monitor_positions(user_no: int, server_no: int):
                     "category": category,"reason": reason,
                     "state_ref": st,"portion": portion
                 })
-        # 9) STOP 모드 토글 및 즉시 손절 큐 생성
-        immediate_sells = []
+        # 일반 손절/손절 모드는 사용하지 않고 구출 전용 손절만 유지합니다.
         for it in enriched:
             market = it.get("market")
-            pnl = it.get("pnl_percent")
-            bal = it.get("balance")
-            cur_price = it.get("current_price")
-            if not market or pnl is None or bal is None or cur_price is None:
+            if not market:
                 continue
             st = ps.data.setdefault(market, {})
-            ps.ensure_stop_fields(market)
-
-            # STOP 기능이 켜진 경우에만 stop_mode_active 토글
-            if ENABLE_STOP:
-                if pnl <= STOP_TRIGGER_PNL:
-                    if not st["stop_mode_active"]:
-                        print(f"[STOP-MODE][ON] {market} pnl={pnl}% <= trigger {STOP_TRIGGER_PNL}%")
-                    st["stop_mode_active"] = True
-                else:
-                    if st["stop_mode_active"]:
-                        print(f"[STOP-MODE][OFF] {market} pnl={pnl}% > trigger {STOP_TRIGGER_PNL}%")
-                    st["stop_mode_active"] = False
-            else:
-                # STOP 전역 OFF인 경우 강제 OFF
-                st["stop_mode_active"] = False
-
-            # 즉시 손절 후보 수집(LOSS_CUT_RATE 이하)도 STOP이 켜진 경우에만 적용
-            if ENABLE_STOP and pnl <= LOSS_CUT_RATE:
-                immediate_sells.append({
-                    "market": market,
-                    "pnl": pnl,
-                    "balance": bal,
-                    "current_price": cur_price
-                })
-        # 10) 즉시 손절 처리: 모든 대기 주문 취소 → 언락 대기 → 시장가 전량
-        if ENABLE_STOP:
-            for item in immediate_sells:
-                mkt = item["market"]
-                st = ps.data.get(mkt) or {}
-
-                # 활성/패시브/전체 지정가/선지정 TP 등 모든 주문 취소 시도
-                for k in ("active_limit_uuid", "passive_limit_uuid", "full_limit_uuid", "pre_tp_uuid"):
-                    uid = st.get(k)
-                    if uid:
-                        try:
-                            await cancel_order(access_key, secret_key, uid)
-                            if k != "pre_tp_uuid":
-                                st[k] = None
-                        except Exception as ce:
-                            print(f"[LOSS-CUT][WARN] cancel {k} {mkt} err={ce}")
-                # 마켓 전체 wait 주문 취소(보수적으로)
-                await cancel_all_open_orders_for_market(access_key, secret_key, mkt, max_rounds=4, sleep_between=0.3)
-                # 언락 대기 후 잔량 재계산
-                bal_now, locked_now = await wait_unlock_and_get_balance(access_key, secret_key, mkt, timeout=2.0,
-                                                                        poll=0.25)
-                vol = safe_calc_volume(bal_now, Decimal("1"))
-                if vol <= 0:
-                    print(f"[LOSS-CUT][SKIP] {mkt} unlocked but no balance (bal={bal_now}, locked={locked_now})")
-                    continue
-                # 최소 주문 금액 체크(오더북 기반)
-                try:
-                    best_bid, _best_ask = await get_orderbook_top(mkt)
-                    notional = vol * best_bid
-                    if notional < MIN_ORDER_NOTIONAL_KRW:
-                        print(
-                            f"[LOSS-CUT][SKIP] {mkt} notional {notional} < MIN_ORDER_NOTIONAL_KRW {MIN_ORDER_NOTIONAL_KRW}")
-                        continue
-                except Exception:
-                    pass
-                # 시장가 전량 매도
-                try:
-                    if not LIVE_TRADING:
-                        print(f"[LOSS-CUT][DRY] {mkt} pnl={item['pnl']}% (<= {LOSS_CUT_RATE}%) → SELL ALL vol={vol}")
-                    else:
-                        resp = await order_market_sell(access_key, secret_key, mkt, vol)
-                        print(f"[LOSS-CUT] {mkt} pnl={item['pnl']}% → SELL ALL uuid={resp.get('uuid')} vol={vol}")
-                    await register_loss_cut(
-                        user_no, mkt, vol, item["current_price"], item["pnl"])
-                    # 손절 후 마틴/스톱 상태 초기화 및 포지션 종료
-                    st["stop_mode_active"] = False
-                    st["martingale_count"] = 0
-                    st["last_martin_ts"] = None
-                    st["last_martin_amount"] = None
-                    ps.mark_sold(mkt)
-                except Exception as e:
-                    print(f"[LOSS-CUT][ERR] {mkt} market sell fail: {e}")
+            st["stop_mode_active"] = False
         # 11) 마틴 추가매수: 오직 여기에서만 실행
         #    - stop_mode_active ON 상태에서만
         #    - MAX_MARTIN 제한, KRW 잔액, 최소 주문 금액, total_invested 기반
@@ -3370,127 +3441,6 @@ async def debug_show_reject_reasons():
         else:
             print(f"[DBG][DROP_SCORE] {m} est_pct={est_pct*100:.3f}% (< {BBTREND_MIN_EXPECTED_PCT*100:.3f}%) mom={mom['est_pct']*100:.2f}% rev={rev['est_pct']*100:.2f}% score={mom['score']}")
     print(f"[DBG] 전체={cnt_total} 유동성통과={cnt_liq_pass} 최종통과={cnt_score_pass}")
-
-# ============================================================
-# 주문 취소후 손절 프로세스 (참고/유틸)
-# ============================================================
-import time as _time_alias
-from decimal import Decimal as _DecAlias, ROUND_DOWN as _RD_ALIAS
-
-def to_amount_precision(exchange, symbol, amount):
-    try:
-        return float(exchange.amount_to_precision(symbol, amount))
-    except Exception:
-        return float(amount)
-
-def cancel_open_limit_orders(exchange, symbol, max_wait_sec=5):
-    open_orders = exchange.fetch_open_orders(symbol)
-    limit_orders = [o for o in open_orders if str(o.get('type', '')).lower().startswith('limit')]
-    for o in limit_orders:
-        try:
-            exchange.cancel_order(o['id'], symbol)
-        except Exception as e:
-            print(f"[{symbol}] cancel_order 실패: {e}")
-    t0 = _time_alias.time()
-    while _time_alias.time() - t0 < max_wait_sec:
-        remain = exchange.fetch_open_orders(symbol)
-        remain_limits = [o for o in remain if str(o.get('type', '')).lower().startswith('limit')]
-        if not remain_limits:
-            return True
-        _time_alias.sleep(0.3)
-    return False
-
-def market_flat_spot(exchange, symbol, min_notional=5.0):
-    market = exchange.market(symbol)
-    base = market['base']
-    bal = exchange.fetch_balance()
-    free_base = bal.get(base, {}).get('free', 0.0) or 0.0
-    if free_base <= 0:
-        return {"status": "NO_BALANCE", "amount": 0}
-    ticker = exchange.fetch_ticker(symbol)
-    price = float(ticker['last'] or ticker['close'])
-    if free_base * price < min_notional:
-        return {"status": "TOO_SMALL", "amount": free_base}
-    amt = to_amount_precision(exchange, symbol, free_base)
-    if amt <= 0:
-        return {"status": "ROUND_TO_ZERO", "amount": free_base}
-    try:
-        order = exchange.create_market_sell_order(symbol, amt)
-        return {"status": "OK", "order": order, "amount": amt}
-    except Exception as e:
-        return {"status": "ERROR", "error": str(e)}
-
-TARGET_STATES = {"PASSIVE", "HOLD-LOCKED"}
-
-def _collect_states(x) -> set:
-    states = set()
-    for key in ("state", "status", "mode"):
-        v = x.get(key)
-        if isinstance(v, str):
-            states.add(v.upper())
-        elif isinstance(v, (list, tuple, set)):
-            states |= {str(s).upper() for s in v}
-    tags = x.get("tags") or x.get("status_tags")
-    if isinstance(tags, str):
-        states.add(tags.upper())
-    elif isinstance(tags, (list, tuple, set)):
-        states |= {str(s).upper() for s in tags}
-    return states
-
-def has_any_state(x, targets=TARGET_STATES) -> bool:
-    return len(_collect_states(x) & set(targets)) > 0
-
-def is_immediate_cut(x, loss_cut_rate) -> bool:
-    try:
-        pnl = float(x.get("pnl", 0))
-    except Exception:
-        return False
-    falling = bool(x.get("falling", False))
-    recommended = bool(x.get("recommended", True))
-    in_locked_states = has_any_state(x, TARGET_STATES)
-    return (pnl <= float(loss_cut_rate)) and ((not recommended) or falling or in_locked_states)
-
-def cancel_open_price_based_orders(exchange, symbol, include_stops=True, max_wait_sec=5):
-    def is_price_based(o):
-        t = str(o.get('type', '')).lower()
-        if t.startswith('limit'):
-            return True
-        if include_stops and ('stop' in t or 'tp' in t or 'take' in t):
-            return True
-        return False
-    open_orders = exchange.fetch_open_orders(symbol)
-    targets = [o for o in open_orders if is_price_based(o)]
-    for o in targets:
-        try:
-            exchange.cancel_order(o['id'], symbol)
-        except Exception as e:
-            print(f"[{symbol}] cancel_order 실패: {e}")
-    t0 = _time_alias.time()
-    while _time_alias.time() - t0 < max_wait_sec:
-        remain = exchange.fetch_open_orders(symbol)
-        remain_targets = [o for o in remain if is_price_based(o)]
-        if not remain_targets:
-            return True
-        _time_alias.sleep(0.3)
-    return False
-
-def process_immediate_sells(exchange, annotated, LOSS_CUT_RATE, mode="spot", min_notional=5.0):
-    immediate_sells = [x for x in annotated if is_immediate_cut(x, LOSS_CUT_RATE)]
-    results = []
-    for row in immediate_sells:
-        symbol = row.get("symbol") or row.get("sym") or row.get("ticker")
-        if not symbol:
-            results.append({"symbol": None, "status": "NO_SYMBOL"})
-            continue
-        cancel_open_price_based_orders(exchange, symbol, include_stops=True, max_wait_sec=7)
-        if mode == "spot":
-            res = market_flat_spot(exchange, symbol, min_notional=min_notional)
-        else:
-            res = {"status": "UNSUPPORTED_MODE"}
-        res["symbol"] = symbol
-        res["states"] = list(_collect_states(row))
-        results.append(res)
-    return results
 
 # ============================================================
 # X. 재시작 초기화: 전체 지정가 매도 취소 후 재배치
