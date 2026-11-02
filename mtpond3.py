@@ -1,3 +1,9 @@
+"""전략 3: 1시간·15분 멀티타임프레임 반등 종목에 진입한다.
+
+진폭과 상단 여유로 동적 익절 목표를 정해 지정가 주문을 배치하고, 구출 후
+반등 실패 시 전량 손절한다.
+"""
+
 # ============================================================
 # 1. Imports
 # ============================================================
@@ -12,19 +18,19 @@ import math
 import json
 from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
-import dotenv
 import httpx
 import jwt
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
+from mtpond_common import (
+    market_buy,
+    quantize_volume,
+    register_loss_cut as _register_loss_cut,
+)
+from mtpond_db import SessionLocal, engine
 
 # ============================================================
-# 2. 환경 로드
+# 2. 환경 설정
 # ============================================================
-dotenv.load_dotenv()
-
-
 def _decimal_env(name: str, default: str) -> Decimal:
     raw_value = os.getenv(name, default)
     try:
@@ -37,10 +43,8 @@ def _decimal_env(name: str, default: str) -> Decimal:
 
 
 # ============================================================
-# 3. DB & 기본 상수
+# 3. 기본 상수
 # ============================================================
-engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
 BASE_UNIT = "KRW"
@@ -384,30 +388,9 @@ async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[st
 
 async def register_loss_cut(
         user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
-    if not API_BASE:
-        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
-        return
-
-    payload = {
-        "userNo": user_no,
-        "coinCode": market,
-        "losscutQty": float(quantity),
-        "losscutPrice": float(price),
-        "currentPrice": float(price),
-        "lossRate": float(loss_rate),
-        "losscutReason": "손절 조건 도달",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
-            response.raise_for_status()
-        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
-    except httpx.HTTPError as e:
-        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
-
-
-def quantize_volume(vol: Decimal) -> Decimal:
-    return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    await _register_loss_cut(
+        API_BASE, user_no, market, quantity, price, loss_rate
+    )
 
 
 # ============================================================
@@ -747,8 +730,10 @@ async def has_minimum_rescue_trade_activity(market: str) -> bool:
 # 11. 주문 실행 도우미
 # ============================================================
 async def order_market_buy_price(access_key: str, secret_key: str, market: str, krw_amount: Decimal):
-    params = {"market": market, "side": "bid", "price": str(krw_amount), "ord_type": "price"}
-    return await upbit_request("POST", UPBIT_ORDER_URL, access_key, secret_key, params=params, max_retry=2)
+    return await market_buy(
+        upbit_request, access_key, secret_key, market, krw_amount,
+        UPBIT_ORDER_URL, max_retry=2,
+    )
 
 
 async def order_market_sell(access_key: str, secret_key: str, market: str, volume: Decimal):

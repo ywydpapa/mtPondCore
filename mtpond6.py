@@ -1,3 +1,9 @@
+"""전략 6: 초기 20%, 물타기 40%, 돌파 10%, 현금 예비금 30%의 예산 버킷을 쓴다.
+
+추세 진입과 횡보 그리드를 함께 운용하고 포지션당 돌파 매수를 제한한다.
+추세·그리드는 지정가 익절, 구출 포지션은 기준가 대비 -2.5%에서 전량 손절한다.
+"""
+
 # ============================================================
 # 1. Imports
 # ============================================================
@@ -12,19 +18,19 @@ import math
 import json
 from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal, ROUND_DOWN, ROUND_FLOOR, ROUND_CEILING
-import dotenv 
 import httpx
 import jwt
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker  # type: ignore[import-not-found]
 from sqlalchemy import text
+from mtpond_common import (
+    market_buy,
+    quantize_volume,
+    register_loss_cut as _register_loss_cut,
+)
+from mtpond_db import SessionLocal, engine
 
 # ============================================================
 # 2. 환경 및 기본 설정
 # ============================================================
-dotenv.load_dotenv()
-
-engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
-SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
 BASE_UNIT = "KRW"
@@ -275,9 +281,7 @@ async def place_capped_buy(access_key: str, secret_key: str, market: str, bucket
           f"remaining={budget['limits'][bucket] - budget['used'][bucket]:,.0f} "
           f"reserve={budget['limits']['reserve']:,.0f}")
     if LIVE_TRADING:
-        await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-            "market": market, "side": "bid", "price": str(amount), "ord_type": "price"
-        })
+        await order_market_buy_price(access_key, secret_key, market, amount)
     debit_limit = amount * (Decimal("1") + BUY_FEE_BUFFER_RATIO)
     budget["used"][bucket] += amount
     budget["market_used"][market] = budget["market_used"].get(market, Decimal("0")) + amount
@@ -499,32 +503,19 @@ async def upbit_api(method: str, url: str, access_key: str, secret_key: str,
         return r.json()
 
 
+async def order_market_buy_price(
+    access_key: str, secret_key: str, market: str, krw_amount: Decimal
+) -> Any:
+    return await market_buy(
+        upbit_api, access_key, secret_key, market, krw_amount, UPBIT_ORDER_URL
+    )
+
+
 async def register_loss_cut(
         user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
-    if not API_BASE:
-        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
-        return
-
-    payload = {
-        "userNo": user_no,
-        "coinCode": market,
-        "losscutQty": float(quantity),
-        "losscutPrice": float(price),
-        "currentPrice": float(price),
-        "lossRate": float(loss_rate),
-        "losscutReason": "손절 조건 도달",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
-            response.raise_for_status()
-        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
-    except httpx.HTTPError as e:
-        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
-
-
-def quantize_volume(vol: Decimal) -> Decimal:
-    return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    await _register_loss_cut(
+        API_BASE, user_no, market, quantity, price, loss_rate
+    )
 
 
 def calculate_ladder_volumes(total_volume: Decimal, total_eval: Decimal, avg_price: Decimal) -> List[Decimal]:
@@ -669,9 +660,9 @@ async def _process_rescue_buy_unlocked(
 
     buy_completed = False
     try:
-        result = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-            "market": market, "side": "bid", "price": str(buy_amount), "ord_type": "price"
-        }) if LIVE_TRADING else {}
+        result = await order_market_buy_price(
+            access_key, secret_key, market, buy_amount
+        ) if LIVE_TRADING else {}
         buy_completed = True
         state["is_rescued"] = True
         state["rescue_buy_price"] = current_price
@@ -1096,9 +1087,9 @@ async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: s
 
     try:
         if LIVE_TRADING:
-            buy_r = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                "market": market, "side": "bid", "price": str(step_amt), "ord_type": "price"
-            })
+            buy_r = await order_market_buy_price(
+                access_key, secret_key, market, step_amt
+            )
             grid_orders.append(buy_r.get("uuid"))
 
         prev_buy_p = cur_p

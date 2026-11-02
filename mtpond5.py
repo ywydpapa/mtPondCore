@@ -1,3 +1,9 @@
+"""전략 5: 총자산을 추세 스캘핑 50%, 그리드 20%, 현금 버퍼 30%로 운용한다.
+
+추세 후보가 없을 때 횡보 후보로 그리드를 구성한다. 추세는 사다리 익절,
+그리드는 합산 평단 기준 익절을 사용하며 구출 후 -2.5%에서 전량 손절한다.
+"""
+
 # ============================================================
 # 1. Imports
 # ============================================================
@@ -12,20 +18,19 @@ import math
 import json
 from typing import Optional, Dict, Any, List, Tuple
 from decimal import Decimal, ROUND_DOWN, ROUND_FLOOR, ROUND_CEILING
-import dotenv
 import httpx
 import jwt
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
+from mtpond_common import (
+    market_buy,
+    quantize_volume,
+    register_loss_cut as _register_loss_cut,
+)
+from mtpond_db import SessionLocal, engine
 
 # ============================================================
 # 2. 환경 및 기본 설정
 # ============================================================
-dotenv.load_dotenv()
-
-engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
 BASE_UNIT = "KRW"
@@ -277,32 +282,22 @@ async def upbit_api(method: str, url: str, access_key: str, secret_key: str, par
         return r.json()
 
 
+async def order_market_buy_price(
+    access_key: str, secret_key: str, market: str, krw_amount: Decimal
+) -> Any:
+    return await market_buy(
+        upbit_api, access_key, secret_key, market, krw_amount, UPBIT_ORDER_URL
+    )
+
+
 async def register_loss_cut(
         user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
-    if not API_BASE:
-        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
-        return
-
-    payload = {
-        "userNo": user_no,
-        "coinCode": market,
-        "losscutQty": float(quantity),
-        "losscutPrice": float(price),
-        "currentPrice": float(price),
-        "lossRate": float(loss_rate),
-        "losscutReason": "손절 조건 도달",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
-            response.raise_for_status()
-        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
-    except httpx.HTTPError as e:
-        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
+    await _register_loss_cut(
+        API_BASE, user_no, market, quantity, price, loss_rate
+    )
 
 
-def quantize_volume(vol: Decimal) -> Decimal:
-    return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
 
 
 def get_tick_unit(price: Decimal) -> Decimal:
@@ -422,9 +417,9 @@ async def _process_rescue_buy_unlocked(
 
     buy_completed = False
     try:
-        result = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-            "market": market, "side": "bid", "price": str(buy_amount), "ord_type": "price"
-        }) if LIVE_TRADING else {}
+        result = await order_market_buy_price(
+            access_key, secret_key, market, buy_amount
+        ) if LIVE_TRADING else {}
         buy_completed = True
         state["is_rescued"] = True
         state["rescue_buy_price"] = current_price
@@ -849,9 +844,9 @@ async def deploy_single_grid_harvest(access_key: str, secret_key: str, market: s
     grid_orders = []
 
     if LIVE_TRADING:
-        buy_r = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-            "market": market, "side": "bid", "price": str(step_amt), "ord_type": "price"
-        })
+        buy_r = await order_market_buy_price(
+            access_key, secret_key, market, step_amt
+        )
         grid_orders.append(buy_r.get("uuid"))
 
     prev_buy_p = cur_p
@@ -1099,10 +1094,9 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                                     print(
                                         f"🚀 [TREND-BUY] 모멘텀 진입: {cand} (점수: {cand_item['overall_score']}) | 금액: {trend_per_trade:,.0f}원")
                                     if LIVE_TRADING:
-                                        await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
-                                            "market": cand, "side": "bid", "price": str(trend_per_trade),
-                                            "ord_type": "price"
-                                        })
+                                        await order_market_buy_price(
+                                            access_key, secret_key, cand, trend_per_trade
+                                        )
                                     await sm.save_trend_position(cand,
                                                                     {"avg_price": cur_p, "entry_ts": time.time()})
                                     asyncio.create_task(place_ladder_tp_orders(access_key, secret_key, cand, sm))

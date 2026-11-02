@@ -1,3 +1,9 @@
+"""전략 1: 교차 분석 후보 진입과 제한된 추가 매수/마틴을 운용한다.
+
+매도는 하드 익절과 고점 추적 기준을 사용하며, 지정가 매도 모드에서는 주문을
+재배치한다. 구출 후 반등에 실패하면 잔고를 전량 청산하고 손절을 기록한다.
+"""
+
 # ============================================================
 # 1. Imports
 # ============================================================
@@ -12,20 +18,20 @@ import math
 import json
 from typing import Optional, Dict, Any, List, Tuple, Set
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
-import dotenv
 import httpx
 import jwt
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text, false
 from sqlalchemy.util import await_only
+from mtpond_common import (
+    market_buy,
+    quantize_volume,
+    register_loss_cut as _register_loss_cut,
+)
+from mtpond_db import SessionLocal, engine
 
 # ============================================================
-# 2. 환경 로드
+# 2. 환경 설정
 # ============================================================
-dotenv.load_dotenv()
-
-
 def _decimal_env(name: str, default: str) -> Decimal:
     raw_value = os.getenv(name, default)
     numeric_value = raw_value.split("#", 1)[0].strip()
@@ -39,10 +45,8 @@ def _decimal_env(name: str, default: str) -> Decimal:
 
 
 # ============================================================
-# 3. DB & 기본 상수 (수정본)
+# 3. 기본 상수
 # ============================================================
-engine = create_async_engine(os.getenv("dburl"), echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
 BASE_UNIT = "KRW"
@@ -598,26 +602,9 @@ async def fetch_upbit_accounts(access_key: str, secret_key: str) -> List[Dict[st
 
 async def register_loss_cut(
         user_no: int, market: str, quantity: Decimal, price: Decimal, loss_rate: Decimal):
-    if not API_BASE:
-        print("[LOSS-CUT-API][WARN] API_BASE가 설정되지 않아 손절 기록을 저장하지 못했습니다.")
-        return
-
-    payload = {
-        "userNo": user_no,
-        "coinCode": market,
-        "losscutQty": float(quantity),
-        "losscutPrice": float(price),
-        "currentPrice": float(price),
-        "lossRate": float(loss_rate),
-        "losscutReason": "손절 조건 도달",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            response = await client.post(f"{API_BASE}/api/regLC", json=payload)
-            response.raise_for_status()
-        print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
-    except httpx.HTTPError as e:
-        print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {e}")
+    await _register_loss_cut(
+        API_BASE, user_no, market, quantity, price, loss_rate
+    )
 
 
 async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
@@ -639,10 +626,6 @@ async def fetch_current_prices(markets: List[str]) -> Dict[str, Decimal]:
 
 def parse_decimal(x) -> Decimal:
     return Decimal(str(x))
-
-def quantize_volume(vol: Decimal) -> Decimal:
-    # 업비트 다수 코인 8자리 허용. 필요하다면 마켓별 precision 맵 도입
-    return vol.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
 def is_dust_volume(volume: Decimal,
                    price: Decimal,
@@ -1414,8 +1397,10 @@ async def order_market_sell(access_key, secret_key, market, volume: Decimal):
     return await upbit_request("POST", UPBIT_ORDER_URL, access_key, secret_key, params=params, max_retry=2)
 
 async def order_market_buy_price(access_key, secret_key, market, krw_amount: Decimal):
-    params = {"market": market, "side": "bid", "price": str(krw_amount), "ord_type": "price"}
-    return await upbit_request("POST", UPBIT_ORDER_URL, access_key, secret_key, params=params, max_retry=2)
+    return await market_buy(
+        upbit_request, access_key, secret_key, market, krw_amount,
+        UPBIT_ORDER_URL, max_retry=2,
+    )
 
 async def order_limit_sell(access_key: str, secret_key: str, market: str, volume: Decimal, price: Decimal):
     params = {"market": market, "side": "ask", "volume": str(volume), "price": str(price), "ord_type": "limit"}
