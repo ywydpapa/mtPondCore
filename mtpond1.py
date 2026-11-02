@@ -27,6 +27,21 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
 )
+from mtpond_config import (
+    API_BASE,
+    BASE_UNIT,
+    BB_MIN_TRADE_COUNT_10M,
+    BB_PATTERNS_API_URL,
+    ENABLE_STOP,
+    FORCE_LIVE,
+    LIVE_TRADING,
+    MAX_CONCURRENT_RESCUE,
+    MIN_ORDER_NOTIONAL_KRW,
+    RESCUE_MAX_DROP,
+    RESCUE_MIN_DROP,
+    UPBIT_ORDER_URL,
+    is_stop_enabled,
+)
 from mtpond_db import SessionLocal, engine
 
 # ============================================================
@@ -47,9 +62,7 @@ def _decimal_env(name: str, default: str) -> Decimal:
 # ============================================================
 # 3. 기본 상수
 # ============================================================
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "15"))
-BASE_UNIT = "KRW"
 
 # ★ Redis 원격 서버 연결 설정 (개별 환경변수 우선 적용 및 URL fallback)
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -114,8 +127,6 @@ INTERVAL_SECONDS = 5
 FIVE_MIN_SECONDS = 300
 MIN_NOTIONAL_KRW = Decimal("50")
 MAX_BACKOFF = 120
-FORCE_LIVE = True
-LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
 WHITELIST_MARKETS: List[str] = []
 ENFORCE_WHITELIST = False
 INTERSECTION_USE_CACHE_ON_EMPTY = os.getenv("INTERSECTION_USE_CACHE_ON_EMPTY", "1") == "1"
@@ -145,15 +156,11 @@ INTERSECTION_MAX_TICKS = int(os.getenv("INTERSECTION_MAX_TICKS", "10"))
 UPRISES_LAST_NONEMPTY: List[dict] = []
 UPRISES_LAST_TS: float | None = None
 UPRISES_EMPTY_STREAK: int = 0
-UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 USE_INITAMT_FOR_INTERSECTION = os.getenv("USE_INITAMT_FOR_INTERSECTION", "1") == "1"
 NORMALIZE_MARGIN_PERCENT = os.getenv("NORMALIZE_MARGIN_PERCENT", "0") == "1"
 MARGIN_PERCENT_DIVISOR = _decimal_env("MARGIN_PERCENT_DIVISOR", "1")
 ALLOW_ADDITIONAL_BUY_WHEN_FULL = os.getenv("ALLOW_ADDITIONAL_BUY_WHEN_FULL","1")=="1"
 MAX_ADDITIONAL_BUYS = int(os.getenv("MAX_ADDITIONAL_BUYS","5"))
-RESCUE_MIN_DROP = Decimal("-8.0")
-RESCUE_MAX_DROP = Decimal("-22.0")
-MAX_CONCURRENT_RESCUE = 1
 _rescue_buy_lock = asyncio.Lock()
 # Avg Down
 AVG_DOWN_TP_ARM_PNL = _decimal_env("AVG_DOWN_TP_ARM_PNL", "0.20")
@@ -200,16 +207,13 @@ PASSIVE_LIMIT_SELL_DEBUG = os.getenv("PASSIVE_LIMIT_SELL_DEBUG", "0") == "1"
 
 PASSIVE_FORCE_REPLACE_ON_INCREASE = os.getenv("PASSIVE_FORCE_REPLACE_ON_INCREASE","1") == "1"
 PASSIVE_FORCE_INCREASE_TOL = _decimal_env("PASSIVE_FORCE_INCREASE_TOL", "0")
-MIN_ORDER_NOTIONAL_KRW = _decimal_env("MIN_ORDER_NOTIONAL_KRW", "5500")
 ORDER_NOTIONAL_BUFFER_PCT = _decimal_env("ORDER_NOTIONAL_BUFFER_PCT", "0.01")
 DUST_ABS_VOLUME_THRESHOLD = _decimal_env("DUST_ABS_VOLUME_THRESHOLD", "0.000001")
 DUST_CLEANUP_ENABLED = os.getenv("DUST_CLEANUP_ENABLED","1") == "1"
 DUST_LOG_INTERVAL_SEC = int(os.getenv("DUST_LOG_INTERVAL_SEC","600"))
 DUST_LAST_LOG: dict[str,float] = {}
 BBTREND_API_URL = os.getenv("BBTREND_API_URL", "http://becog.iptime.org:8088/api/bbtrend30")
-BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))
-BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 BBTREND_MIN_EXPECTED_PCT = float(os.getenv("BBTREND_MIN_EXPECTED_PCT", "0.005"))  # 0.005 = 0.5%
 BBTREND_MIN_NOTIONAL_3M = float(os.getenv("BBTREND_MIN_NOTIONAL_3M", "20000000"))
 BBTREND_FETCH_INTERVAL_SEC = int(os.getenv("BBTREND_FETCH_INTERVAL_SEC", "30"))
@@ -229,7 +233,6 @@ DEBUG_INTX = os.getenv("DEBUG_INTX","0") == "1"
 
 # 마틴 및 구출 실패 손절 플래그
 ENABLE_MARTIN = (os.getenv("ENABLE_MARTIN", "0").upper() in ("1","Y","TRUE"))
-ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1","Y","TRUE"))
 
 _CONFIG_INITIALIZED = False
 def init_config(force: bool = False):
@@ -257,7 +260,7 @@ def init_config(force: bool = False):
 
     # 불리언 플래그 재정규화
     ENABLE_MARTIN = (str(os.getenv("ENABLE_MARTIN", "0")).upper() in ("1","Y","TRUE"))
-    ENABLE_STOP = (str(os.getenv("ENABLE_STOP", "1")).upper() in ("1","Y","TRUE"))
+    ENABLE_STOP = is_stop_enabled()
 
     _CONFIG_INITIALIZED = True
     print("[INIT] Runtime config 초기화 완료")

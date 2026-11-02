@@ -26,6 +26,22 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
 )
+from mtpond_config import (
+    API_BASE,
+    BASE_UNIT,
+    BB_MIN_TRADE_COUNT_10M,
+    BB_PATTERNS_API_URL,
+    ENABLE_STOP,
+    FORCE_LIVE,
+    LIVE_TRADING,
+    MAX_CONCURRENT_RESCUE,
+    MIN_ORDER_NOTIONAL_KRW,
+    RESCUE_MAX_DROP,
+    RESCUE_MIN_DROP,
+    UPBIT_ORDER_URL,
+    get_bb_min_trade_count_10m,
+    is_stop_enabled,
+)
 from mtpond_db import SessionLocal, engine
 
 # ============================================================
@@ -45,9 +61,7 @@ def _decimal_env(name: str, default: str) -> Decimal:
 # ============================================================
 # 3. 기본 상수
 # ============================================================
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
-BASE_UNIT = "KRW"
 
 # Redis 연결 설정
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -104,12 +118,10 @@ async def close_http_client():
 # ============================================================
 # 4. STATIC CONFIG (설정 및 신규 조건)
 # ============================================================
-BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))
 COOLDOWN_AFTER_SELL_SEC = int(os.getenv("COOLDOWN_AFTER_SELL_SEC", "180"))
 
 BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
-BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
 ARM_PNL = Decimal("0.25")
 HARD_TP = Decimal("0.6")
@@ -124,11 +136,7 @@ HARD_TP2_SELL_PORTION = _decimal_env("HARD_TP2_SELL_PORTION", "1.0")
 
 INTERVAL_SECONDS = 5
 MIN_NOTIONAL_KRW = Decimal("5000")
-MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
 ORDER_NOTIONAL_BUFFER_PCT = Decimal("0.01")
-FORCE_LIVE = True
-LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
-UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
 PREPLACE_HARD_TP = os.getenv("PREPLACE_HARD_TP", "1") == "1"
 PREPLACE_TP_PORTION = os.getenv("PREPLACE_TP_PORTION")
@@ -359,10 +367,6 @@ async def check_3m_candle_trend(market: str) -> bool:
 # ============================================================
 # 5. RUNTIME CONFIG (동적 설정 관리)
 # ============================================================
-ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1", "Y", "TRUE"))
-RESCUE_MIN_DROP = Decimal("-8.0")
-RESCUE_MAX_DROP = Decimal("-22.0")
-MAX_CONCURRENT_RESCUE = 1
 _rescue_buy_lock = asyncio.Lock()
 
 _CONFIG_INITIALIZED = False
@@ -519,9 +523,9 @@ def init_config(force: bool = False):
     MAX_TOTAL_INVEST_PER_MARKET = _decimal_env("MAX_TOTAL_INVEST_PER_MARKET", "400000")
     BUY_RANGE_LOW = _decimal_env("BUY_RANGE_LOW", "-2.2")
     BUY_RANGE_HIGH = _decimal_env("BUY_RANGE_HIGH", "0.45")
-    ENABLE_STOP = (str(os.getenv("ENABLE_STOP", "1")).upper() in ("1", "Y", "TRUE"))
+    ENABLE_STOP = is_stop_enabled()
     BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
-    BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
+    BB_MIN_TRADE_COUNT_10M = get_bb_min_trade_count_10m()
 
     _CONFIG_INITIALIZED = True
     print(f"[INIT] 설정 초기화 완료 (force={force}) | 추천점수>={BB_MIN_OVERALL_SCORE}, 10분체결>={BB_MIN_TRADE_COUNT_10M}건")

@@ -26,14 +26,26 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
 )
+from mtpond_config import (
+    API_BASE,
+    BASE_UNIT,
+    BB_MIN_TRADE_COUNT_10M,
+    BB_PATTERNS_API_URL,
+    ENABLE_STOP,
+    FORCE_LIVE,
+    LIVE_TRADING,
+    MAX_CONCURRENT_RESCUE,
+    MIN_ORDER_NOTIONAL_KRW,
+    RESCUE_MAX_DROP,
+    RESCUE_MIN_DROP,
+    UPBIT_ORDER_URL,
+)
 from mtpond_db import SessionLocal, engine
 
 # ============================================================
 # 2. 환경 및 기본 설정
 # ============================================================
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
-BASE_UNIT = "KRW"
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "56379"))
@@ -52,9 +64,7 @@ redis_client = aioredis.Redis(
 # ============================================================
 # 3. STATIC CONFIG (50% / 20% / 30% 자금 룰 & API 설정)
 # ============================================================
-BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = 60  # 외부 분석 서버 캐시 주기 60초
-BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 ADDITIONAL_BUY_KRW = Decimal(os.getenv("ADDITIONAL_BUY_KRW", "40000"))
 
 RATIO_TREND = Decimal("0.50")  # 추세 스캘핑: 50%
@@ -65,18 +75,10 @@ RATIO_CASH_BUFFER = Decimal("0.30")  # 현금 버퍼: 30% (항시 유지)
 GRID_STEP_COUNT = 4  # 4단계 매수 그물망
 GRID_INTERVAL_PCT = Decimal("0.5")  # -0.5% 간격
 GRID_TARGET_TP_PCT = Decimal("0.5")  # +0.5% 합산 익절
-RESCUE_MIN_DROP = Decimal("-8.0")
-RESCUE_MAX_DROP = Decimal("-22.0")
-MAX_CONCURRENT_RESCUE = 1
 _rescue_buy_lock = asyncio.Lock()
-ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").strip().upper() in ("1", "Y", "TRUE"))
 
-MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
 COOLDOWN_TP_SEC = 180
 COOLDOWN_DEFENSE_SEC = 300
-FORCE_LIVE = True
-LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
-UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
 
 def apply_rescue_buy_config(cfg: Dict[str, Any], source: str) -> None:

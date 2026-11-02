@@ -26,6 +26,21 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
 )
+from mtpond_config import (
+    API_BASE,
+    BASE_UNIT,
+    BB_MIN_TRADE_COUNT_10M,
+    BB_PATTERNS_API_URL,
+    ENABLE_STOP,
+    FORCE_LIVE,
+    LIVE_TRADING,
+    MAX_CONCURRENT_RESCUE,
+    MIN_ORDER_NOTIONAL_KRW,
+    RESCUE_MAX_DROP,
+    RESCUE_MIN_DROP,
+    UPBIT_ORDER_URL,
+    get_bb_min_trade_count_10m,
+)
 from mtpond_db import SessionLocal, engine
 
 # ============================================================
@@ -45,9 +60,7 @@ def _decimal_env(name: str, default: str) -> Decimal:
 # ============================================================
 # 3. 기본 상수
 # ============================================================
-API_BASE = os.getenv("API_BASE", "").rstrip("/")
 CONTROLLER_POLL_SEC = int(os.getenv("CONTROLLER_POLL_SEC", "5"))
-BASE_UNIT = "KRW"
 
 # Redis 연결 설정
 REDIS_HOST = os.getenv("REDIS_HOST")
@@ -86,7 +99,6 @@ class ResetRequested(Exception):
 # ============================================================
 # 4. STATIC CONFIG (기본 상수)
 # ============================================================
-BB_PATTERNS_API_URL = os.getenv("BB_PATTERNS_API_URL", "http://becog.iptime.org:8088/api/bb-patterns")
 BB_CACHE_TTL_SEC = int(os.getenv("BB_CACHE_TTL_SEC", "180"))
 
 COOLDOWN_TP_SEC = int(os.getenv("COOLDOWN_TP_SEC", "180"))  # 익절 후 재매수 방지 180초
@@ -94,9 +106,6 @@ COOLDOWN_DEFENSE_SEC = int(os.getenv("COOLDOWN_DEFENSE_SEC", "300"))  # 손절 �
 
 ACTIVE_CAPITAL_RATIO = Decimal("0.60")  # 총 자산의 60% 한도 투입
 DEFENSE_TRIGGER_PCT = Decimal("-1.4")  # 방어 틱 사다리 재배치 (-1.4%)
-RESCUE_MIN_DROP = Decimal("-8.0")
-RESCUE_MAX_DROP = Decimal("-22.0")
-MAX_CONCURRENT_RESCUE = 1
 _rescue_buy_lock = asyncio.Lock()
 
 MIN_SLOT_NOTIONAL_KRW = Decimal("10000")  # 1슬롯 기본 10,000원
@@ -105,21 +114,15 @@ LADDER_STEP_PCT = Decimal("0.30")  # 단계별 간격 (+0.30%)
 
 INTERVAL_SECONDS = 3
 MIN_NOTIONAL_KRW = Decimal("5000")
-MIN_ORDER_NOTIONAL_KRW = Decimal("5500")
-FORCE_LIVE = True
-LIVE_TRADING = (os.getenv("UPBIT_LIVE") == "1") or FORCE_LIVE
-UPBIT_ORDER_URL = "https://api.upbit.com/v1/orders"
 
 # ============================================================
 # 5. RUNTIME CONFIG (Redis 우선 동적 설정 관리)
 # ============================================================
 _CONFIG_INITIALIZED = False
-ENABLE_STOP = (os.getenv("ENABLE_STOP", "1").upper() in ("1", "Y", "TRUE"))
 MAX_ACTIVE_MARKETS = 2
 RANGE_BUY_KRW = Decimal("40000")  # 초기 폴백값 (Redis 로드 시 즉시 덮어씌워짐)
 ADDITIONAL_BUY_KRW = _decimal_env("ADDITIONAL_BUY_KRW", "40000")
 BB_MIN_OVERALL_SCORE = 3
-BB_MIN_TRADE_COUNT_10M = 60
 
 
 class PositionState:
@@ -193,7 +196,7 @@ def init_config(force: bool = False):
     MAX_ACTIVE_MARKETS = int(os.getenv("MAX_ACTIVE_MARKETS", str(default_markets)))
 
     BB_MIN_OVERALL_SCORE = int(os.getenv("BB_MIN_OVERALL_SCORE", "3"))
-    BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
+    BB_MIN_TRADE_COUNT_10M = get_bb_min_trade_count_10m()
 
     _CONFIG_INITIALIZED = True
     print(f"[INIT] 시스템 1차 설정 완료 | 종목당 초기할당: {RANGE_BUY_KRW:,.0f}원, 활성최대: {MAX_ACTIVE_MARKETS}개")
