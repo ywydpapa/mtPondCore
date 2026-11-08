@@ -26,6 +26,7 @@ from mtpond_common import (
     market_buy,
     quantize_volume,
     register_loss_cut as _register_loss_cut,
+    get_dynamic_stop_limits,
 )
 from mtpond_config import (
     API_BASE,
@@ -1467,11 +1468,15 @@ async def manage_grid_position(access_key: str, secret_key: str, sm: CompositeSt
             )
             return
 
-        # 2. 그리드 하드 손절 (-7.0%) 및 대폭락 강제 손절 (-22.0%)
-        is_hard_stop = bool(ENABLE_STOP and pnl <= HARD_STOP_LOSS_PCT)
-        is_max_drop = bool(ENABLE_STOP and pnl <= MAX_DROP_LOSS_CUT_PCT)
+        # 2. 그리드 하드 손절 및 대폭락 강제 손절 (코인별 30분봉 동적 진동폭 연동)
+        limits = await get_dynamic_stop_limits(mkt, patterns_data=_patterns_cache.get("data"), client=get_http_client())
+        dyn_hard_stop = limits["hard_stop"]
+        dyn_max_drop = limits["max_drop"]
+
+        is_hard_stop = bool(ENABLE_STOP and pnl <= dyn_hard_stop)
+        is_max_drop = bool(ENABLE_STOP and pnl <= dyn_max_drop)
         if is_hard_stop or is_max_drop:
-            reason = "HARD_STOP_LOSS" if is_hard_stop else "MAX_DROP_LOSS_CUT"
+            reason = f"DYNAMIC_HARD_STOP({dyn_hard_stop}%)" if is_hard_stop else f"DYNAMIC_MAX_DROP({dyn_max_drop}%)"
             print(f"🚨 [GRID-STOP] {mkt} 그리드 손절 발동 ({reason}, PnL: {pnl:.2f}%) → 전량 시장가 청산")
             await cancel_all_orders(access_key, secret_key, mkt)
             await asyncio.sleep(0.4)
@@ -1702,11 +1707,15 @@ async def run_hybrid_engine(user_no: int, server_no: int):
                     )
                     continue
 
-                # 2. 일반 추세 포지션 하드 손절 (-7.0%) 및 대폭락 강제 손절 (-22.0%)
-                is_hard_stop = bool(ENABLE_STOP and pnl <= HARD_STOP_LOSS_PCT)
-                is_max_drop = bool(ENABLE_STOP and pnl <= MAX_DROP_LOSS_CUT_PCT)
+                # 2. 일반 추세 포지션 하드 손절 및 대폭락 강제 손절 (코인별 30분봉 동적 진동폭 연동)
+                limits = await get_dynamic_stop_limits(market, patterns_data=_patterns_cache.get("data"), client=get_http_client())
+                dyn_hard_stop = limits["hard_stop"]
+                dyn_max_drop = limits["max_drop"]
+
+                is_hard_stop = bool(ENABLE_STOP and pnl <= dyn_hard_stop)
+                is_max_drop = bool(ENABLE_STOP and pnl <= dyn_max_drop)
                 if is_hard_stop or is_max_drop:
-                    reason = "HARD_STOP_LOSS" if is_hard_stop else "MAX_DROP_LOSS_CUT"
+                    reason = f"DYNAMIC_HARD_STOP({dyn_hard_stop}%)" if is_hard_stop else f"DYNAMIC_MAX_DROP({dyn_max_drop}%)"
                     print(f"🚨 [TREND-STOP] {market} 추세 포지션 손절 발동 ({reason}, PnL: {pnl:.2f}%) → 전량 시장가 청산")
                     async with get_market_lock(market):
                         await cancel_all_orders(access_key, secret_key, market)

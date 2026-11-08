@@ -25,6 +25,7 @@ from mtpond_common import (
     market_buy,
     quantize_volume,
     register_loss_cut as _register_loss_cut,
+    get_dynamic_stop_limits,
 )
 from mtpond_config import (
     API_BASE,
@@ -2222,16 +2223,20 @@ async def monitor_positions(user_no: int, server_no: int):
                     continue
 
                 # -------------------------------------------------------------
-                # 2. 하드 손절선 검사 (물타기 소진 후 -7.0% 또는 대폭락 -22.0%)
+                # 2. 하드 손절선 검사 (코인별 30분봉 동적 진동폭 연동)
                 # -------------------------------------------------------------
                 total_buys, _ = ps.get_buy_stats(market)
                 is_water_exhausted = (total_buys - 1) >= MAX_ADDITIONAL_BUYS
-                hard_stop_hit = is_water_exhausted and (pnl <= HARD_STOP_LOSS_PCT)
-                max_drop_hit = (pnl <= MAX_DROP_LOSS_CUT_PCT)
+                limits = await get_dynamic_stop_limits(market, patterns_data=_bb_patterns_cache.get("candidates"), client=get_http_client())
+                dyn_hard_stop = limits["hard_stop"]
+                dyn_max_drop = limits["max_drop"]
+
+                hard_stop_hit = is_water_exhausted and (pnl <= dyn_hard_stop)
+                max_drop_hit = (pnl <= dyn_max_drop)
 
                 if ENABLE_STOP and (hard_stop_hit or max_drop_hit):
-                    stop_tag = "HARD_STOP_LOSS" if hard_stop_hit else "MAX_DROP_LOSS_CUT"
-                    stop_detail = f"물타기{total_buys-1}회소진 PNL={pnl}% <= {HARD_STOP_LOSS_PCT}%" if hard_stop_hit else f"PNL={pnl}% <= {MAX_DROP_LOSS_CUT_PCT}%"
+                    stop_tag = f"DYNAMIC_HARD_STOP({dyn_hard_stop}%)" if hard_stop_hit else f"DYNAMIC_MAX_DROP({dyn_max_drop}%)"
+                    stop_detail = f"물타기{total_buys-1}회소진 PNL={pnl}% <= {dyn_hard_stop}%" if hard_stop_hit else f"PNL={pnl}% <= {dyn_max_drop}%"
                     print(f"[STOP-LOSS] {market} {stop_tag} 감지 ({stop_detail}) -> 긴급 시장가 손절 실행")
                     async with get_market_lock(market):
                         await cancel_all_open_orders_for_market(access_key, secret_key, market)

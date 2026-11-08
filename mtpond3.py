@@ -25,6 +25,7 @@ from mtpond_common import (
     market_buy,
     quantize_volume,
     register_loss_cut as _register_loss_cut,
+    get_dynamic_stop_limits,
 )
 from mtpond_config import (
     API_BASE,
@@ -1594,13 +1595,17 @@ async def monitor_positions(user_no: int, server_no: int):
                 elif ENABLE_STOP and not st.get("is_rescued", False):
                     total_buys, _ = ps.get_buy_stats(market)
                     is_water_exhausted = (total_buys - 1 >= MAX_ADDITIONAL_BUYS)
-                    is_beyond_hard_stop = (is_water_exhausted and pnl <= HARD_STOP_LOSS_PCT)
-                    is_beyond_max_drop = (pnl <= MAX_DROP_LOSS_CUT_PCT)
+                    limits = await get_dynamic_stop_limits(market, patterns_data=_bb_patterns_cache.get("candidates"))
+                    dyn_hard_stop = limits["hard_stop"]
+                    dyn_max_drop = limits["max_drop"]
+
+                    is_beyond_hard_stop = (is_water_exhausted and pnl <= dyn_hard_stop)
+                    is_beyond_max_drop = (pnl <= dyn_max_drop)
 
                     if is_beyond_hard_stop or is_beyond_max_drop:
-                        cut_reason = "WATER_EXHAUSTED_LOSS_CUT" if is_beyond_hard_stop else "MAX_DROP_LOSS_CUT"
+                        cut_reason = f"WATER_EXHAUSTED({dyn_hard_stop}%)" if is_beyond_hard_stop else f"DYNAMIC_MAX_DROP({dyn_max_drop}%)"
                         print(
-                            f"🚨 [HARD-STOP-LOSS] {market} 최종 방어 손절 발동! "
+                            f"🚨 [HARD-STOP-LOSS] {market} 최종 방어 동적손절 발동! "
                             f"(PNL: {pnl:.2f}%, 물타기: {total_buys}회, 사유: {cut_reason})"
                         )
                         await cancel_all_open_orders_for_market(access_key, secret_key, market)

@@ -16,8 +16,8 @@ BB_PATTERNS_API_URL = os.getenv(
 )
 BB_MIN_TRADE_COUNT_10M = int(os.getenv("BB_MIN_TRADE_COUNT_10M", "60"))
 
-RESCUE_MIN_DROP = Decimal("-8.0")
-RESCUE_MAX_DROP = Decimal("-22.0")
+RESCUE_MIN_DROP = Decimal(os.getenv("RESCUE_MIN_DROP", "-3.5"))
+RESCUE_MAX_DROP = Decimal(os.getenv("RESCUE_MAX_DROP", "-8.5"))
 MAX_CONCURRENT_RESCUE = 1
 raw_min_order_notional = os.getenv("MIN_ORDER_NOTIONAL_KRW", "5500")
 try:

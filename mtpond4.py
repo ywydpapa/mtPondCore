@@ -25,6 +25,7 @@ from mtpond_common import (
     market_buy,
     quantize_volume,
     register_loss_cut as _register_loss_cut,
+    get_dynamic_stop_limits,
 )
 from mtpond_config import (
     API_BASE,
@@ -1366,14 +1367,16 @@ async def monitor_positions(user_no: int, server_no: int):
 
                 # B. 일반 포지션 관리
 
-                # 1) 하드 손절 / 대폭락 강제 손절 검사
-                # - 방어 모드 진입 후 추가 하락으로 HARD_STOP_LOSS_PCT(-7.0%) 도달 시
-                # - 또는 구출 불가능한 수준의 대폭락 MAX_DROP_LOSS_CUT_PCT(-22.0%) 도달 시
-                is_hard_stop = bool(ENABLE_STOP and st.get("defense_mode") and pnl <= HARD_STOP_LOSS_PCT)
-                is_max_drop = bool(ENABLE_STOP and pnl <= MAX_DROP_LOSS_CUT_PCT)
+                # 1) 하드 손절 / 대폭락 강제 손절 검사 (코인별 30분봉 동적 진동폭 연동)
+                limits = await get_dynamic_stop_limits(market, patterns_data=_bb_patterns_cache.get("candidates"), client=get_http_client())
+                dyn_hard_stop = limits["hard_stop"]
+                dyn_max_drop = limits["max_drop"]
+
+                is_hard_stop = bool(ENABLE_STOP and st.get("defense_mode") and pnl <= dyn_hard_stop)
+                is_max_drop = bool(ENABLE_STOP and pnl <= dyn_max_drop)
 
                 if is_hard_stop or is_max_drop:
-                    cut_reason = "방어실패 하드손절" if is_hard_stop else "대폭락 안전망 손절"
+                    cut_reason = f"방어실패 동적손절({dyn_hard_stop}%)" if is_hard_stop else f"대폭락 동적안전망({dyn_max_drop}%)"
                     print(f"🚨 [HARD-STOP] {market} {cut_reason} 발동 (PnL: {pnl}%), 전량 시장가 청산")
                     async with get_market_lock(market):
                         await cancel_all_open_orders_for_market(access_key, secret_key, market)
