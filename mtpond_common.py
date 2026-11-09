@@ -13,24 +13,27 @@ VOLATILITY_CACHE_TTL_SEC = 300  # 5분 캐시
 def calculate_dynamic_stops(v30: float) -> Dict[str, Decimal]:
     """
     30분봉 진동폭(v30 %)을 기반으로 코인별 1파동 복구형 동적 손절/구출 한계선을 계산한다.
-    - hard_stop: 30분봉 진동폭 기반 최종 방어 손절선 (최소 -5.5%, 최대 -8.0% 캡)
-    - rescue_min_drop: 구출/물타기 시작점 -(v30 * 1.0) (최소 -3.0%, 최대 -4.5%)
-    - rescue_max_drop: 구출 진입 허용 하한선 -(v30 * 2.0) (최소 -6.0%, 최대 -8.5%)
-    - max_drop: 대폭락 강제 손절 한계선 (사용자 지정: -15% 수준 안전망)
+    단계별 서열 구조:
+    1. 정상 매매 및 진동 구간 (0% ~ rescue_min)
+    2. 구출/물타기 반등 확인 구간 (rescue_min ~ rescue_max: -3.0% ~ -8.0%)
+    3. 최종 하드 손절선 (hard_stop: 구출 구간 이탈 또는 물타기 소진 후 방어선, -7.0% ~ -9.5%)
+    4. 대폭락 강제 안전망 (max_drop: 사용자 지정 -15% 수준 안전망, -14.0% ~ -15.0% 캡)
     """
     v30_safe = max(1.0, float(v30))
 
-    # 1) 최종 하드 손절 (물타기 소진 또는 방어 실패 후 기준선: -5.5% ~ -8.0% 캡)
-    hard_sl = -max(5.5, min(8.0, v30_safe * 1.8))
-
-    # 2) 구출(Averaging) 허용 구간
+    # 1) 구출(Averaging) 허용 구간: -3.0% ~ -8.0%
     rescue_min = -max(3.0, min(4.5, v30_safe * 1.0))
-    rescue_max = -max(6.0, min(8.5, v30_safe * 2.0))
+    rescue_max = -max(6.0, min(8.0, v30_safe * 2.0))
     if rescue_min <= rescue_max:
         rescue_max = rescue_min - 2.0
 
+    # 2) 최종 하드 손절선 (구출 구간 이탈 후 또는 물타기 소진 시 최종 방어선: -7.0% ~ -9.5%)
+    hard_sl = -max(7.0, min(9.5, v30_safe * 2.2))
+    if hard_sl >= rescue_max:
+        hard_sl = rescue_max - 0.5
+
     # 3) 대폭락 강제 손절선 (-15% 수준 안전망)
-    # 30분봉 진동폭을 연동하되, 사용자 지정(-15% 수준)에 맞춰 -14.0% ~ -15.0% 범위로 캡 설정
+    # 30분봉 진동폭을 연동하되, 사용자 지정(-15% 수준)에 맞춰 최대 -15.0%로 엄격히 제한
     env_max = os.getenv("MAX_DROP_LOSS_CUT_PCT")
     try:
         max_cap = abs(float(env_max)) if env_max else 15.0
@@ -38,8 +41,8 @@ def calculate_dynamic_stops(v30: float) -> Dict[str, Decimal]:
         max_cap = 15.0
 
     max_drop = -max(min(14.0, max_cap), min(max_cap, v30_safe * 4.2))
-    if max_drop >= rescue_max:
-        max_drop = min(-Decimal(str(round(max_cap, 2))), rescue_max - Decimal("2.0"))
+    if max_drop >= hard_sl:
+        max_drop = min(-Decimal(str(round(max_cap, 2))), Decimal(str(round(hard_sl, 2))) - Decimal("2.0"))
 
     return {
         "v30": Decimal(str(round(v30_safe, 2))),
