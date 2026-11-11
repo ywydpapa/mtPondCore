@@ -339,8 +339,104 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
 
 
 # ============================================================
-# 6. 업비트 API 및 서명 헬퍼
+# 6. 업비트 API 및 서명 헬퍼 & 상폐/거래불가 마켓 방어
 # ============================================================
+_TRADABLE_MARKETS_SET: Set[str] = set()
+_TRADABLE_MARKETS_TS: float = 0.0
+_TRADABLE_MARKETS_CACHE_TTL_SEC: float = 1800.0  # 30분 캐시
+_untradable_logged_set: Set[str] = set()
+
+
+async def get_upbit_tradable_markets(force: bool = False) -> Set[str]:
+    """
+    업비트에서 현재 거래 지원 중인 전체 마켓 목록(KRW, BTC, USDT 등) 조회 및 캐싱 (30분 TTL).
+    상장폐지(유의/지원종료) 또는 미상장 코인을 필터링하여 API 에러를 방지함.
+    """
+    global _TRADABLE_MARKETS_SET, _TRADABLE_MARKETS_TS
+    now = time.time()
+    if (not force) and _TRADABLE_MARKETS_SET and (now - _TRADABLE_MARKETS_TS < _TRADABLE_MARKETS_CACHE_TTL_SEC):
+        return _TRADABLE_MARKETS_SET
+
+    try:
+        client = get_http_client()
+        resp = await client.get("https://api.upbit.com/v1/market/all?isDetails=false", timeout=5.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                _TRADABLE_MARKETS_SET = {m["market"] for m in data if isinstance(m, dict) and "market" in m}
+                _TRADABLE_MARKETS_TS = now
+    except Exception as e:
+        print(f"[MARKETS][WARN] 업비트 마켓 목록 조회 실패 (기존 캐시 유지): {e}")
+
+    return _TRADABLE_MARKETS_SET
+
+
+async def fetch_current_prices_safe(
+    markets: List[str],
+    access_key: Optional[str] = None,
+    secret_key: Optional[str] = None
+) -> Dict[str, Decimal]:
+    """
+    보유 마켓들의 현재가를 안전하게 일괄 조회한다.
+    - 거래 가능 마켓 목록으로 1차 사전 필터링 (상폐/미지원 마켓 제외)
+    - 업비트 Ticker 일괄 조회 시도
+    - 만약 개별 상폐 코인 등으로 일괄 조회가 실패(404 등)할 경우,
+      개별 조회 fallback을 수행하여 유효한 코인 시세만 획득하고 상폐 코인은 거래 가능 목록에서 제거.
+    """
+    if not markets:
+        return {}
+
+    tradable = await get_upbit_tradable_markets()
+    # 1차 필터링: 거래 가능 목록에 있는 마켓만 추림
+    valid_markets = [m for m in markets if m in tradable] if tradable else list(markets)
+    if not valid_markets:
+        return {}
+
+    client = get_http_client()
+    url = "https://api.upbit.com/v1/ticker"
+    params = {"markets": ",".join(valid_markets)}
+
+    # 일괄 조회 시도 (Ticker API는 공개 엔드포인트이므로 인증 불필요)
+    try:
+        res = await client.get(url, params=params, timeout=5.0)
+        if res.status_code == 200:
+            raw = res.json()
+            out = {}
+            for item in raw:
+                m = item.get("market")
+                p = item.get("trade_price")
+                if m and p is not None:
+                    try:
+                        out[m] = Decimal(str(p))
+                    except Exception:
+                        pass
+            return out
+        else:
+            print(f"[TICKER][WARN] 일괄 시세 조회 실패 (HTTP {res.status_code}) -> 개별 조회 폴백 가동")
+    except Exception as e:
+        print(f"[TICKER][WARN] 일괄 시세 조회 통신 예외 ({e}) -> 개별 조회 폴백 가동")
+
+    # Fallback: 개별 조회로 상폐/오류 마켓 분리
+    price_map: Dict[str, Decimal] = {}
+    for m in valid_markets:
+        try:
+            r = await client.get(url, params={"markets": m}, timeout=3.0)
+            if r.status_code == 200:
+                items = r.json()
+                if items and isinstance(items, list) and items[0].get("trade_price") is not None:
+                    price_map[m] = Decimal(str(items[0]["trade_price"]))
+            elif r.status_code == 404:
+                # 거래소에서 삭제된 상폐 코인
+                _TRADABLE_MARKETS_SET.discard(m)
+                if m not in _untradable_logged_set:
+                    _untradable_logged_set.add(m)
+                    print(f"⚠️ [DELISTED][WARN] {m} 거래소 상장폐지/미지원 확인 -> 거래 대상에서 즉시 제외")
+        except Exception:
+            pass
+
+    return price_map
+
+
 def build_jwt(access_key: str, secret_key: str, query: Optional[Dict[str, Any]] = None) -> str:
     payload = {"access_key": access_key, "nonce": str(uuid.uuid4())}
     if query:
@@ -376,6 +472,9 @@ async def upbit_api(
 
 
 async def cancel_all_orders(access_key: str, secret_key: str, market: str):
+    tradable = await get_upbit_tradable_markets()
+    if tradable and market not in tradable:
+        return
     try:
         orders = await upbit_api(
             "GET", "https://api.upbit.com/v1/orders", access_key, secret_key,
@@ -540,6 +639,12 @@ async def place_spike_catcher_ladder_tp(
     if balance <= 0 or avg_price <= 0:
         return
 
+    # 상장폐지/거래불가 마켓 방어
+    tradable = await get_upbit_tradable_markets()
+    if tradable and market not in tradable:
+        print(f"[SPIKE-CATCHER][SKIP] {market} 거래 불가능한 마켓(상폐 등)이므로 지정가 발주를 건너뜁니다.")
+        return
+
     # 1. 기존 잔여 주문 정리
     await cancel_all_orders(access_key, secret_key, market)
     await asyncio.sleep(0.3)
@@ -631,16 +736,25 @@ class PositionManager7:
 
     async def restore_from_redis_and_wallet(self, access_key: str, secret_key: str):
         print("🔄 [RESTORE] 시스템 기동: Redis 상태 및 업비트 잔고 대조 복원 시작...")
+        wallet_map: Dict[str, Dict[str, Decimal]] = {}
+        tradable_markets = await get_upbit_tradable_markets()
+
         try:
             accs = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
-            wallet_map = {}
             for a in accs:
                 cur = a.get("currency")
                 if cur and cur != "KRW":
+                    mkt = f"KRW-{cur}"
+                    # 거래 불가(상장폐지, BTC마켓 전용, 에어드랍 미상장) 코인 배제
+                    if tradable_markets and mkt not in tradable_markets:
+                        if mkt not in _untradable_logged_set:
+                            _untradable_logged_set.add(mkt)
+                            print(f"⚠️ [RESTORE][SKIP] {mkt} KRW 거래 불가(상폐/비상장/BTC마켓전용) 코인 감지 -> 관리 대상 제외")
+                        continue
                     tot = Decimal(str(a.get("balance", "0"))) + Decimal(str(a.get("locked", "0")))
                     avg = Decimal(str(a.get("avg_buy_price", "0")))
                     if tot > 0:
-                        wallet_map[f"KRW-{cur}"] = {"total_vol": tot, "avg_price": avg}
+                        wallet_map[mkt] = {"total_vol": tot, "avg_price": avg}
         except Exception as e:
             print(f"[RESTORE][ERR] 업비트 잔고 조회 실패: {e}")
             return
@@ -648,6 +762,12 @@ class PositionManager7:
         raw_positions = await self.r.hgetall(self.get_redis_key())
         if raw_positions:
             for mkt, s_val in raw_positions.items():
+                # 상폐된 코인이 과거 Redis에 남아있는 경우 정리
+                if tradable_markets and mkt not in tradable_markets:
+                    print(f"🧹 [RESTORE][CLEANUP] {mkt} 상폐 코인 Redis 잔존 포지션 데이터 영구 삭제")
+                    await self.r.hdel(self.get_redis_key(), mkt)
+                    continue
+
                 if mkt in wallet_map:
                     try:
                         item = json.loads(s_val)
@@ -663,8 +783,10 @@ class PositionManager7:
                 else:
                     await self.r.hdel(self.get_redis_key(), mkt)
 
-        # 지갑에 보유 중이지만 Redis에 없는 코인은 신규 편입
+        # 지갑에 보유 중이지만 Redis에 없는 유효 코인은 신규 편입
         for mkt, w_info in wallet_map.items():
+            if tradable_markets and mkt not in tradable_markets:
+                continue
             if mkt not in self.positions:
                 print(f"  └ ⚠️ [미등록 보유 코인 감지] {mkt} → 전략 7 신규 편입 (수량: {w_info['total_vol']})")
                 new_state = {
@@ -759,12 +881,15 @@ async def fetch_15m_rebound_signal(market: str) -> bool:
 async def get_daily_1pct_candidates(excluded: Set[str]) -> List[Dict[str, Any]]:
     """일일 1% 목표에 가장 적합한 거래 활성 및 양봉 반등 후보 종목 선별"""
     patterns = await fetch_all_candle_patterns()
+    tradable = await get_upbit_tradable_markets()
     candidates = []
     for row in patterns:
         if not isinstance(row, dict):
             continue
         mkt = row.get("market", "")
         if not mkt.startswith("KRW-") or mkt in excluded:
+            continue
+        if tradable and mkt not in tradable:
             continue
 
         try:
@@ -822,6 +947,9 @@ async def run_mtpond7_engine(user_no: int, server_no: int):
             btc_health = await check_btc_market_health()
             btc_status = btc_health["status"]
 
+            # 거래 가능 마켓 목록 최신화 (상폐 및 거래불가 마켓 방어)
+            tradable_markets = await get_upbit_tradable_markets()
+
             # 업비트 계좌 및 잔고 조회
             accounts = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
             krw_available = Decimal("0")
@@ -834,21 +962,18 @@ async def run_mtpond7_engine(user_no: int, server_no: int):
                     krw_available = Decimal(str(a.get("balance", "0")))
                     krw_locked = Decimal(str(a.get("locked", "0")))
                 else:
+                    mkt = f"KRW-{cur}"
+                    # 거래 불가(상장폐지, BTC마켓 전용, 에어드랍 미상장) 코인 배제
+                    if tradable_markets and mkt not in tradable_markets:
+                        continue
                     tot_v = Decimal(str(a.get("balance", "0"))) + Decimal(str(a.get("locked", "0")))
                     avg_p = Decimal(str(a.get("avg_buy_price", "0")))
                     if tot_v > 0:
-                        wallet_map[f"KRW-{cur}"] = {"total_vol": tot_v, "avg_price": avg_p}
+                        wallet_map[mkt] = {"total_vol": tot_v, "avg_price": avg_p}
 
-            # 현재 보유 코인 시세 조회
+            # 현재 보유 코인 시세 안전 조회 (상폐/오류 코인 안전 격리 및 폴백)
             held_markets = list(wallet_map.keys())
-            price_map = {}
-            if held_markets:
-                ticker_res = await upbit_api(
-                    "GET", "https://api.upbit.com/v1/ticker", access_key, secret_key,
-                    {"markets": ",".join(held_markets)}
-                )
-                for t in ticker_res:
-                    price_map[t["market"]] = Decimal(str(t["trade_price"]))
+            price_map = await fetch_current_prices_safe(held_markets, access_key, secret_key)
 
             # 총 평가액 및 현금 버퍼 계산
             coin_eval = sum(
@@ -870,6 +995,12 @@ async def run_mtpond7_engine(user_no: int, server_no: int):
             # 1. 기존 보유 포지션 관리 (익절 체결/본절 안전망/손절)
             # ========================================================
             for market in list(pm.positions.keys()):
+                # 상폐 마켓 체크 -> 관리 목록에서 즉시 제거
+                if tradable_markets and market not in tradable_markets:
+                    print(f"⚠️ [DELISTED-EXIT] {market} 상폐 또는 거래불가 감지 -> 포지션 관리에서 즉시 제거")
+                    await pm.remove_position(market)
+                    continue
+
                 state = pm.positions[market]
                 w_info = wallet_map.get(market)
 
@@ -880,9 +1011,13 @@ async def run_mtpond7_engine(user_no: int, server_no: int):
                     pm.set_cooldown(market, is_tp=True)
                     continue
 
-                cur_p = price_map.get(market, w_info["avg_price"])
+                cur_p = price_map.get(market)
+                if not cur_p or cur_p <= 0:
+                    cur_p = w_info["avg_price"]
                 avg_p = w_info["avg_price"]
                 total_vol = w_info["total_vol"]
+                if cur_p <= 0 or avg_p <= 0:
+                    continue
                 pnl = ((cur_p - avg_p) / avg_p * Decimal("100")).quantize(Decimal("0.01"))
 
                 # 30분봉 동적 손절 한계선 조회
