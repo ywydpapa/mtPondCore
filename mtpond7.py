@@ -33,6 +33,7 @@ import math
 import json
 from typing import Optional, Dict, Any, List, Tuple, Set
 from decimal import Decimal, ROUND_DOWN, ROUND_FLOOR, ROUND_CEILING
+import dotenv
 import httpx
 import jwt
 from sqlalchemy import text
@@ -57,6 +58,28 @@ from mtpond_config import (
     UPBIT_ORDER_URL,
 )
 from mtpond_db import SessionLocal, engine
+
+dotenv.load_dotenv()
+
+
+async def get_keys(user_no: int, server_no: int) -> Tuple[Optional[str], Optional[str]]:
+    """DB(traceUser)에서 사용자의 업비트 API 키(apiKey1, apiKey2)를 조회한다."""
+    try:
+        async with SessionLocal() as session:
+            sql = text("""SELECT apiKey1, apiKey2
+                          FROM traceUser
+                          WHERE userNo = :u AND serverNo = :s LIMIT 1""")
+            result = await session.execute(sql, {"u": user_no, "s": server_no})
+            row = result.fetchone()
+            if row and row[0] and row[1]:
+                return str(row[0]).strip(), str(row[1]).strip()
+    except Exception as e:
+        print(f"[DB-CONFIG][WARN] traceUser 키 조회 실패: {e}")
+
+    # 환경변수 폴백 (UPBIT_OPEN_API_ACCESS_KEY 등)
+    ak = os.getenv("UPBIT_OPEN_API_ACCESS_KEY") or os.getenv("UPBIT_ACCESS_KEY")
+    sk = os.getenv("UPBIT_OPEN_API_SECRET_KEY") or os.getenv("UPBIT_SECRET_KEY")
+    return ak, sk
 
 
 def _decimal_env(key: str, default: str) -> Decimal:
@@ -770,20 +793,17 @@ async def get_daily_1pct_candidates(excluded: Set[str]) -> List[Dict[str, Any]]:
 # ============================================================
 # 11. 메인 감시 및 트레이딩 루프
 # ============================================================
-async def main():
-    user_no = int(os.getenv("USER_NO", "100001"))
-    access_key = os.getenv("UPBIT_OPEN_API_ACCESS_KEY")
-    secret_key = os.getenv("UPBIT_OPEN_API_SECRET_KEY")
-
+async def run_mtpond7_engine(user_no: int, server_no: int):
+    access_key, secret_key = await get_keys(user_no, server_no)
     if not access_key or not secret_key:
-        print("[mtpond7][FATAL] 업비트 API 키가 설정되지 않았습니다. .env 확인 필요")
+        print(f"[mtpond7][FATAL] user={user_no}, server={server_no} 업비트 API 키를 DB(traceUser) 및 .env에서 찾지 못했습니다.")
         return
 
     pm = PositionManager7(user_no, redis_client)
     await pm.restore_from_redis_and_wallet(access_key, secret_key)
 
     print("=" * 60)
-    print("🚀 [mtpond7] 일일 1% 수익 실현 특화 퀀트 엔진 시작")
+    print(f"🚀 [mtpond7] 일일 1% 수익 실현 특화 퀀트 엔진 시작 (User: {user_no}, Server: {server_no})")
     print(f"  └ 1차 익절(Tier 1, 60%): +0.45%~+0.65% (Spike Catcher 선발주)")
     print(f"  └ 2차 익절(Tier 2, 40%): +0.95%~+1.40% (본절 안전망 +0.08% 가동)")
     print(f"  └ 시장 안전망: BTC 3단계 체력 필터 + 30분봉 진폭 연동 4단계 동적 손절")
@@ -1029,6 +1049,70 @@ async def main():
             print(f"[mtpond7][ERROR] 메인 루프 예외 발생: {loop_err}")
 
         await asyncio.sleep(CONTROLLER_POLL_SEC)
+
+
+# ============================================================
+# 12. 컨트롤러 (웹 ON/OFF 상태 감시 및 기동)
+# ============================================================
+async def run_mtpond_controller(user_no: int, server_no: int):
+    task: Optional[asyncio.Task] = None
+    print(f"[CTRL] mtpond7 Controller 시작 (User: {user_no}, Server: {server_no})")
+
+    while True:
+        try:
+            active_flag = False
+            raw_status = await redis_client.get(f"mtpond:status:{user_no}")
+            if raw_status is not None:
+                active_flag = raw_status.strip().upper() in ("ON", "1", "Y", "TRUE")
+            c = await redis_client.get(f"mtpond:setup:{user_no}")
+            if c:
+                data = json.loads(c)
+                cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
+                if isinstance(cfg, dict):
+                    apply_dynamic_config(cfg)
+                    if raw_status is None:
+                        active_flag = str(cfg.get("activeYN", "N")).strip().upper() == "Y"
+                else:
+                    cfg = await fetch_database_setup(user_no)
+                    active_flag = cfg.get("activeYN", "N") == "Y"
+            elif raw_status is None:
+                cfg = await fetch_database_setup(user_no)
+                active_flag = cfg.get("activeYN", "N") == "Y"
+
+            if task is not None and task.done():
+                exc = task.exception()
+                if exc:
+                    print(f"[CTRL] 엔진 예외 감지: {exc} → 재기동 준비")
+                task = None
+
+            if active_flag and task is None:
+                print(f"▶️ [CTRL] 봇 활성화(ON) 감지 → run_mtpond7_engine 기동")
+                task = asyncio.create_task(run_mtpond7_engine(user_no, server_no))
+
+            elif not active_flag and task is not None:
+                print(f"⏸️ [CTRL] 봇 비활성화(OFF) 감지 → run_mtpond7_engine 중단 요청")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                task = None
+
+        except Exception as e:
+            print(f"[CTRL][ERR] {e}")
+
+        await asyncio.sleep(CONTROLLER_POLL_SEC)
+
+
+async def main():
+    dotenv.load_dotenv()
+    user_no = int(os.getenv("USER_NO", "100001"))
+    server_no = int(os.getenv("SERVER_NO", "21"))
+    try:
+        await sync_redis_config(user_no)
+        await run_mtpond_controller(user_no, server_no)
+    finally:
+        await close_http_client()
 
 
 if __name__ == "__main__":
