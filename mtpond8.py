@@ -180,26 +180,87 @@ BB_PATTERNS_CACHE_TTL_SEC = 20
 
 def apply_dynamic_config(setup: Dict[str, Any]):
     global INITIAL_BUY_KRW, ADDITIONAL_BUY_KRW, MAX_ACTIVE_MARKETS
-    global HARD_STOP_LOSS_PCT, MAX_DROP_LOSS_CUT_PCT
-    if "buyAmt" in setup:
-        INITIAL_BUY_KRW = Decimal(str(setup["buyAmt"]))
+    global HARD_STOP_LOSS_PCT, MAX_DROP_LOSS_CUT_PCT, ENABLE_STOP
+    changes = []
+
+    # 1. 시작 매수 금액 (buyAmt or initAmt)
+    buy_key = "initAmt" if "initAmt" in setup else ("buyAmt" if "buyAmt" in setup else None)
+    if buy_key:
+        try:
+            b_amt = Decimal(str(setup[buy_key]))
+            if b_amt > 0 and b_amt != INITIAL_BUY_KRW:
+                changes.append(f"INITIAL_BUY_KRW: {INITIAL_BUY_KRW} -> {b_amt}")
+                INITIAL_BUY_KRW = b_amt
+        except Exception:
+            pass
+
+    # 2. 추가 매수 금액
     if "addAmt" in setup:
-        ADDITIONAL_BUY_KRW = Decimal(str(setup["addAmt"]))
+        try:
+            a_amt = Decimal(str(setup["addAmt"]))
+            if a_amt > 0 and a_amt != ADDITIONAL_BUY_KRW:
+                changes.append(f"ADDITIONAL_BUY_KRW: {ADDITIONAL_BUY_KRW} -> {a_amt}")
+                ADDITIONAL_BUY_KRW = a_amt
+        except Exception:
+            pass
+
+    # 3. 최대 코인 수
     if "maxCoincnt" in setup:
-        MAX_ACTIVE_MARKETS = int(setup["maxCoincnt"])
-    if "hardStopLoss" in setup:
-        HARD_STOP_LOSS_PCT = Decimal(str(setup["hardStopLoss"]))
+        try:
+            mc = int(setup["maxCoincnt"])
+            if mc > 0 and mc != MAX_ACTIVE_MARKETS:
+                changes.append(f"MAX_ACTIVE_MARKETS: {MAX_ACTIVE_MARKETS} -> {mc}")
+                MAX_ACTIVE_MARKETS = mc
+        except Exception:
+            pass
+
+    # 4. 손절 설정치 (hardStopLoss or lcRate)
+    stop_key = "lcRate" if "lcRate" in setup else ("hardStopLoss" if "hardStopLoss" in setup else None)
+    if stop_key:
+        try:
+            hsl = Decimal(str(setup[stop_key]))
+            if hsl > 0:
+                hsl = -abs(hsl)
+            if hsl != HARD_STOP_LOSS_PCT:
+                changes.append(f"HARD_STOP_LOSS_PCT: {HARD_STOP_LOSS_PCT} -> {hsl}")
+                HARD_STOP_LOSS_PCT = hsl
+        except Exception:
+            pass
+
     if "maxDropLossCut" in setup:
-        MAX_DROP_LOSS_CUT_PCT = Decimal(str(setup["maxDropLossCut"]))
+        try:
+            mdl = Decimal(str(setup["maxDropLossCut"]))
+            if mdl > 0:
+                mdl = -abs(mdl)
+            if mdl != MAX_DROP_LOSS_CUT_PCT:
+                changes.append(f"MAX_DROP_LOSS_CUT_PCT: {MAX_DROP_LOSS_CUT_PCT} -> {mdl}")
+                MAX_DROP_LOSS_CUT_PCT = mdl
+        except Exception:
+            pass
+
+    # 5. 손절 적용 여부 (stopYN)
+    if "stopYN" in setup:
+        stop_enabled = str(setup["stopYN"]).strip().upper() in ("1", "Y", "TRUE", "ON")
+        if stop_enabled != ENABLE_STOP:
+            changes.append(f"ENABLE_STOP: {ENABLE_STOP} -> {stop_enabled}")
+            ENABLE_STOP = stop_enabled
+
+    if changes:
+        print("[CFG] mtpond8 동적 설정 반영:\n  " + "\n  ".join(changes))
 
 
-async def sync_redis_config(user_no: int):
+async def sync_redis_config(user_no: int) -> Optional[Dict[str, Any]]:
     try:
-        r_conf = await redis_client.hgetall(f"mtpond:config:{user_no}")
-        if r_conf:
-            apply_dynamic_config(r_conf)
-    except Exception:
-        pass
+        c = await redis_client.get(f"mtpond:setup:{user_no}")
+        if c:
+            data = json.loads(c)
+            cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
+            if isinstance(cfg, dict):
+                apply_dynamic_config(cfg)
+                return cfg
+    except Exception as e:
+        print(f"[CONFIG][WARN] Redis 설정 동기화 실패: {e}")
+    return None
 
 
 # ============================================================
@@ -263,7 +324,7 @@ async def get_excluded_markets(force_reload: bool = False, db_setup: Optional[Di
 # ============================================================
 # 5. DB 매매 설정 조회 캐시
 # ============================================================
-DB_SETUP_CACHE_TTL_SEC = 30
+DB_SETUP_CACHE_TTL_SEC = 5
 _db_setup_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 
 
@@ -284,15 +345,20 @@ async def fetch_database_setup(user_no: int) -> Dict[str, Any]:
     if not isinstance(setup, dict):
         raise ValueError(f"유효하지 않은 DB 설정 응답: {data}")
 
+    b_val = setup.get("initAmt") or setup.get("buyAmt") or INITIAL_BUY_KRW
+    a_val = setup.get("addAmt") or ADDITIONAL_BUY_KRW
+    hsl_val = setup.get("lcRate") or setup.get("hardStopLoss") or HARD_STOP_LOSS_PCT
+
     parsed = {
         "userNo": user_no,
         "activeVer": int(setup.get("activeVer", 8)),
-        "buyAmt": Decimal(str(setup.get("buyAmt", INITIAL_BUY_KRW))),
-        "addAmt": Decimal(str(setup.get("addAmt", ADDITIONAL_BUY_KRW))),
+        "activeYN": str(setup.get("activeYN", "N")).strip().upper(),
+        "buyAmt": Decimal(str(b_val)),
+        "addAmt": Decimal(str(a_val)),
         "maxCoincnt": int(setup.get("maxCoincnt", MAX_ACTIVE_MARKETS)),
         "limitAmt": Decimal(str(setup.get("limitAmt", 100000))),
-        "stopYN": str(setup.get("stopYN", "Y")).strip().upper() in ("1", "Y", "TRUE"),
-        "hardStopLoss": Decimal(str(setup.get("hardStopLoss", HARD_STOP_LOSS_PCT))),
+        "stopYN": str(setup.get("stopYN", "Y")).strip().upper() in ("1", "Y", "TRUE", "ON"),
+        "hardStopLoss": Decimal(str(hsl_val)),
         "maxDropLossCut": Decimal(str(setup.get("maxDropLossCut", MAX_DROP_LOSS_CUT_PCT))),
         "exCoinlist": str(setup.get("exCoinlist", "") or "").strip(),
     }
@@ -936,8 +1002,17 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
     while True:
         try:
             loop_cnt += 1
-            await sync_redis_config(user_no)
+            # 최신 설정 동기화 및 거래 비활성화(OFF) 감지 시 루프 종료
+            r_cfg = await sync_redis_config(user_no)
+            if r_cfg and str(r_cfg.get("activeYN", "Y")).strip().upper() == "N":
+                print(f"⏸️ [mtpond8] activeYN=N 감지 -> 거래 루프를 안전하게 종료합니다. (User: {user_no})")
+                break
+
             db_setup = await fetch_database_setup(user_no)
+            if str(db_setup.get("activeYN", "Y")).strip().upper() == "N":
+                print(f"⏸️ [mtpond8] DB activeYN=N 감지 -> 거래 루프를 안전하게 종료합니다. (User: {user_no})")
+                break
+
             excluded_markets = await get_excluded_markets(db_setup=db_setup)
 
             # 비트코인 체력 진단
@@ -1161,26 +1236,55 @@ async def run_mtpond_controller(user_no: int, server_no: int):
     while True:
         try:
             active_flag = False
+
+            # 1. mtpond:status:{user_no} 키 우선 확인 (있는 경우)
             raw_status = await redis_client.get(f"mtpond:status:{user_no}")
             if raw_status is not None:
-                active_flag = str(raw_status).strip().upper() in ("1", "TRUE", "ON", "START")
-            else:
-                db_setup = await fetch_database_setup(user_no)
-                active_flag = bool(db_setup.get("activeYN", True))
+                active_flag = str(raw_status).strip().upper() in ("1", "TRUE", "ON", "START", "Y")
 
-            if active_flag:
-                if task is None or task.done():
-                    print(f"▶️ [CTRL] mtpond8 ON 감지 -> 엔진 기동 (User: {user_no})")
-                    task = asyncio.create_task(run_mtpond8_engine(user_no, server_no))
-            else:
-                if task is not None and not task.done():
-                    print(f"⏹️ [CTRL] mtpond8 OFF 감지 -> 엔진 정지 (User: {user_no})")
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                    task = None
+            # 2. mtpond:setup:{user_no} JSON 설정 확인
+            c = await redis_client.get(f"mtpond:setup:{user_no}")
+            if c:
+                try:
+                    data = json.loads(c)
+                    cfg = data[0] if isinstance(data, list) and len(data) > 0 else data
+                    if isinstance(cfg, dict):
+                        apply_dynamic_config(cfg)
+                        if raw_status is None and "activeYN" in cfg:
+                            active_flag = str(cfg.get("activeYN", "N")).strip().upper() == "Y"
+                except Exception as parse_err:
+                    print(f"[CTRL][WARN] Redis setup 파싱 오류: {parse_err}")
+
+            # 3. Redis에 상태가 전혀 없으면 DB API 조회 (Fallback)
+            if raw_status is None and not c:
+                try:
+                    db_setup = await fetch_database_setup(user_no)
+                    active_flag = str(db_setup.get("activeYN", "N")).strip().upper() == "Y"
+                except Exception as db_err:
+                    print(f"[CTRL][WARN] DB 설정 조회 실패: {db_err}")
+
+            # 기동 중 예외 종료 여부 감지
+            if task is not None and task.done():
+                exc = task.exception()
+                if exc:
+                    print(f"⚠️ [CTRL] mtpond8 엔진 예외 발생으로 종료됨: {exc} → 재기동 대기")
+                task = None
+
+            # ON 상태인데 task가 없으면 엔진 기동
+            if active_flag and task is None:
+                print(f"▶️ [CTRL] mtpond8 ON 감지 -> 엔진 기동 (User: {user_no}, Server: {server_no})")
+                task = asyncio.create_task(run_mtpond8_engine(user_no, server_no))
+
+            # OFF 상태인데 task가 실행 중이면 엔진 정지
+            elif not active_flag and task is not None:
+                print(f"⏹️ [CTRL] mtpond8 OFF 감지 -> 엔진 정지 요청 (User: {user_no})")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                task = None
+
         except Exception as e:
             print(f"[CTRL][ERR] 컨트롤러 루프 예외: {e}")
 
