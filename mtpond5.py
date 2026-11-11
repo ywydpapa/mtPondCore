@@ -948,29 +948,38 @@ async def fetch_all_candle_patterns() -> List[Dict[str, Any]]:
 
 
 async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
-    """추세 스캘핑용: 점수(overall_score >= 3) 및 단기 거래 체결량이 풍부한 종목 추출"""
+    """추세 스캘핑용: advisor의 5대 안전장치 및 마켓레짐을 통과한 엄선된 추천 종목(recommendation)만 추출"""
     excluded = await get_excluded_markets()
     coins = await fetch_all_candle_patterns()
     qualified = []
     for c in coins:
         mkt = c.get("market", "")
         if not mkt.startswith("KRW-") or mkt in excluded: continue
+
+        # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
+        rec = c.get("recommendation")
+        if not rec or not isinstance(rec, dict):
+            continue
+
         try:
             score = int(c.get("overall_score", 0))
             price = float(c.get("price", 0))
             trades = int((c.get("trade_activity") or {}).get("trade_count_10m", 0))
+            p_score = float(rec.get("priority_score", 0))
         except (ValueError, TypeError):
             continue
 
-        if score >= 3 and trades >= 50 and price >= 30:
+        if trades >= 25 and price >= 30:
             qualified.append({
                 "market": mkt,
                 "overall_score": score,
+                "priority_score": p_score,
                 "trade_count": trades,
-                "price": price
+                "price": price,
+                "recommendation": rec
             })
 
-    qualified.sort(key=lambda x: (x["overall_score"], x["trade_count"]), reverse=True)
+    qualified.sort(key=lambda x: (x["priority_score"], x["overall_score"], x["trade_count"]), reverse=True)
     return qualified
 
 

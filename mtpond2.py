@@ -1250,10 +1250,18 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             cnt_price_drop += 1
             continue
 
+        # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
+        rec = c.get("recommendation")
+        if not rec or not isinstance(rec, dict):
+            cnt_score_drop += 1
+            continue
+
         try:
             overall_score = int(c.get("overall_score", 0))
+            p_score = float(rec.get("priority_score", 0))
         except Exception:
             overall_score = 0
+            p_score = 0
         act = c.get("trade_activity") or {}
         try:
             count_10m = int(act.get("trade_count_10m", 0))
@@ -1261,11 +1269,8 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             count_10m = 0
         market_scores[market] = overall_score
         trade_counts[market] = count_10m
-        if overall_score < BB_MIN_OVERALL_SCORE:
-            cnt_score_drop += 1
-            continue
 
-        if count_10m < BB_MIN_TRADE_COUNT_10M:
+        if count_10m < 25:
             cnt_trade_drop += 1
             continue
 
@@ -1273,12 +1278,13 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             "market": market,
             "price": Decimal(str(price)),
             "overall_score": overall_score,
+            "priority_score": p_score,
             "trade_count_10m": count_10m,
             "trade_count_1h": act.get("trade_count_1h", 0),
-            "recommendation": c.get("recommendation")
+            "recommendation": rec
         })
 
-    qualified.sort(key=lambda x: (x["overall_score"], x["trade_count_10m"]), reverse=True)
+    qualified.sort(key=lambda x: (x.get("priority_score", 0), x["overall_score"], x["trade_count_10m"]), reverse=True)
 
     _bb_patterns_cache["fetched_ts"] = now
     _bb_patterns_cache["last_server_updated"] = server_updated

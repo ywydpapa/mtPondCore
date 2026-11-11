@@ -1357,8 +1357,17 @@ class PositionState:
         cands = await get_intersection_candidates_safe()
         if not isinstance(cands, list):
             return []
+        try:
+            await fetch_rescue_market_ranks()
+            recommended = _rescue_rank_cache.get("recommended", set())
+        except Exception:
+            recommended = set()
         out = []
         for c in cands:
+            market = c.get("market")
+            # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
+            if not market or market not in recommended:
+                continue
             # INTERSECTION_MIN_SCORE를 percent(%) 기준으로 사용
             try:
                 pct = Decimal(str(c.get("expected_move_pct")))
@@ -2570,6 +2579,7 @@ _rescue_rank_cache: Dict[str, Any] = {
     "fetched_ts": 0.0,
     "scores": {},
     "trade_counts": {},
+    "recommended": set(),
 }
 
 
@@ -2597,6 +2607,7 @@ async def fetch_rescue_market_ranks() -> None:
 
     scores = {}
     trade_counts = {}
+    recommended = set()
     for coin in coins:
         if not isinstance(coin, dict):
             continue
@@ -2608,10 +2619,12 @@ async def fetch_rescue_market_ranks() -> None:
             trade_counts[market] = int(
                 (coin.get("trade_activity") or {}).get("trade_count_10m", 0)
             )
+            if coin.get("recommendation"):
+                recommended.add(market)
         except (TypeError, ValueError):
             continue
     _rescue_rank_cache.update(
-        fetched_ts=now, scores=scores, trade_counts=trade_counts
+        fetched_ts=now, scores=scores, trade_counts=trade_counts, recommended=recommended
     )
 
 

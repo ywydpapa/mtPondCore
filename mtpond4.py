@@ -852,27 +852,35 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     for c in coins:
         mkt = c.get("market", "")
         if not mkt.startswith("KRW-"): continue
+
+        # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
+        rec = c.get("recommendation")
+        if not rec or not isinstance(rec, dict): continue
+
         try:
             score = int(c.get("overall_score", 0))
             price = float(c.get("price", 0))
             trades = int((c.get("trade_activity") or {}).get("trade_count_10m", 0))
+            p_score = float(rec.get("priority_score", 0))
         except:
             continue
         market_scores[mkt] = score
         trade_counts[mkt] = trades
         if mkt in excluded: continue
 
-        if price < 30 or score < BB_MIN_OVERALL_SCORE or trades < BB_MIN_TRADE_COUNT_10M:
+        if price < 30 or trades < 25:
             continue
 
         qualified.append({
             "market": mkt,
             "price": Decimal(str(price)),
             "overall_score": score,
-            "trade_count_10m": trades
+            "priority_score": p_score,
+            "trade_count_10m": trades,
+            "recommendation": rec
         })
 
-    qualified.sort(key=lambda x: (x["overall_score"], x["trade_count_10m"]), reverse=True)
+    qualified.sort(key=lambda x: (x["priority_score"], x["overall_score"], x["trade_count_10m"]), reverse=True)
     _bb_patterns_cache["fetched_ts"] = now
     _bb_patterns_cache["candidates"] = qualified
     _bb_patterns_cache["market_scores"] = market_scores
