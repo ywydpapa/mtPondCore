@@ -630,13 +630,22 @@ def calculate_micro_tick_target(market: str, avg_price: Decimal) -> Tuple[Decima
     else:
         target_ticks = 3
 
-    raw_target = avg_price + (tick * Decimal(str(target_ticks)))
-    target_price = adjust_price_to_tick(raw_target, side="ask")
+    # 기본 호가 단위 기준 최소 목표가 산출
+    base_floor = adjust_price_to_tick(avg_price, side="floor")
+    target_price = adjust_price_to_tick(base_floor + (tick * Decimal(str(target_ticks))), side="ask")
     if target_price <= avg_price:
-        target_price = avg_price + (tick * Decimal("1"))
+        target_price = adjust_price_to_tick(avg_price + tick, side="ask")
+        if target_price <= avg_price:
+            target_price = avg_price + tick
 
+    # 수수료(0.10%) 고려 최소 이익률(MIN_TICK_PROFIT_PCT: 0.20%) 보장
     real_tp_pct = ((target_price - avg_price) / avg_price * Decimal("100")).quantize(Decimal("0.01"))
-    return target_price, real_tp_pct, target_ticks
+    while real_tp_pct < MIN_TICK_PROFIT_PCT:
+        target_price += tick
+        real_tp_pct = ((target_price - avg_price) / avg_price * Decimal("100")).quantize(Decimal("0.01"))
+
+    actual_ticks = int(round((target_price - base_floor) / tick))
+    return target_price, real_tp_pct, max(1, actual_ticks)
 
 
 async def place_micro_tick_limit_sell(
@@ -797,7 +806,7 @@ class PositionManager8:
                         item = json.loads(s_val)
                         real_avg = wallet_map[mkt]["avg_price"]
                         item["avg_price"] = real_avg if real_avg > 0 else Decimal(str(item.get("avg_price", "0")))
-                        for dec_k in ("target_price", "sell_vol", "avg_price"):
+                        for dec_k in ("target_price", "sell_vol", "avg_price", "last_buy_price"):
                             if item.get(dec_k) is not None:
                                 item[dec_k] = Decimal(str(item[dec_k]))
                         self.positions[mkt] = item
@@ -817,8 +826,11 @@ class PositionManager8:
                     print(f"  └ ⚠️ [500원 미만 보유 코인 감지] {mkt} → 전략 8 신규 편입 (평단: {avg_p}원, 수량: {w_info['total_vol']})")
                     new_state = {
                         "avg_price": avg_p,
+                        "last_buy_price": avg_p,
                         "entry_ts": time.time(),
+                        "last_buy_ts": time.time(),
                         "buy_count": 1,
+                        "reset_count": 0,
                     }
                     await self.save_position(mkt, new_state)
                     asyncio.create_task(
@@ -1097,19 +1109,82 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
 
                 pnl = ((cur_p - avg_p) / avg_p * Decimal("100")).quantize(Decimal("0.01"))
 
-                # ----------------------------------------------------
-                # [동적 범위 이탈 리셋 감지]:
-                # 가격이 하락하여 목표 지정가 범위를 벗어난 경우 (2틱 이상 하락 또는 PnL <= -0.8%)
-                # 기존 매도 주문을 취소하고 현재가 기준 1틱 위에 매도를 재배치하여 손실 확대 방지
-                # ----------------------------------------------------
                 tick = get_tick_unit(cur_p)
-                drop_ticks = (avg_p - cur_p) / tick if tick > 0 else Decimal("0")
                 now_ts = time.time()
+
+                last_buy_p = Decimal(str(state.get("last_buy_price", avg_p)))
+                buy_cnt = int(state.get("buy_count", 1))
+                last_buy_ts = float(state.get("last_buy_ts", state.get("entry_ts", now_ts)))
+
+                # ----------------------------------------------------
+                # [단계 A] 1틱 하락 가격변동 감지 시 추가 구매 진행 (Step-Down Additional Buy)
+                # - 가격변동이 없는 경우 (cur_p == last_buy_p): 추가 구매 안 하고 지정가 매도 체결 대기
+                # - 1틱이라도 하락하는 가격변동 발생 시 (cur_p <= last_buy_p - tick):
+                #   추가 구매 진행 -> 평단가 인하 -> 새로운 평단가 기준 즉시 선지정가 매도 재배치
+                # ----------------------------------------------------
+                drop_from_last = (last_buy_p - cur_p) / tick if tick > 0 else Decimal("0")
+
+                # 종목별 누적 투자 한도(limitAmt) 및 추가 매수 가능 횟수 산출
+                limit_krw = Decimal(str(db_setup.get("limitAmt", 100000)))
+                add_krw = db_setup.get("addAmt", ADDITIONAL_BUY_KRW)
+                init_krw = db_setup.get("buyAmt", INITIAL_BUY_KRW)
+
+                max_allowed_buys = int(os.getenv("MAX_ADDITIONAL_BUYS", "19"))
+                if add_krw > 0 and limit_krw > init_krw:
+                    calc_buys = int((limit_krw - init_krw) // add_krw)
+                    if calc_buys > 0:
+                        max_allowed_buys = min(max_allowed_buys, calc_buys)
+
+                current_invested = avg_p * total_vol
+                under_limit = (current_invested + add_krw) <= (limit_krw * Decimal("1.05"))
+
+                can_add_buy = (
+                    buy_cnt <= max_allowed_buys
+                    and under_limit
+                    and spendable_krw >= add_krw
+                    and (now_ts - last_buy_ts >= 10.0)
+                    and btc_status != "EMERGENCY"
+                )
+
+                if drop_from_last >= Decimal("1") and can_add_buy:
+                    async with get_market_lock(market):
+                        print(
+                            f"💧 [STEP-DOWN-BUY] {market} 1틱 하락 가격변동 감지!\n"
+                            f"  └ 직전매수가: {last_buy_p}원 -> 현재가: {cur_p}원 (-{drop_from_last:.0f}틱 하락)\n"
+                            f"  └ 추가 구매 {add_krw:,.0f}원 집행 (차수: {buy_cnt + 1}/{max_allowed_buys + 1}, 누적: {current_invested + add_krw:,.0f}/{limit_krw:,.0f}원)"
+                        )
+                        if LIVE_TRADING:
+                            await market_buy(upbit_api, access_key, secret_key, market, add_krw, UPBIT_ORDER_URL)
+                        await asyncio.sleep(0.8)
+
+                        accs_after = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
+                        target_acc = next((x for x in accs_after if x.get("currency") == market.split("-")[1]), None)
+                        if target_acc:
+                            new_tot = Decimal(str(target_acc.get("balance", "0"))) + Decimal(str(target_acc.get("locked", "0")))
+                            new_avg = Decimal(str(target_acc.get("avg_buy_price", "0")))
+                        else:
+                            new_tot = total_vol + (add_krw / cur_p).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
+                            new_avg = ((avg_p * total_vol) + add_krw) / new_tot
+
+                        state["buy_count"] = buy_cnt + 1
+                        state["last_buy_price"] = cur_p
+                        state["last_buy_ts"] = time.time()
+                        state["avg_price"] = new_avg
+                        await pm.save_position(market, state)
+                        await place_micro_tick_limit_sell(access_key, secret_key, market, state, new_tot, new_avg)
+                        spendable_krw -= add_krw
+                        continue
+
+                # ----------------------------------------------------
+                # [단계 B] 추가 매수 한도 소진 후 범위 이탈 시 동적 리셋 감지
+                # ----------------------------------------------------
+                drop_from_avg = (avg_p - cur_p) / tick if tick > 0 else Decimal("0")
                 last_reset_ts = float(state.get("last_reset_ts", state.get("entry_ts", now_ts)))
                 reset_cnt = int(state.get("reset_count", 0))
 
-                is_range_breached = (drop_ticks >= Decimal(str(RESET_DROP_TICKS)) or pnl <= RESET_DROP_PCT)
-                can_reset = (reset_cnt < MAX_RESETS and (now_ts - last_reset_ts >= RESET_COOLDOWN_SEC))
+                is_range_breached = (drop_from_avg >= Decimal(str(RESET_DROP_TICKS)) or pnl <= RESET_DROP_PCT)
+                exhausted_buys = (buy_cnt > max_allowed_buys or not under_limit)
+                can_reset = (exhausted_buys and reset_cnt < MAX_RESETS and (now_ts - last_reset_ts >= RESET_COOLDOWN_SEC))
 
                 if is_range_breached and can_reset:
                     async with get_market_lock(market):
@@ -1125,8 +1200,8 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                 dyn_hard_stop = limits["hard_stop"]
                 dyn_max_drop = limits["max_drop"]
 
-                # 손절 조건 검증 (리셋 한도 소진 후 추가 하락 또는 대폭락 감지 시)
-                is_hard_stop = bool(ENABLE_STOP and (reset_cnt >= MAX_RESETS) and pnl <= dyn_hard_stop)
+                # 손절 조건 검증 (추가 매수 및 리셋 한도 소진 후 추가 하락 또는 대폭락 감지 시)
+                is_hard_stop = bool(ENABLE_STOP and (exhausted_buys or reset_cnt >= MAX_RESETS) and pnl <= dyn_hard_stop)
                 is_max_drop = bool(ENABLE_STOP and pnl <= dyn_max_drop)
 
                 if is_hard_stop or is_max_drop:
@@ -1149,24 +1224,28 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
             # ========================================================
             # 2. 신규 500원 미만 동전주 탐색 및 진입
             #    [진입 제어]:
-            #    - 기존 보유 코인 중 3분(180초) 이상 미체결 정체 중인 코인이 있으면 신규 매수 보류
+            #    - 기존 보유 코인 중 가격변동 없이 3분(180초) 이상 미체결 정체 중인 코인이 있으면 신규 매수 보류
             #    - 무작정 시간 경과만으로 사들이지 않고 기존 포지션 회전을 기다림
             # ========================================================
             active_cnt = len(pm.positions)
             max_coins = db_setup["maxCoincnt"]
             now_ts = time.time()
 
-            # 보유 포지션 중 체결 지연/정체(3분 이상) 종목 조사
+            # 보유 포지션 중 체결 지연/정체(최근 활동 이후 3분 이상) 종목 조사
             stagnant_coins = []
             for m, s in pm.positions.items():
-                e_ts = float(s.get("entry_ts", now_ts))
-                if (now_ts - e_ts) >= STAGNANT_TIMEOUT_SEC:
+                last_act_ts = max(
+                    float(s.get("entry_ts", now_ts)),
+                    float(s.get("last_buy_ts", 0.0)),
+                    float(s.get("last_reset_ts", 0.0))
+                )
+                if (now_ts - last_act_ts) >= STAGNANT_TIMEOUT_SEC:
                     stagnant_coins.append(m)
 
             has_stagnant = len(stagnant_coins) > 0
 
             if has_stagnant and loop_cnt % 6 == 1:
-                print(f"⏳ [WAIT-STAGNANT] {stagnant_coins} 포지션이 3분 이상 미체결 대기 중 -> 신규 매수를 보류하고 체결/리셋을 기다립니다.")
+                print(f"⏳ [WAIT-STAGNANT] {stagnant_coins} 포지션이 가격변동 없이 3분 이상 미체결 대기 중 -> 신규 매수를 보류하고 체결/변동을 기다립니다.")
 
             # 비트코인 상태 NORMAL, 슬롯 여유, 자금 여유, 진입 주기 경과, [정체 포지션 없음] 시에만 진입
             if (
@@ -1209,16 +1288,23 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                         if target_acc:
                             new_tot = Decimal(str(target_acc.get("balance", "0"))) + Decimal(str(target_acc.get("locked", "0")))
                             new_avg = Decimal(str(target_acc.get("avg_buy_price", "0")))
-                            new_state = {
-                                "avg_price": new_avg,
-                                "entry_ts": time.time(),
-                                "buy_count": 1,
-                            }
-                            await pm.save_position(target_market, new_state)
-                            await place_micro_tick_limit_sell(access_key, secret_key, target_market, new_state, new_tot, new_avg)
-                            spendable_krw -= buy_krw
-                            _last_entry_ts = time.time()
-                            break
+                        else:
+                            new_avg = Decimal(str(cand["price"]))
+                            new_tot = (buy_krw / new_avg).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
+
+                        new_state = {
+                            "avg_price": new_avg,
+                            "last_buy_price": new_avg,
+                            "entry_ts": time.time(),
+                            "last_buy_ts": time.time(),
+                            "buy_count": 1,
+                            "reset_count": 0,
+                        }
+                        await pm.save_position(target_market, new_state)
+                        await place_micro_tick_limit_sell(access_key, secret_key, target_market, new_state, new_tot, new_avg)
+                        spendable_krw -= buy_krw
+                        _last_entry_ts = time.time()
+                        break
 
         except Exception as loop_err:
             print(f"[mtpond8][ERROR] 메인 루프 예외: {loop_err}")
