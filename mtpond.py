@@ -97,7 +97,7 @@ def get_engine_version(setup: dict[str, Any]) -> int:
     raw_version = setup.get("activeVer")
     if raw_version is None:
         raise ValueError(
-            "웹 설정에 activeVer 값이 없습니다. API 설정에 1~6 정수 값을 지정하세요."
+            "웹 설정에 activeVer 값이 없습니다. API 설정에 1~7 정수 값을 지정하세요."
         )
 
     try:
@@ -108,12 +108,12 @@ def get_engine_version(setup: dict[str, Any]) -> int:
         ) from exc
 
     if not version.is_finite() or version != version.to_integral_value():
-        raise ValueError(f"웹 설정 activeVer는 1~6 정수여야 합니다: {raw_version!r}")
+        raise ValueError(f"웹 설정 activeVer는 1~7 정수여야 합니다: {raw_version!r}")
 
     engine_version = int(version)
-    if engine_version not in range(1, 7):
+    if engine_version not in range(1, 8):
         raise ValueError(
-            f"지원하지 않는 activeVer={engine_version}; 1~6 중 하나를 선택하세요."
+            f"지원하지 않는 activeVer={engine_version}; 1~7 중 하나를 선택하세요."
         )
     return engine_version
 
