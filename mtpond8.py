@@ -507,6 +507,18 @@ async def cancel_all_orders(access_key: str, secret_key: str, market: str):
         print(f"[CANCEL][ERR] {market} 취소 실패: {e}")
 
 
+async def cancel_single_order(access_key: str, secret_key: str, order_uuid: str) -> bool:
+    """특정 UUID의 개별 주문만 단독 취소"""
+    if not order_uuid or str(order_uuid).startswith("dry-"):
+        return True
+    try:
+        await upbit_api("DELETE", "https://api.upbit.com/v1/order", access_key, secret_key, {"uuid": order_uuid})
+        return True
+    except Exception as e:
+        print(f"[CANCEL-ORDER][WARN] uuid={order_uuid} 취소 예외: {e}")
+        return False
+
+
 def get_tick_unit(price: Decimal) -> Decimal:
     """업비트 원화 마켓 공식 호가 단위 반환."""
     p = float(price)
@@ -648,6 +660,104 @@ def calculate_micro_tick_target(market: str, avg_price: Decimal) -> Tuple[Decima
     return target_price, real_tp_pct, max(1, actual_ticks)
 
 
+async def place_tranche_limit_sell(
+    access_key: str,
+    secret_key: str,
+    market: str,
+    volume: Decimal,
+    target_price: Decimal
+) -> Optional[str]:
+    """
+    [개별 트랜치 독립 매도 발주]
+    기존에 이미 등록되어 대기 중인 다른 트랜치 매도 주문들은 일체 취소하지 않고 건드리지 않으며,
+    새로 매수된 트랜치 물량(volume)에 대해서만 독립적인 선(先) 지정가 매도 주문을 발주한다.
+    """
+    if volume <= 0 or target_price <= 0:
+        return None
+
+    tradable = await get_upbit_tradable_markets()
+    if tradable and market not in tradable:
+        print(f"[TRANCHE-SELL][SKIP] {market} 거래 불가능한 마켓이므로 발주 건너뜀")
+        return None
+
+    sell_vol = quantize_volume(volume)
+    notional = sell_vol * target_price
+    if notional < MIN_ORDER_NOTIONAL_KRW:
+        print(f"[TRANCHE-SELL][WARN] {market} 최소 주문금액(5,000원) 미달: {notional:,.0f}원 (수량: {sell_vol})")
+        return None
+
+    order_uuid = None
+    if LIVE_TRADING:
+        try:
+            r = await upbit_api("POST", UPBIT_ORDER_URL, access_key, secret_key, {
+                "market": market, "side": "ask", "volume": str(sell_vol), "price": str(target_price), "ord_type": "limit"
+            })
+            order_uuid = r.get("uuid")
+        except Exception as e:
+            print(f"[TRANCHE-SELL][ERR] {market} 독립 지정가 매도 발주 실패: {e}")
+            return None
+    else:
+        order_uuid = f"dry-{uuid.uuid4().hex[:12]}"
+
+    return order_uuid
+
+
+async def reposition_tranches_limit_sell(
+    access_key: str,
+    secret_key: str,
+    market: str,
+    state: Dict[str, Any],
+    cur_p: Decimal
+) -> bool:
+    """
+    [동적 범위 이탈 리셋 (개별 트랜치 분리 유지)]
+    추가 매수가 한도에 도달한 상태에서 가격이 하락하여 목표 지정가 범위를 벗어난 경우:
+    현재가 대비 너무 높은 곳에 대기 중인 트랜치들의 매도 주문만 개별 취소하고,
+    현재가(cur_p) 기준 1틱 위로 각각 재배치하여 1호가 미세 반등 시 순차적 탈출 및 원금 회수를 실현한다.
+    """
+    tradable = await get_upbit_tradable_markets()
+    if tradable and market not in tradable:
+        return False
+
+    tick = get_tick_unit(cur_p)
+    new_target = adjust_price_to_tick(cur_p + tick, side="ask")
+    if new_target <= cur_p:
+        new_target = cur_p + tick
+
+    tranches = state.get("tranches", [])
+    active_tranches = [t for t in tranches if t.get("status") == "WAITING_SELL"]
+    if not active_tranches:
+        return False
+
+    reset_done = False
+    for t in active_tranches:
+        old_target = Decimal(str(t.get("target_price", 0)))
+        if old_target > (new_target + tick):
+            old_uuid = t.get("sell_uuid")
+            if old_uuid:
+                await cancel_single_order(access_key, secret_key, old_uuid)
+                await asyncio.sleep(0.1)
+
+            t_vol = Decimal(str(t.get("volume", 0)))
+            new_uuid = await place_tranche_limit_sell(access_key, secret_key, market, t_vol, new_target)
+            if new_uuid:
+                t["target_price"] = str(new_target)
+                t["sell_uuid"] = new_uuid
+                t["reset_count"] = t.get("reset_count", 0) + 1
+                reset_done = True
+                print(
+                    f"🔄 [DYNAMIC-RESET] {market} 트랜치 #{t['id']} 독립 리셋 완료!\n"
+                    f"  └ 기존 목표가: {old_target}원 -> 신규 목표가: {new_target}원 (+1틱)\n"
+                    f"  └ 1호가 미세 반등 시 독립 체결되어 현금 회수 가능"
+                )
+
+    if reset_done:
+        state["reset_count"] = state.get("reset_count", 0) + 1
+        state["last_reset_ts"] = time.time()
+        return True
+    return False
+
+
 async def place_micro_tick_limit_sell(
     access_key: str,
     secret_key: str,
@@ -762,10 +872,7 @@ class PositionManager8:
 
     async def save_position(self, market: str, state: Dict[str, Any]):
         self.positions[market] = state
-        serialized = {}
-        for k, v in state.items():
-            serialized[k] = str(v) if isinstance(v, Decimal) else v
-        await self.r.hset(self.get_redis_key(), market, json.dumps(serialized))
+        await self.r.hset(self.get_redis_key(), market, json.dumps(state, default=str))
 
     async def remove_position(self, market: str):
         if market in self.positions:
@@ -809,8 +916,21 @@ class PositionManager8:
                         for dec_k in ("target_price", "sell_vol", "avg_price", "last_buy_price"):
                             if item.get(dec_k) is not None:
                                 item[dec_k] = Decimal(str(item[dec_k]))
+                        # 트랜치 목록 복원 및 하위 호환
+                        if "tranches" not in item or not isinstance(item["tranches"], list):
+                            item["tranches"] = [{
+                                "id": 1,
+                                "buy_price": str(item["avg_price"]),
+                                "volume": str(wallet_map[mkt]["total_vol"]),
+                                "target_price": str(item.get("target_price", item["avg_price"])),
+                                "target_ticks": item.get("target_ticks", 1),
+                                "target_tp_pct": str(item.get("target_tp_pct", "0.5")),
+                                "sell_uuid": item.get("sell_order_uuid"),
+                                "buy_ts": item.get("entry_ts", time.time()),
+                                "status": "WAITING_SELL"
+                            }]
                         self.positions[mkt] = item
-                        print(f"  └ [포지션 복원] {mkt} (평단: {item['avg_price']}원 | 잔고: {wallet_map[mkt]['total_vol']})")
+                        print(f"  └ [포지션 복원] {mkt} (평단: {item['avg_price']}원 | 잔고: {wallet_map[mkt]['total_vol']} | 트랜치: {len(item.get('tranches', []))}개)")
                     except Exception as exc:
                         print(f"[RESTORE][WARN] {mkt} 파싱 실패: {exc}")
                 else:
@@ -824,6 +944,17 @@ class PositionManager8:
                 avg_p = w_info["avg_price"]
                 if avg_p <= MAX_TARGET_PRICE:
                     print(f"  └ ⚠️ [500원 미만 보유 코인 감지] {mkt} → 전략 8 신규 편입 (평단: {avg_p}원, 수량: {w_info['total_vol']})")
+                    target_p, tp_pct, ticks = calculate_micro_tick_target(mkt, avg_p)
+                    open_orders = await upbit_api(
+                        "GET", "https://api.upbit.com/v1/orders", access_key, secret_key,
+                        {"market": mkt, "state": "wait"}
+                    )
+                    sell_uuid = None
+                    if open_orders and isinstance(open_orders, list) and len(open_orders) > 0:
+                        sell_uuid = open_orders[0].get("uuid")
+                    else:
+                        sell_uuid = await place_tranche_limit_sell(access_key, secret_key, mkt, w_info["total_vol"], target_p)
+
                     new_state = {
                         "avg_price": avg_p,
                         "last_buy_price": avg_p,
@@ -831,11 +962,21 @@ class PositionManager8:
                         "last_buy_ts": time.time(),
                         "buy_count": 1,
                         "reset_count": 0,
+                        "tranches": [
+                            {
+                                "id": 1,
+                                "buy_price": str(avg_p),
+                                "volume": str(w_info["total_vol"]),
+                                "target_price": str(target_p),
+                                "target_ticks": ticks,
+                                "target_tp_pct": str(tp_pct),
+                                "sell_uuid": sell_uuid,
+                                "buy_ts": time.time(),
+                                "status": "WAITING_SELL"
+                            }
+                        ]
                     }
                     await self.save_position(mkt, new_state)
-                    asyncio.create_task(
-                        place_micro_tick_limit_sell(access_key, secret_key, mkt, new_state, w_info["total_vol"], avg_p)
-                    )
 
         print(f"✅ [RESTORE-COMPLETE] mtpond8 복원 완료. 관리 포지션: {list(self.positions.keys())}")
 
@@ -1086,15 +1227,9 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                 state = pm.positions[market]
                 w_info = wallet_map.get(market)
 
-                # 거래소에서 이미 전량 매도(익절) 체결 완료된 경우
+                # 거래소에서 잔고가 완전히 0이 된 경우 (외부 매도 또는 전량 정리)
                 if not w_info or w_info["total_vol"] <= Decimal("0.000001"):
-                    reset_cnt = int(state.get("reset_count", 0))
-                    if reset_cnt > 0:
-                        print(f"🎉 [RESET-EXIT] {market} 동적 리셋 매도 체결 확인! (소액 방어로 손실 확대 차단 성공, 자금 회수) -> 상태 제거")
-                    else:
-                        tp_pct = state.get("target_tp_pct", "0.5")
-                        ticks = state.get("target_ticks", 1)
-                        print(f"🎉 [MICRO-SCALP-TP] {market} {ticks}틱 초고속 익절 완료 (+{tp_pct}%)! -> 상태 제거 및 자금 회수")
+                    print(f"🎉 [CLEARED-EXIT] {market} 전체 잔고 소진 확인 -> 포지션 정리 및 자금 회수")
                     await pm.remove_position(market)
                     pm.set_cooldown(market, is_tp=True)
                     continue
@@ -1108,21 +1243,72 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                     continue
 
                 pnl = ((cur_p - avg_p) / avg_p * Decimal("100")).quantize(Decimal("0.01"))
-
                 tick = get_tick_unit(cur_p)
                 now_ts = time.time()
 
-                last_buy_p = Decimal(str(state.get("last_buy_price", avg_p)))
-                buy_cnt = int(state.get("buy_count", 1))
+                # ----------------------------------------------------
+                # [독립 트랜치 관리]: 각 매수 건별 체결 여부 개별 감지
+                # 목적: 하락 중에도 순간 반등 시 해당 트랜치만 즉시 이익 취득 & 현금 회수
+                # ----------------------------------------------------
+                tranches = state.get("tranches", [])
+                active_tranches = [t for t in tranches if t.get("status") == "WAITING_SELL"]
+
+                if LIVE_TRADING and active_tranches:
+                    try:
+                        open_orders = await upbit_api(
+                            "GET", "https://api.upbit.com/v1/orders", access_key, secret_key,
+                            {"market": market, "state": "wait"}
+                        )
+                        open_uuids = {o["uuid"] for o in open_orders if isinstance(o, dict) and o.get("uuid")}
+                        for t in active_tranches:
+                            u = t.get("sell_uuid")
+                            if u and u not in open_uuids:
+                                try:
+                                    od = await upbit_api("GET", "https://api.upbit.com/v1/order", access_key, secret_key, {"uuid": u})
+                                    if od.get("state") == "done":
+                                        t["status"] = "DONE"
+                                        t["done_ts"] = time.time()
+                                        print(
+                                            f"🎉 [TRANCHE-TP] {market} 트랜치 #{t['id']} 독립 선(先)지정가 매도 체결 완료!\n"
+                                            f"  └ 매수: {t.get('buy_price')}원 -> 매도: {t.get('target_price')}원 (+{t.get('target_tp_pct')}%) | 독립 이익 실현 & 현금 회수 완료!"
+                                        )
+                                    elif od.get("state") == "cancel":
+                                        t["status"] = "CANCELLED"
+                                except Exception as ord_err:
+                                    print(f"[TRANCHE-CHECK][WARN] {u} 상태 조회 예외: {ord_err}")
+                    except Exception as e:
+                        print(f"[ORDERS-CHECK][WARN] {market} 주문 목록 조회 실패: {e}")
+                elif (not LIVE_TRADING) and active_tranches:
+                    for t in active_tranches:
+                        tp = Decimal(str(t.get("target_price", "0")))
+                        if cur_p >= tp:
+                            t["status"] = "DONE"
+                            t["done_ts"] = time.time()
+                            print(
+                                f"🎉 [DRY-TRANCHE-TP] {market} 트랜치 #{t['id']} 모의 독립 익절 체결 완료!\n"
+                                f"  └ 매수: {t.get('buy_price')}원 -> 매도: {tp}원 (+{t.get('target_tp_pct')}%) | 가상 이익 실현 & 현금 회수!"
+                            )
+
+                # 체결 후 남은 활성 트랜치 갱신
+                active_tranches = [t for t in tranches if t.get("status") == "WAITING_SELL"]
+                if tranches and not active_tranches:
+                    print(f"🎊 [ALL-TRANCHES-CLEARED] {market} 모든 투입 거래 독립 익절 완료! 포지션 완전 종료 및 쿨다운 진입")
+                    await pm.remove_position(market)
+                    pm.set_cooldown(market, is_tp=True)
+                    continue
+
+                # 활성 트랜치 중 가장 낮은 매수가격 산출 (가격 변동 기준선)
+                lowest_buy_p = min([Decimal(str(t["buy_price"])) for t in active_tranches], default=Decimal(str(state.get("last_buy_price", avg_p))))
+                buy_cnt = int(state.get("buy_count", len(tranches) if tranches else 1))
                 last_buy_ts = float(state.get("last_buy_ts", state.get("entry_ts", now_ts)))
 
                 # ----------------------------------------------------
-                # [단계 A] 1틱 하락 가격변동 감지 시 추가 구매 진행 (Step-Down Additional Buy)
-                # - 가격변동이 없는 경우 (cur_p == last_buy_p): 추가 구매 안 하고 지정가 매도 체결 대기
-                # - 1틱이라도 하락하는 가격변동 발생 시 (cur_p <= last_buy_p - tick):
-                #   추가 구매 진행 -> 평단가 인하 -> 새로운 평단가 기준 즉시 선지정가 매도 재배치
+                # [단계 A] 1틱 하락 가격변동 감지 시 독립 추가 구매 (Independent Step-Down Buy)
+                # - 가격변동이 없는 경우 (cur_p == lowest_buy_p): 추가 구매 안 하고 기존 지정가 매도 체결 대기
+                # - 1틱이라도 하락하는 가격변동 발생 시 (cur_p <= lowest_buy_p - tick):
+                #   새로운 독립 매수 집행 -> 해당 매수가 기준 독립 선지정가 매도 등록 (기존 상위 주문 유지!)
                 # ----------------------------------------------------
-                drop_from_last = (last_buy_p - cur_p) / tick if tick > 0 else Decimal("0")
+                drop_from_last = (lowest_buy_p - cur_p) / tick if tick > 0 else Decimal("0")
 
                 # 종목별 누적 투자 한도(limitAmt) 및 추가 매수 가능 횟수 산출
                 limit_krw = Decimal(str(db_setup.get("limitAmt", 100000)))
@@ -1148,10 +1334,11 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
 
                 if drop_from_last >= Decimal("1") and can_add_buy:
                     async with get_market_lock(market):
+                        next_tranche_id = max([t.get("id", 0) for t in tranches], default=0) + 1
                         print(
-                            f"💧 [STEP-DOWN-BUY] {market} 1틱 하락 가격변동 감지!\n"
-                            f"  └ 직전매수가: {last_buy_p}원 -> 현재가: {cur_p}원 (-{drop_from_last:.0f}틱 하락)\n"
-                            f"  └ 추가 구매 {add_krw:,.0f}원 집행 (차수: {buy_cnt + 1}/{max_allowed_buys + 1}, 누적: {current_invested + add_krw:,.0f}/{limit_krw:,.0f}원)"
+                            f"💧 [INDEPENDENT-STEP-BUY] {market} 1틱 하락 가격변동 감지!\n"
+                            f"  └ 최저매수가: {lowest_buy_p}원 -> 현재가: {cur_p}원 (-{drop_from_last:.0f}틱 하락)\n"
+                            f"  └ 트랜치 #{next_tranche_id} 독립 추가 구매 {add_krw:,.0f}원 집행 (차수: {buy_cnt + 1}/{max_allowed_buys + 1}, 누적: {current_invested + add_krw:,.0f}/{limit_krw:,.0f}원)"
                         )
                         if LIVE_TRADING:
                             await market_buy(upbit_api, access_key, secret_key, market, add_krw, UPBIT_ORDER_URL)
@@ -1160,23 +1347,48 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                         accs_after = await upbit_api("GET", "https://api.upbit.com/v1/accounts", access_key, secret_key)
                         target_acc = next((x for x in accs_after if x.get("currency") == market.split("-")[1]), None)
                         if target_acc:
-                            new_tot = Decimal(str(target_acc.get("balance", "0"))) + Decimal(str(target_acc.get("locked", "0")))
+                            # 기존 주문 물량은 locked에 있으므로 이번 매수 물량은 balance에 위치
+                            new_tranche_vol = Decimal(str(target_acc.get("balance", "0")))
+                            if new_tranche_vol <= Decimal("0"):
+                                new_tranche_vol = (add_krw / cur_p).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
                             new_avg = Decimal(str(target_acc.get("avg_buy_price", "0")))
                         else:
-                            new_tot = total_vol + (add_krw / cur_p).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
-                            new_avg = ((avg_p * total_vol) + add_krw) / new_tot
+                            new_tranche_vol = (add_krw / cur_p).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
+                            new_avg = ((avg_p * total_vol) + add_krw) / (total_vol + new_tranche_vol)
 
+                        # 이번 트랜치 매수가격(cur_p) 기준 독립 목표가 산출
+                        new_target_p, new_tp_pct, new_ticks = calculate_micro_tick_target(market, cur_p)
+
+                        # [독립 매도 발주] 기존 상위 매도 주문은 일체 취소하지 않고 신규 물량만 별도 주문 등록
+                        new_sell_uuid = await place_tranche_limit_sell(access_key, secret_key, market, new_tranche_vol, new_target_p)
+
+                        new_t_entry = {
+                            "id": next_tranche_id,
+                            "buy_price": str(cur_p),
+                            "volume": str(new_tranche_vol),
+                            "target_price": str(new_target_p),
+                            "target_ticks": new_ticks,
+                            "target_tp_pct": str(new_tp_pct),
+                            "sell_uuid": new_sell_uuid,
+                            "buy_ts": time.time(),
+                            "status": "WAITING_SELL"
+                        }
+                        state.setdefault("tranches", []).append(new_t_entry)
                         state["buy_count"] = buy_cnt + 1
                         state["last_buy_price"] = cur_p
                         state["last_buy_ts"] = time.time()
                         state["avg_price"] = new_avg
                         await pm.save_position(market, state)
-                        await place_micro_tick_limit_sell(access_key, secret_key, market, state, new_tot, new_avg)
+
+                        print(
+                            f"  └ 🎯 트랜치 #{next_tranche_id} 독립 선(先)지정가 매도 등록 완료: {new_tranche_vol}개 @ {new_target_p}원 (+{new_tp_pct}% / {new_ticks}틱)\n"
+                            f"  └ 📌 기존 상위 매도 주문들은 그대로 유지됨 (총 {len(active_tranches) + 1}개 독립 매도 분리 대기 중)"
+                        )
                         spendable_krw -= add_krw
                         continue
 
                 # ----------------------------------------------------
-                # [단계 B] 추가 매수 한도 소진 후 범위 이탈 시 동적 리셋 감지
+                # [단계 B] 추가 매수 한도 소진 후 범위 이탈 시 동적 리셋 감지 (개별 트랜치 유지)
                 # ----------------------------------------------------
                 drop_from_avg = (avg_p - cur_p) / tick if tick > 0 else Decimal("0")
                 last_reset_ts = float(state.get("last_reset_ts", state.get("entry_ts", now_ts)))
@@ -1188,8 +1400,8 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
 
                 if is_range_breached and can_reset:
                     async with get_market_lock(market):
-                        success = await reposition_micro_tick_limit_sell(
-                            access_key, secret_key, market, state, cur_p, total_vol, avg_p
+                        success = await reposition_tranches_limit_sell(
+                            access_key, secret_key, market, state, cur_p
                         )
                         if success:
                             await pm.save_position(market, state)
@@ -1292,6 +1504,9 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                             new_avg = Decimal(str(cand["price"]))
                             new_tot = (buy_krw / new_avg).quantize(Decimal("0.00000001"), rounding=ROUND_FLOOR)
 
+                        target_p, tp_pct, ticks = calculate_micro_tick_target(target_market, new_avg)
+                        sell_uuid = await place_tranche_limit_sell(access_key, secret_key, target_market, new_tot, target_p)
+
                         new_state = {
                             "avg_price": new_avg,
                             "last_buy_price": new_avg,
@@ -1299,9 +1514,24 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                             "last_buy_ts": time.time(),
                             "buy_count": 1,
                             "reset_count": 0,
+                            "tranches": [
+                                {
+                                    "id": 1,
+                                    "buy_price": str(new_avg),
+                                    "volume": str(new_tot),
+                                    "target_price": str(target_p),
+                                    "target_ticks": ticks,
+                                    "target_tp_pct": str(tp_pct),
+                                    "sell_uuid": sell_uuid,
+                                    "buy_ts": time.time(),
+                                    "status": "WAITING_SELL"
+                                }
+                            ]
                         }
                         await pm.save_position(target_market, new_state)
-                        await place_micro_tick_limit_sell(access_key, secret_key, target_market, new_state, new_tot, new_avg)
+                        print(
+                            f"  └ 🎯 트랜치 #1 독립 선(先)지정가 매도 등록: {new_tot}개 @ {target_p}원 (+{tp_pct}% / {ticks}틱)"
+                        )
                         spendable_krw -= buy_krw
                         _last_entry_ts = time.time()
                         break
