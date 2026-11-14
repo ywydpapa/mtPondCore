@@ -947,13 +947,17 @@ async def get_15m_candles(market: str, count: int = 22) -> List[Dict[str, Any]]:
     return []
 
 
-async def check_15m_uptrend_or_range(market: str) -> Tuple[bool, str]:
+async def check_15m_uptrend_or_range(
+    market: str,
+    candles: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[bool, str]:
     """
     [15분봉 상위 추세 필터 - 떨어지는 칼날 배제]
     - 현재가가 15분봉 20 이동평균선(MA20) 대비 1.5% 이상 하회 중이면 계단식 하락장으로 판별하여 진입 차단.
     - 최근 1시간(15분봉 4개) 누적 하락률이 -2.5% 이하인 종목 배제.
     """
-    candles = await get_15m_candles(market, count=22)
+    if candles is None:
+        candles = await get_15m_candles(market, count=22)
     if not candles or len(candles) < 20:
         return True, "15M_DATA_INSUFFICIENT_SKIP"
 
@@ -995,7 +999,7 @@ def evaluate_3m_reversal(candles: List[Dict[str, Any]]) -> Tuple[bool, str]:
 
         p1_close = Decimal(str(c1["trade_price"]))
         p1_open = Decimal(str(c1["opening_price"]))
-        p1_high = Decimal(str(c1["high_price"]))
+        p1_high = Decimal(str(c1.get("high_price", c1.get("trade_price"))))
 
         p2_close = Decimal(str(c2["trade_price"]))
 
@@ -1402,7 +1406,11 @@ async def run_mtpond8_engine(user_no: int, server_no: int):
                 dyn_max_drop = limits["max_drop"]
 
                 # 손절 조건 검증 (추가 매수 한도 소진 후 하드 손절선 도달 또는 대폭락 감지 시)
-                is_hard_stop = bool(ENABLE_STOP and (exhausted_buys or reset_cnt >= MAX_RESETS) and pnl <= dyn_hard_stop)
+                is_hard_stop = bool(
+                    ENABLE_STOP
+                    and (exhausted_buys or (MAX_RESETS > 0 and reset_cnt >= MAX_RESETS))
+                    and pnl <= dyn_hard_stop
+                )
                 is_max_drop = bool(ENABLE_STOP and pnl <= dyn_max_drop)
 
                 if is_hard_stop or is_max_drop:
