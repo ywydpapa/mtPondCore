@@ -4,7 +4,7 @@ import os
 import time
 import httpx
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Awaitable, Callable, Optional, Dict
+from typing import Any, Awaitable, Callable, Optional, Dict, Set, Tuple, List
 
 _VOLATILITY_CACHE: Dict[str, Dict[str, Any]] = {}
 VOLATILITY_CACHE_TTL_SEC = 300  # 5분 캐시
@@ -179,3 +179,218 @@ async def register_loss_cut(
         print(f"[LOSS-CUT-API] {market} 손절 기록 저장 완료")
     except httpx.HTTPError as error:
         print(f"[LOSS-CUT-API][ERR] {market} 손절 기록 저장 실패: {error}")
+
+
+# ============================================================
+# 업비트 거래 가능 마켓 캐싱
+# ============================================================
+_TRADABLE_MARKETS_SET: Set[str] = set()
+_TRADABLE_MARKETS_TS: float = 0.0
+_TRADABLE_MARKETS_CACHE_TTL_SEC: float = 1800.0  # 30분 캐시
+
+
+async def get_upbit_tradable_markets(
+    force: bool = False,
+    client: Optional[httpx.AsyncClient] = None
+) -> Set[str]:
+    """업비트 전체 마켓 중 현재 거래 가능한(상장폐지/거래정지 제외) KRW 마켓 목록을 조회하여 캐싱."""
+    global _TRADABLE_MARKETS_SET, _TRADABLE_MARKETS_TS
+    now = time.time()
+    if (not force) and _TRADABLE_MARKETS_SET and (now - _TRADABLE_MARKETS_TS < _TRADABLE_MARKETS_CACHE_TTL_SEC):
+        return set(_TRADABLE_MARKETS_SET)
+
+    url = "https://api.upbit.com/v1/market/all?isDetails=true"
+    try:
+        if client is not None:
+            res = await client.get(url, timeout=5.0)
+        else:
+            async with httpx.AsyncClient(timeout=5.0) as local_client:
+                res = await local_client.get(url)
+
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                valid = {
+                    item["market"] for item in data
+                    if isinstance(item, dict)
+                    and item.get("market", "").startswith("KRW-")
+                    and item.get("market_warning") != "DELISTING"
+                }
+                if valid:
+                    _TRADABLE_MARKETS_SET = valid
+                    _TRADABLE_MARKETS_TS = now
+                    return set(valid)
+    except Exception as e:
+        print(f"[MARKETS][WARN] 업비트 마켓 목록 조회 실패: {e}")
+
+    return set(_TRADABLE_MARKETS_SET)
+
+
+# ============================================================
+# 3분봉 / 15분봉 캔들 조회 및 캐싱
+# ============================================================
+_candle_3m_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+CANDLE_3M_CACHE_TTL = 3.0
+
+_candle_15m_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+CANDLE_15M_CACHE_TTL = 15.0
+
+
+async def get_3m_candles(
+    market: str,
+    count: int = 8,
+    client: Optional[httpx.AsyncClient] = None
+) -> List[Dict[str, Any]]:
+    """업비트 3분봉 캔들 데이터 조회 (캐시 3초)"""
+    now = time.time()
+    cached = _candle_3m_cache.get(market)
+    if cached and (now - cached[0]) < CANDLE_3M_CACHE_TTL:
+        return cached[1]
+
+    url = "https://api.upbit.com/v1/candles/minutes/3"
+    try:
+        if client is not None:
+            res = await client.get(url, params={"market": market, "count": count}, timeout=4.0)
+        else:
+            async with httpx.AsyncClient(timeout=4.0) as local_client:
+                res = await local_client.get(url, params={"market": market, "count": count})
+
+        if res.status_code == 200:
+            candles = res.json()
+            if isinstance(candles, list):
+                _candle_3m_cache[market] = (now, candles)
+                return candles
+    except Exception as e:
+        print(f"[CANDLE-3M][WARN] {market} 3분봉 조회 실패: {e}")
+    return []
+
+
+async def get_15m_candles(
+    market: str,
+    count: int = 22,
+    client: Optional[httpx.AsyncClient] = None
+) -> List[Dict[str, Any]]:
+    """업비트 15분봉 캔들 데이터 조회 (캐시 15초)"""
+    now = time.time()
+    cached = _candle_15m_cache.get(market)
+    if cached and (now - cached[0]) < CANDLE_15M_CACHE_TTL:
+        return cached[1]
+
+    url = "https://api.upbit.com/v1/candles/minutes/15"
+    try:
+        if client is not None:
+            res = await client.get(url, params={"market": market, "count": count}, timeout=4.0)
+        else:
+            async with httpx.AsyncClient(timeout=4.0) as local_client:
+                res = await local_client.get(url, params={"market": market, "count": count})
+
+        if res.status_code == 200:
+            candles = res.json()
+            if isinstance(candles, list):
+                _candle_15m_cache[market] = (now, candles)
+                return candles
+    except Exception as e:
+        print(f"[CANDLE-15M][WARN] {market} 15분봉 조회 실패: {e}")
+    return []
+
+
+# ============================================================
+# 15분봉 상위 추세 필터 - 떨어지는 칼날 배제
+# ============================================================
+async def check_15m_uptrend_or_range(
+    market: str,
+    candles: Optional[List[Dict[str, Any]]] = None,
+    client: Optional[httpx.AsyncClient] = None
+) -> Tuple[bool, str]:
+    """
+    [15분봉 상위 추세 필터 - 떨어지는 칼날 배제]
+    - 현재가가 15분봉 20 이동평균선(MA20) 대비 1.5% 이상 하회 중이면 계단식 하락장으로 판별하여 진입 차단.
+    - 최근 1시간(15분봉 4개) 누적 하락률이 -2.5% 이하인 종목 배제.
+    """
+    if candles is None:
+        candles = await get_15m_candles(market, count=22, client=client)
+    if not candles or len(candles) < 20:
+        return True, "15M_DATA_INSUFFICIENT_SKIP"
+
+    try:
+        cur_p = Decimal(str(candles[0]["trade_price"]))
+        prev_1h_p = Decimal(str(candles[4]["trade_price"]))
+        closes_20 = [Decimal(str(c["trade_price"])) for c in candles[:20]]
+        ma20 = sum(closes_20) / Decimal("20")
+
+        pnl_1h = ((cur_p - prev_1h_p) / prev_1h_p) * Decimal("100")
+        if pnl_1h <= Decimal("-2.5"):
+            return False, f"15분봉 기준 1시간 급락 진행 중 ({pnl_1h:.2f}%)"
+
+        if cur_p < (ma20 * Decimal("0.985")):
+            return False, f"15분봉 MA20 하향 이탈 상태 ({cur_p} < {ma20:.4f})"
+
+        return True, "15분봉 횡보/상승 추세 양호"
+    except Exception as e:
+        return True, f"15M_EVAL_SKIP({e})"
+
+
+# ============================================================
+# 3분봉 장악형 양봉 반전 신호 검증
+# ============================================================
+def evaluate_3m_reversal(candles: List[Dict[str, Any]]) -> Tuple[bool, str]:
+    """
+    [강화된 3분봉 장악형 반전/반등 신호 순수 평가 함수]
+    - 단순 1틱짜리 데드캣 바운스(숨고르기 양봉)를 걸러내기 위해 다음 조건을 모두 충족해야 반등으로 인정:
+      1. 현재 3분봉이 확실한 양봉(trade_price > opening_price)이어야 함.
+      2. 직전 3분봉이 음봉이었다면, 현재 양봉 종가가 직전 음봉의 시가(p1_open) 이상을 장악(돌파)해야 함.
+      3. 최근 3개 3분봉 종가 평균(MA3)을 상회해야 함.
+      4. 최근 5개 3분봉 중 음봉이 4개 이상인 극심한 투매 구간에서는 직전 봉 고가(p1_high)까지 돌파해야 인정.
+    """
+    if not candles or len(candles) < 5:
+        return False, "CANDLE_DATA_UNAVAILABLE"
+
+    try:
+        c0, c1, c2 = candles[0], candles[1], candles[2]
+
+        p0_close = Decimal(str(c0["trade_price"]))
+        p0_open = Decimal(str(c0["opening_price"]))
+
+        p1_close = Decimal(str(c1["trade_price"]))
+        p1_open = Decimal(str(c1["opening_price"]))
+        p1_high = Decimal(str(c1.get("high_price", c1.get("trade_price"))))
+
+        p2_close = Decimal(str(c2["trade_price"]))
+
+        # 1. 현재 3분봉이 확실한 양봉이어야 함 (시가 동일 도지/음봉 배제)
+        if p0_close <= p0_open:
+            return False, f"현재 3분봉 양봉 미전환 ({p0_close} <= {p0_open})"
+
+        # 2. 직전 봉이 음봉이었다면 직전 음봉의 몸통(시가) 이상을 장악해야 함
+        if p1_close < p1_open:
+            if p0_close < p1_open:
+                return False, f"직전 음봉 시가 미돌파 ({p0_close} < {p1_open})"
+
+        # 3. 3봉 종가 이동평균(MA3) 상회 검증
+        ma3 = (p0_close + p1_close + p2_close) / Decimal("3")
+        if p0_close <= ma3:
+            return False, f"3분봉 MA3 미달 ({p0_close} <= {ma3:.4f})"
+
+        # 4. 최근 5개 봉(c1~c5) 중 음봉이 4개 이상인 지속 투매 구간이면 직전 봉 고가(p1_high) 돌파까지 요구
+        recent_reds = sum(
+            1 for c in candles[1:6]
+            if Decimal(str(c["trade_price"])) < Decimal(str(c["opening_price"]))
+        )
+        if recent_reds >= 4 and p0_close <= p1_high:
+            return False, f"연속 투매(음봉 {recent_reds}개) 후 직전 고가({p1_high}) 미돌파"
+
+        return True, "3분봉 장악형 양봉 반전 확인"
+    except Exception as e:
+        return False, f"CANDLE_EVAL_ERROR({e})"
+
+
+async def check_3m_reversal_signal(
+    market: str,
+    candles: Optional[List[Dict[str, Any]]] = None,
+    client: Optional[httpx.AsyncClient] = None
+) -> Tuple[bool, str]:
+    """[3분봉 하락 연속 배제 및 반전/반등 신호 감지 비동기 래퍼]"""
+    if candles is None:
+        candles = await get_3m_candles(market, count=8, client=client)
+    return evaluate_3m_reversal(candles)
+

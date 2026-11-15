@@ -26,6 +26,12 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
     get_dynamic_stop_limits,
+    check_15m_uptrend_or_range,
+    check_3m_reversal_signal,
+    evaluate_3m_reversal,
+    get_3m_candles,
+    get_15m_candles,
+    get_upbit_tradable_markets,
 )
 from mtpond_config import (
     API_BASE,
@@ -792,29 +798,12 @@ async def check_btc_market_health() -> Dict[str, Any]:
 # 9. 상승 모멘텀 검증 (15분봉 정배열 & 실시간 양봉)
 # ============================================================
 async def check_bullish_momentum(market: str) -> bool:
-    url_15m = "https://api.upbit.com/v1/candles/minutes/15"
-    params = {"market": market, "count": 20}
-    try:
-        client = get_http_client()
-        resp = await client.get(url_15m, params=params)
-        if resp.status_code != 200:
-            return False
-        candles = resp.json()
-
-        if not candles or len(candles) < 20:
-            return False
-
-        cur_price = Decimal(str(candles[0]["trade_price"]))
-        open_price = Decimal(str(candles[0]["opening_price"]))
-
-        closes = [Decimal(str(c["trade_price"])) for c in candles]
-        ma5 = sum(closes[:5]) / Decimal("5")
-        ma20 = sum(closes[:20]) / Decimal("20")
-
-        return bool((cur_price >= ma5) and (ma5 > ma20) and (cur_price >= open_price))
-    except Exception as e:
-        print(f"[MOMENTUM][WARN] {market} 모멘텀 확인 실패: {e}")
+    """15분봉 상위 추세(급락/이탈 배제) 및 3분봉 장악형 양봉 반전 신호 종합 검증"""
+    trend_ok, _ = await check_15m_uptrend_or_range(market)
+    if not trend_ok:
         return False
+    rebound_ok, _ = await check_3m_reversal_signal(market)
+    return rebound_ok
 
 
 # ============================================================
@@ -833,16 +822,15 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     if (not force) and (now - _bb_patterns_cache["fetched_ts"] < BB_CACHE_TTL_SEC) and _bb_patterns_cache["candidates"]:
         return _bb_patterns_cache["candidates"]
 
+    tradable = await get_upbit_tradable_markets()
     try:
         client = get_http_client()
         resp = await client.get(BB_PATTERNS_API_URL)
-        if resp.status_code != 200: return _bb_patterns_cache["candidates"]
-        data = resp.json()
+        data = resp.json() if resp.status_code == 200 else {}
     except Exception:
-        return _bb_patterns_cache["candidates"]
+        data = {}
 
-    coins = data.get("coins", [])
-    if not isinstance(coins, list): return _bb_patterns_cache["candidates"]
+    coins = data.get("coins", []) if isinstance(data, dict) else []
 
     excluded = await get_excluded_markets()
     qualified = []
@@ -851,9 +839,9 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
 
     for c in coins:
         mkt = c.get("market", "")
-        if not mkt.startswith("KRW-"): continue
+        if not mkt.startswith("KRW-") or mkt in excluded: continue
+        if tradable and mkt not in tradable: continue
 
-        # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
         rec = c.get("recommendation")
         if not rec or not isinstance(rec, dict): continue
 
@@ -866,9 +854,9 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
             continue
         market_scores[mkt] = score
         trade_counts[mkt] = trades
-        if mkt in excluded: continue
 
-        if price < 30 or trades < 25:
+        # 체결 15건 이상 (완화), 30원 이상
+        if price < 30 or trades < 15:
             continue
 
         qualified.append({
@@ -881,6 +869,31 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
         })
 
     qualified.sort(key=lambda x: (x["priority_score"], x["overall_score"], x["trade_count_10m"]), reverse=True)
+
+    # 폴백: 패턴 미응답 시 실시간 거래대금 1.5억원 이상 종목 선별
+    if not qualified:
+        try:
+            client = get_http_client()
+            all_krw = [m for m in tradable if m.startswith("KRW-") and m not in excluded]
+            if all_krw:
+                r_tickers = await client.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(all_krw[:100])})
+                if r_tickers.status_code == 200:
+                    for t in r_tickers.json():
+                        p = float(t.get("trade_price", 0))
+                        vol_24h = float(t.get("acc_trade_price_24h", 0))
+                        if p >= 30 and vol_24h >= 150_000_000:
+                            qualified.append({
+                                "market": t["market"],
+                                "price": Decimal(str(p)),
+                                "overall_score": 80,
+                                "priority_score": 80.0,
+                                "trade_count_10m": int(vol_24h / 1e7),
+                                "recommendation": {"action": "BUY"}
+                            })
+                    qualified.sort(key=lambda x: x["trade_count_10m"], reverse=True)
+        except Exception:
+            pass
+
     _bb_patterns_cache["fetched_ts"] = now
     _bb_patterns_cache["candidates"] = qualified
     _bb_patterns_cache["market_scores"] = market_scores

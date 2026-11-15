@@ -42,6 +42,11 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
     get_dynamic_stop_limits,
+    check_15m_uptrend_or_range,
+    check_3m_reversal_signal,
+    evaluate_3m_reversal,
+    get_3m_candles,
+    get_15m_candles,
 )
 from mtpond_config import (
     API_BASE,
@@ -852,34 +857,16 @@ async def fetch_all_candle_patterns() -> List[Dict[str, Any]]:
 
 
 async def fetch_15m_rebound_signal(market: str) -> bool:
-    """15분봉 기준 양봉 및 5일선 골든크로스 반등 신호 검증"""
-    try:
-        url = "https://api.upbit.com/v1/candles/minutes/15"
-        client = get_http_client()
-        res = await client.get(url, params={"market": market, "count": 10})
-        if res.status_code != 200:
-            return False
-        candles = res.json()
-        if not candles or len(candles) < 6:
-            return False
-
-        cur_c = candles[0]
-        cur_p = Decimal(str(cur_c["trade_price"]))
-        open_p = Decimal(str(cur_c["opening_price"]))
-        # 양봉 확인
-        if cur_p < open_p:
-            return False
-
-        # 최근 5개봉 단기 MA 상회
-        closes = [Decimal(str(c["trade_price"])) for c in candles[:5]]
-        ma5 = sum(closes) / Decimal("5")
-        return cur_p >= ma5
-    except Exception:
+    """하위 호환용 래퍼: 15분봉 및 3분봉 장악형 반전 신호 종합 검증"""
+    trend_ok, _ = await check_15m_uptrend_or_range(market)
+    if not trend_ok:
         return False
+    rebound_ok, _ = await check_3m_reversal_signal(market)
+    return rebound_ok
 
 
 async def get_daily_1pct_candidates(excluded: Set[str]) -> List[Dict[str, Any]]:
-    """일일 1% 목표에 가장 적합한 거래 활성 및 양봉 반등 후보 종목 선별"""
+    """일일 1% 목표에 가장 적합한 거래 활성 및 양봉 반등 후보 종목 선별 (조건 완화 및 폴백 적용)"""
     patterns = await fetch_all_candle_patterns()
     tradable = await get_upbit_tradable_markets()
     candidates = []
@@ -900,8 +887,8 @@ async def get_daily_1pct_candidates(excluded: Set[str]) -> List[Dict[str, Any]]:
         except (ValueError, TypeError):
             continue
 
-        # 너무 무거운 코인(2백만원 이상)이나 동전주 미만(10원 이하) 제외, 10분 체결 40건 이상
-        if 20 <= price <= 1_500_000 and trades >= 40 and v30 >= 0.8:
+        # 20원 이상 150만원 이하, 체결 15건 이상 (조건 완화로 풀 확대)
+        if 20 <= price <= 1_500_000 and trades >= 15:
             candidates.append({
                 "market": mkt,
                 "price": price,
@@ -912,6 +899,30 @@ async def get_daily_1pct_candidates(excluded: Set[str]) -> List[Dict[str, Any]]:
 
     # 체결 빈도 및 종합 점수 순 정렬
     candidates.sort(key=lambda x: (x["trades"], x["score"]), reverse=True)
+
+    # 폴백: 패턴 서버 응답 지연/후보 부족 시 업비트 실시간 거래대금 1.5억원 이상 종목 선별
+    if not candidates:
+        try:
+            client = get_http_client()
+            all_krw = [m for m in tradable if m.startswith("KRW-") and m not in excluded]
+            if all_krw:
+                r_tickers = await client.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(all_krw[:100])})
+                if r_tickers.status_code == 200:
+                    for t in r_tickers.json():
+                        p = float(t.get("trade_price", 0))
+                        vol_24h = float(t.get("acc_trade_price_24h", 0))
+                        if 20 <= p <= 1_500_000 and vol_24h >= 150_000_000:
+                            candidates.append({
+                                "market": t["market"],
+                                "price": p,
+                                "trades": int(vol_24h / 1e7),
+                                "score": 80,
+                                "v30": 2.0
+                            })
+                    candidates.sort(key=lambda x: x["trades"], reverse=True)
+        except Exception:
+            pass
+
     return candidates
 
 
@@ -1148,8 +1159,14 @@ async def run_mtpond7_engine(user_no: int, server_no: int):
                     ):
                         continue
 
-                    # 15분봉 단기 상승 반등 확인
-                    if not await fetch_15m_rebound_signal(target_market):
+                    # [신규 방어 1] 15분봉 상위 추세 검증 (떨어지는 칼날 사전 배제)
+                    trend_ok, trend_reason = await check_15m_uptrend_or_range(target_market)
+                    if not trend_ok:
+                        continue
+
+                    # [신규 방어 2] 3분봉 장악형 양봉 반전 신호 검증
+                    rebound_ok, rebound_reason = await check_3m_reversal_signal(target_market)
+                    if not rebound_ok:
                         continue
 
                     buy_krw = db_setup["buyAmt"]

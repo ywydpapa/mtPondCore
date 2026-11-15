@@ -26,6 +26,12 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
     get_dynamic_stop_limits,
+    check_15m_uptrend_or_range,
+    check_3m_reversal_signal,
+    evaluate_3m_reversal,
+    get_3m_candles,
+    get_15m_candles,
+    get_upbit_tradable_markets,
 )
 from mtpond_config import (
     API_BASE,
@@ -948,15 +954,16 @@ async def fetch_all_candle_patterns() -> List[Dict[str, Any]]:
 
 
 async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
-    """추세 스캘핑용: advisor의 5대 안전장치 및 마켓레짐을 통과한 엄선된 추천 종목(recommendation)만 추출"""
+    """추세 스캘핑용: advisor 추천 종목 선별 (조건 완화 및 폴백 적용)"""
     excluded = await get_excluded_markets()
+    tradable = await get_upbit_tradable_markets()
     coins = await fetch_all_candle_patterns()
     qualified = []
     for c in coins:
         mkt = c.get("market", "")
         if not mkt.startswith("KRW-") or mkt in excluded: continue
+        if tradable and mkt not in tradable: continue
 
-        # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
         rec = c.get("recommendation")
         if not rec or not isinstance(rec, dict):
             continue
@@ -969,7 +976,8 @@ async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
         except (ValueError, TypeError):
             continue
 
-        if trades >= 25 and price >= 30:
+        # 체결 15건 이상 (완화), 30원 이상
+        if trades >= 15 and price >= 30:
             qualified.append({
                 "market": mkt,
                 "overall_score": score,
@@ -980,17 +988,44 @@ async def get_trend_scalping_candidates() -> List[Dict[str, Any]]:
             })
 
     qualified.sort(key=lambda x: (x["priority_score"], x["overall_score"], x["trade_count"]), reverse=True)
+
+    # 폴백: 패턴 미응답 시 실시간 거래대금 1.5억원 이상 종목 선별
+    if not qualified:
+        try:
+            client = get_http_client()
+            all_krw = [m for m in tradable if m.startswith("KRW-") and m not in excluded]
+            if all_krw:
+                r_tickers = await client.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(all_krw[:100])})
+                if r_tickers.status_code == 200:
+                    for t in r_tickers.json():
+                        p = float(t.get("trade_price", 0))
+                        vol_24h = float(t.get("acc_trade_price_24h", 0))
+                        if p >= 30 and vol_24h >= 150_000_000:
+                            qualified.append({
+                                "market": t["market"],
+                                "overall_score": 80,
+                                "priority_score": 80.0,
+                                "trade_count": int(vol_24h / 1e7),
+                                "price": p,
+                                "recommendation": {"action": "BUY"}
+                            })
+                    qualified.sort(key=lambda x: x["trade_count"], reverse=True)
+        except Exception:
+            pass
+
     return qualified
 
 
 async def get_grid_active_candidates() -> List[Dict[str, Any]]:
     """그리드 하베스트용: 점수 무관, 10분 체결 빈도가 가장 높은 횡보형 종목 추출"""
     excluded = await get_excluded_markets()
+    tradable = await get_upbit_tradable_markets()
     coins = await fetch_all_candle_patterns()
     candidates = []
     for c in coins:
         mkt = c.get("market", "")
         if not mkt.startswith("KRW-") or mkt in excluded: continue
+        if tradable and mkt not in tradable: continue
         try:
             price = float(c.get("price", 0))
             trades = int((c.get("trade_activity") or {}).get("trade_count_10m", 0))
@@ -1009,27 +1044,19 @@ async def get_grid_active_candidates() -> List[Dict[str, Any]]:
 
 
 async def check_bullish_trend(market: str) -> bool:
-    """업비트 실시간 15분봉 정배열(5 > 20) & 양봉 재확인"""
-    try:
-        url = "https://api.upbit.com/v1/candles/minutes/15"
-        client = get_http_client()
-        res = await client.get(url, params={"market": market, "count": 20})
-        if res.status_code != 200: return False
-        candles = res.json()
-
-        cur_price = Decimal(str(candles[0]["trade_price"]))
-        open_price = Decimal(str(candles[0]["opening_price"]))
-        closes = [Decimal(str(c["trade_price"])) for c in candles]
-        ma5 = sum(closes[:5]) / Decimal("5")
-        ma20 = sum(closes[:20]) / Decimal("20")
-
-        return bool((cur_price >= ma5) and (ma5 > ma20) and (cur_price >= open_price))
-    except Exception:
+    """15분봉 상위 추세(급락/이탈 배제) 및 3분봉 장악형 양봉 반전 신호 종합 검증"""
+    trend_ok, _ = await check_15m_uptrend_or_range(market)
+    if not trend_ok:
         return False
+    rebound_ok, _ = await check_3m_reversal_signal(market)
+    return rebound_ok
 
 
 async def check_sideways_grid_candidate(market: str) -> bool:
-    """그리드용 15분봉 밴드폭(1.2% ~ 3.0%) 횡보성 확인"""
+    """그리드용 15분봉 상위 추세 확인 및 밴드폭(1.2% ~ 3.0%) 횡보성 확인"""
+    trend_ok, _ = await check_15m_uptrend_or_range(market)
+    if not trend_ok:
+        return False
     try:
         url = "https://api.upbit.com/v1/candles/minutes/15"
         client = get_http_client()
@@ -1038,6 +1065,12 @@ async def check_sideways_grid_candidate(market: str) -> bool:
         candles = res.json()
 
         closes = [float(c["trade_price"]) for c in candles]
+        mean = sum(closes) / len(closes)
+        std = math.sqrt(sum((x - mean) ** 2 for x in closes) / len(closes))
+        bandwidth_pct = ((4.0 * std) / mean) * 100.0
+        return bool(1.2 <= bandwidth_pct <= 3.0)
+    except Exception:
+        return False
         mean = sum(closes) / len(closes)
         std = math.sqrt(sum((x - mean) ** 2 for x in closes) / len(closes))
         bandwidth_pct = ((4.0 * std) / mean) * 100.0

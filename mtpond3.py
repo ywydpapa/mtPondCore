@@ -26,6 +26,12 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
     get_dynamic_stop_limits,
+    check_15m_uptrend_or_range,
+    check_3m_reversal_signal,
+    evaluate_3m_reversal,
+    get_3m_candles,
+    get_15m_candles,
+    get_upbit_tradable_markets,
 )
 from mtpond_config import (
     API_BASE,
@@ -858,16 +864,15 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     if not force and now - _bb_patterns_cache["fetched_ts"] < BB_CACHE_TTL_SEC:
         return _bb_patterns_cache["candidates"]
 
+    tradable = await get_upbit_tradable_markets()
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.get(BB_PATTERNS_API_URL)
-            if resp.status_code != 200: return _bb_patterns_cache["candidates"]
-            data = resp.json()
+            data = resp.json() if resp.status_code == 200 else {}
     except Exception:
-        return _bb_patterns_cache["candidates"]
+        data = {}
 
-    coins = data.get("coins", [])
-    if not isinstance(coins, list): return _bb_patterns_cache["candidates"]
+    coins = data.get("coins", []) if isinstance(data, dict) else []
 
     excluded = await get_excluded_markets()
     qualified = []
@@ -877,8 +882,8 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
     for c in coins:
         mkt = c.get("market", "")
         if not mkt.startswith("KRW-") or mkt in excluded: continue
+        if tradable and mkt not in tradable: continue
 
-        # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
         rec = c.get("recommendation")
         if not rec or not isinstance(rec, dict): continue
 
@@ -892,7 +897,9 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
 
         trade_counts[mkt] = trades
         market_scores[mkt] = score
-        if price < 30 or trades < 25:
+
+        # 체결 15건 이상 (완화), 30원 이상
+        if price < 30 or trades < 15:
             continue
 
         qualified.append({
@@ -905,6 +912,31 @@ async def fetch_bb_patterns_candidates(force: bool = False) -> List[Dict[str, An
         })
 
     qualified.sort(key=lambda x: (x["priority_score"], x["overall_score"], x["trade_count_10m"]), reverse=True)
+
+    # 폴백: 패턴 미응답 시 실시간 거래대금 1.5억원 이상 종목 선별
+    if not qualified:
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                all_krw = [m for m in tradable if m.startswith("KRW-") and m not in excluded]
+                if all_krw:
+                    r_tickers = await client.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(all_krw[:100])})
+                    if r_tickers.status_code == 200:
+                        for t in r_tickers.json():
+                            p = float(t.get("trade_price", 0))
+                            vol_24h = float(t.get("acc_trade_price_24h", 0))
+                            if p >= 30 and vol_24h >= 150_000_000:
+                                qualified.append({
+                                    "market": t["market"],
+                                    "price": Decimal(str(p)),
+                                    "overall_score": 80,
+                                    "priority_score": 80.0,
+                                    "trade_count_10m": int(vol_24h / 1e7),
+                                    "recommendation": {"action": "BUY"}
+                                })
+                        qualified.sort(key=lambda x: x["trade_count_10m"], reverse=True)
+        except Exception:
+            pass
+
     _bb_patterns_cache["fetched_ts"] = now
     _bb_patterns_cache["candidates"] = qualified
     _bb_patterns_cache["trade_counts"] = trade_counts
@@ -1297,6 +1329,16 @@ async def process_new_candidate_buys(
 
         market = item["market"]
         if market in excluded or ps.buy_info.get(market) or ps.recently_sold(market):
+            continue
+
+        # [신규 방어 1] 15분봉 상위 추세 검증 (떨어지는 칼날 사전 배제)
+        trend_ok, _ = await check_15m_uptrend_or_range(market)
+        if not trend_ok:
+            continue
+
+        # [신규 방어 2] 3분봉 장악형 양봉 반전 신호 검증
+        rebound_ok, _ = await check_3m_reversal_signal(market)
+        if not rebound_ok:
             continue
 
         analysis = await analyze_mtf_trend_and_target(market)

@@ -27,6 +27,12 @@ from mtpond_common import (
     quantize_volume,
     register_loss_cut as _register_loss_cut,
     get_dynamic_stop_limits,
+    check_15m_uptrend_or_range,
+    check_3m_reversal_signal,
+    evaluate_3m_reversal,
+    get_3m_candles,
+    get_15m_candles,
+    get_upbit_tradable_markets,
 )
 from mtpond_config import (
     API_BASE,
@@ -1362,11 +1368,14 @@ class PositionState:
             recommended = _rescue_rank_cache.get("recommended", set())
         except Exception:
             recommended = set()
+        tradable = await get_upbit_tradable_markets()
         out = []
         for c in cands:
             market = c.get("market")
             # [핵심] advisor의 안전 추천 필터를 통과하지 못한 코인은 매수 완전 배제
-            if not market or market not in recommended:
+            if not market or (recommended and market not in recommended):
+                continue
+            if tradable and market not in tradable:
                 continue
             # INTERSECTION_MIN_SCORE를 percent(%) 기준으로 사용
             try:
@@ -1375,6 +1384,31 @@ class PositionState:
                 continue
             if pct >= INTERSECTION_MIN_SCORE:
                 out.append(c)
+
+        # 폴백: 패턴 미응답 시 실시간 거래대금 1.5억원 이상 종목 선별
+        if not out:
+            try:
+                async with httpx.AsyncClient(timeout=4.0) as client:
+                    all_krw = [m for m in tradable if m.startswith("KRW-") and m not in EXCLUDED_MARKETS]
+                    if all_krw:
+                        r_tickers = await client.get("https://api.upbit.com/v1/ticker", params={"markets": ",".join(all_krw[:100])})
+                        if r_tickers.status_code == 200:
+                            for t in r_tickers.json():
+                                p = float(t.get("trade_price", 0))
+                                vol_24h = float(t.get("acc_trade_price_24h", 0))
+                                if p >= 100 and vol_24h >= 150_000_000:
+                                    out.append({
+                                        "market": t["market"],
+                                        "close": p,
+                                        "expected_move_pct": 1.0,
+                                        "target_price": round(p * 1.01, 8),
+                                        "scenario": ["fallback"],
+                                        "score": 8,
+                                        "score_max": 8,
+                                    })
+            except Exception:
+                pass
+
         return self.order_intersection_candidates(out)
 
 
@@ -2503,6 +2537,16 @@ async def process_intersection_buys(
             continue
 
         if not already_has:
+            # [신규 방어 1] 15분봉 상위 추세 검증 (떨어지는 칼날 사전 배제)
+            trend_ok, _ = await check_15m_uptrend_or_range(market)
+            if not trend_ok:
+                continue
+
+            # [신규 방어 2] 3분봉 장악형 양봉 반전 신호 검증
+            rebound_ok, _ = await check_3m_reversal_signal(market)
+            if not rebound_ok:
+                continue
+
             # 최초 진입: initAmt만
             init_amt = INTERSECTION_BUY_KRW_SAFE
             remaining_cap = (
@@ -2513,6 +2557,11 @@ async def process_intersection_buys(
                     print(f"[INTX][SKIP] {market} init_amt {krw_to_use} < min {MIN_ORDER_NOTIONAL_KRW}")
                 continue
         else:
+            # 추가 매수 시에도 3분봉 반전 신호 확인
+            rebound_ok, _ = await check_3m_reversal_signal(market)
+            if not rebound_ok:
+                continue
+
             # 추가 매수: addAmt만
             add_amt_cfg = ADDITIONAL_BUY_KRW_SAFE
             if add_amt_cfg <= 0:
@@ -2557,6 +2606,11 @@ async def process_intersection_buys(
 
 async def check_rescue_rebound_signal(market: str) -> bool:
     try:
+        # 3분봉 장악형 양봉 반전 신호 우선 확인
+        reb_ok, _ = await check_3m_reversal_signal(market)
+        if not reb_ok:
+            return False
+
         candles = await fetch_minute_candles(market, unit=15, count=10)
         if len(candles) < 5:
             return False
